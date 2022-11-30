@@ -56,8 +56,6 @@ Type "help", "copyright", "credits" or "license" for more information.
 >>> debug_dumpling("test.dump")
 > /home/loyd/vscodeFiles/pydumpling/test.py(6)inner()
 -> c = a + b
-(Pdb) lsit 1,17
-*** SyntaxError: invalid syntax
 (Pdb) list 1,17
   1     from pydumpling import save_dumping
   2  
