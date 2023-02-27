@@ -6,7 +6,7 @@
 * 修复其在2.7及3.10版本中的bug
 * 支持更多的pdb命令
 
-pydump可以在程序抛出异常时，将异常的traceback写到一个文件中，可以稍后在Python调试器中加载它。目前pydump支持很多兼容PDB api的调试器（pdbpp, udb, ipdb)
+pydumpling可以在代码的任何位置中，将当前Python程序的traceback写到一个文件中，可以稍后在Python调试器中加载它。目前pydump支持很多兼容PDB api的调试器（pdbpp, udb, ipdb)
 
 ## 为什么会有Pydump?
 

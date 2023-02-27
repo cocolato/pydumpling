@@ -9,7 +9,7 @@ It's a fork/optimized version from [elifiner/pydump](https://github.com/elifiner
 * supported more pdb commnd
 
 
-Pydump writes the traceback of an exception into a file and 
+Pydumpling writes the `python current traceback` into a file and 
 can later load it in a Python debugger. It works with the built-in 
 pdb and with other popular debuggers (pudb, ipdb and pdbpp).
 
