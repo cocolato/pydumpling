@@ -60,12 +60,12 @@ class FakeType(object):
 
 class FakeTraceback(FakeType):
 
-    def __init__(self, traceback):
+    def __init__(self, traceback=None):
         self.tb_frame = FakeFrame(
-            traceback.tb_frame) if traceback.tb_frame else None
-        self.tb_lineno = traceback.tb_lineno
+            traceback.tb_frame) if traceback and traceback.tb_frame else None
+        self.tb_lineno = traceback.tb_lineno if traceback else None
         self.tb_next = FakeTraceback(
-            traceback.tb_next) if traceback.tb_next else None
+            traceback.tb_next) if traceback and traceback.tb_next else None
         self.tb_lasti = 0
 
 

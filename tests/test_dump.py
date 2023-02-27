@@ -1,11 +1,12 @@
 import os
-from pydumpling import save_dumping
+from pydumpling import save_dumping, dump_current_traceback
 import pytest
 
 
 def inner():
     a = 1
     b = "2"
+    dump_current_traceback("current_tb.dump")
     c = a + b  # noqa: F841
 
 
