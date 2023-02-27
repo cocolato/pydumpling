@@ -1,6 +1,7 @@
 # 针对Python的异常调试器
 
 这是 [elifiner/pydump](https://github.com/elifiner/pydump) 的fork/优化版本, 主要优化点有:
+* 支持在任何地方保存`Python traceback`，而不是只在异常发生的时候
 * 优化代码结构, 去除冗余代码
 * 修复其在2.7及3.10版本中的bug
 * 支持更多的pdb命令
@@ -19,12 +20,34 @@ Python版本支持：>= 2.7, >=3.6
 
 目前还没有在Pypi上面进行发布，因此直接使用PIP安装dist目录下的whl文件
 ```
-pip install dist/pydumpling-0.1.0-py2.py3-none-any.whl
+pip install dist/pydumpling-0.1.1-py2.py3-none-any.whl
 ```
 
 ## 使用方法
 
-In the code, find the place where we need to do the exception replump and use 'save_dumpling()'. When we save the dump file, it will default to '${exception file}:${line number of the exception}.dump'.
+### 在任何地方进行`traceback`的保存
+```python
+from pydumpling import dump_current_traceback
+from inspect import currentframe
+
+
+def inner():
+    a = 1
+    b = "2"
+    dump_current_traceback("test.dump")
+    c = str(a) + b
+
+
+def outer():
+    d = 4
+    inner()
+
+```
+
+
+
+### 在异常发生时进行异常堆栈的保存
+在异常捕获的处理代码中使用`save_dumpling()`. 如过不指定文件名，默认使用：`${exception file}:${line number of the exception}.dump`.
 
 ```python
 from pydumpling import save_dumping

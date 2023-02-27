@@ -3,6 +3,7 @@
 English | [简体中文](README_zh.md)
 
 It's a fork/optimized version from [elifiner/pydump](https://github.com/elifiner/pydump).The main optimization points are：
+* Save the `Python traceback` anywhere, not just when it's an exception.
 * Optimize code structure && remove redundant code
 * fix bug in python2.7 && support python3.10+
 * supported more pdb commnd
@@ -24,10 +25,32 @@ Python version：>= 2.7, >=3.6
 
 Not published in pypi，so use the `.whl` file install pydumpling in the dist path.
 ```
-pip install dist/pydumpling-0.1.0-py2.py3-none-any.whl
+pip install dist/pydumpling-0.1.1-py2.py3-none-any.whl
 ```
 
 ## How to use pydumpling
+
+
+### Save the python traceback anywhere.
+```python
+from pydumpling import dump_current_traceback
+from inspect import currentframe
+
+
+def inner():
+    a = 1
+    b = "2"
+    dump_current_traceback("test.dump")
+    c = str(a) + b
+
+
+def outer():
+    d = 4
+    inner()
+
+```
+
+### Save the exception traceback.
 
 In the code, find the place where we need to do the `try ... except ...` and use `save_dumpling()`. When we save the dump file, it will default to `${exception filename}:${error lineno}.dump`.
 
