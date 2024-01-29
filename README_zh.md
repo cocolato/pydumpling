@@ -47,7 +47,7 @@ def outer():
 
 
 ### 在异常发生时进行异常堆栈的保存
-在异常捕获的处理代码中使用`save_dumpling()`. 如过不指定文件名，默认使用：`${exception file}:${line number of the exception}.dump`.
+在异常捕获的处理代码中使用`save_dumpling()`. 如果不指定文件名，默认使用：`${exception file}:${line number of the exception}.dump`.
 
 ```python
 from pydumpling import save_dumping
