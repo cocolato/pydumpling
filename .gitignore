@@ -6,3 +6,4 @@ __pycache__
 test.py
 /my
 .vscode
+.idea
