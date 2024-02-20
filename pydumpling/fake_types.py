@@ -66,7 +66,7 @@ class FakeTraceback(FakeType):
         self.tb_lineno = traceback.tb_lineno if traceback else None
         self.tb_next = FakeTraceback(
             traceback.tb_next) if traceback and traceback.tb_next else None
-        self.tb_lasti = 0
+        self.tb_lasti = traceback.tb_lasti if traceback else 0
 
 
 class FakeFrame(FakeType):
@@ -78,6 +78,8 @@ class FakeFrame(FakeType):
         self.f_globals = self._convert_dict(frame.f_globals)
         self.f_lineno = frame.f_lineno
         self.f_back = FakeFrame(frame.f_back) if frame.f_back else None
+        self.f_lasti = frame.f_lasti
+        self.f_builtins = frame.f_builtins
 
 
 class FakeClass(FakeType):
@@ -107,6 +109,8 @@ class FakeCode(FakeType):
             code, "co_lines") else []
         if hasattr(code, "co_kwonlyargcount"):
             self.co_kwonlyargcount = code.co_kwonlyargcount
+        if hasattr(code, "co_positions"):
+            self.co_positions = code.co_positions
 
     def co_lines(self):
         return iter(self._co_lines)
