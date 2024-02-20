@@ -14,16 +14,20 @@ __version__ = "0.1.1"
 def save_dumping(filename=None, tb=None):
     try:
         if tb is None:
-            tb = sys.exc_info()[2]
+            exc_type, exc_value, exc_tb = sys.exc_info()
 
         if filename is None:
             filename = "%s:%d.dump" % (
-                tb.tb_frame.f_code.co_filename, tb.tb_frame.f_lineno)
+                exc_tb.tb_frame.f_code.co_filename, exc_tb.tb_frame.f_lineno)
 
-        fake_tb = FakeTraceback(tb)
+        fake_tb = FakeTraceback(exc_tb)
         dumpling = {
             "traceback": fake_tb,
             "version": __version__,
+            "exc_extra": {
+                "exc_type": exc_type,
+                "exc_value": exc_value,
+            },
             "dump_type": "DILL"
         }
         with gzip.open(filename, "wb") as f:
