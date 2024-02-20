@@ -1,7 +1,7 @@
 import argparse
 import os.path
 from .debug_dumpling import debug_dumpling, load_dumpling
-from .helpers import print_traceback
+from .helpers import print_traceback_and_except
 
 DUMP_FILE_EXTENSION: str = ".dump"
 
@@ -47,7 +47,7 @@ def main() -> None:
     args = parser.parse_args()
     file_name = args.filename
     if args.print:
-        tb = load_dumpling(file_name)["traceback"]
-        print_traceback(tb)
+        dumpling_ = load_dumpling(file_name)
+        print_traceback_and_except(dumpling_)
     elif args.debug:
         debug_dumpling(file_name)

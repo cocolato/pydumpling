@@ -1,7 +1,12 @@
 import linecache
 
 
-def print_traceback(traceback_obj):
+def print_traceback_and_except(dumpling_result):
+    traceback_obj = dumpling_result["traceback"]
+    except_extra = dumpling_result["exc_extra"]
+    except_type = except_extra["exc_type"]
+    except_value = except_extra["exc_value"]
+
     print("Traceback (most recent call last):")
     while traceback_obj:
         frame = traceback_obj.tb_frame
@@ -18,3 +23,4 @@ def print_traceback(traceback_obj):
 
         if traceback_obj is None:
             break
+    print(f"{except_type.__name__}: {except_value}")
