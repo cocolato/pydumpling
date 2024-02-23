@@ -72,7 +72,7 @@ def gen_tb_from_frame(f):
     f = f.f_back
     if f is None:
         return tb
-    while f and "python" not in f.f_code.co_filename.lower():
+    while f:
         tb = FakeTraceback()
         tb.tb_frame = FakeFrame(f)
         tb.tb_lasti = f.f_lasti
