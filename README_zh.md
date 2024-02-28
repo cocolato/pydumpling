@@ -5,6 +5,7 @@
 * 优化代码结构, 去除冗余代码
 * 修复其在2.7及3.10版本中的bug
 * 支持更多的pdb命令
+* 提供了一个方便用来调试的命令行工具
 
 pydumpling可以在代码的任何位置中，将当前Python程序的traceback写到一个文件中，可以稍后在Python调试器中加载它。目前pydump支持很多兼容PDB api的调试器（pdbpp, udb, ipdb)
 
@@ -119,6 +120,33 @@ Type "help", "copyright", "credits" or "license" for more information.
 (Pdb) ll
   9     def outer():
  10  ->     inner()
+(Pdb) 
+```
+
+### 命令行使用
+
+使用命令行来打印traceback:
+`python -m pydumpling --print test.deump`
+
+将会输出:
+```python
+Traceback (most recent call last):
+  File "/workspaces/pydumpling/tests/test_dump.py", line 20, in test_dumpling
+    outer()
+  File "/workspaces/pydumpling/tests/test_dump.py", line 14, in outer
+    inner()
+  File "/workspaces/pydumpling/tests/test_dump.py", line 10, in inner
+    c = a + b  # noqa: F841
+TypeError: unsupported operand type(s) for +: 'int' and 'str'
+```
+
+
+使用命令行来进行pdb调试:
+`python -m pydumpling --debug test.deump`
+
+将会打开pdb调试会话:
+```python
+-> c = a + b
 (Pdb) 
 ```
 

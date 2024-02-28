@@ -7,6 +7,7 @@ It's a fork/optimized version from [elifiner/pydump](https://github.com/elifiner
 * Optimize code structure && remove redundant code
 * fix bug in python2.7 && support python3.10+
 * supported more pdb commnd
+* a useful command line tool for debug
 
 
 Pydumpling writes the `python current traceback` into a file and 
@@ -125,5 +126,33 @@ Type "help", "copyright", "credits" or "license" for more information.
  10  ->     inner()
 (Pdb) 
 ```
+
+### Use Command Line
+
+Use command line to print the traceback:
+`python -m pydumpling --print test.deump`
+
+It will print:
+```python
+Traceback (most recent call last):
+  File "/workspaces/pydumpling/tests/test_dump.py", line 20, in test_dumpling
+    outer()
+  File "/workspaces/pydumpling/tests/test_dump.py", line 14, in outer
+    inner()
+  File "/workspaces/pydumpling/tests/test_dump.py", line 10, in inner
+    c = a + b  # noqa: F841
+TypeError: unsupported operand type(s) for +: 'int' and 'str'
+```
+
+
+Use command line to do pdb debug:
+`python -m pydumpling --debug test.deump`
+
+It will open the pdb window:
+```python
+-> c = a + b
+(Pdb) 
+```
+
 ## TODO
 - []
