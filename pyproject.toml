@@ -1,17 +1,34 @@
-[tool.poetry]
+[tool.pdm]
+distribution = true
+
+[tool.pdm.scripts]
+test = {composite = ["pdm install", "flake8 ./pydumpling ./tests", "pytest tests/"]}
+
+[tool.pdm.build]
+includes = ["pydumpling/*.py"]
+
+[tool.pdm.dev-dependencies]
+test = [
+    "pytest-order>=1.2.0",
+    "flake8>=5.0.4",
+    "six>=1.16.0",
+]
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+
+[project]
 name = "pydumpling"
 version = "0.1.2"
 description = ""
-authors = ["cocolato <haiizhu@outlook.com>"]
+authors = [
+    {name = "cocolato", email = "haiizhu@outlook.com"},
+]
+dependencies = [
+    "dill<1.0.0,>=0.3.2",
+    "six<2.0.0,>=1.16.0",
+]
+requires-python = ">=3.7"
 readme = "README.md"
-packages = [{include = "pydumpling/*.py"}]
-
-[tool.poetry.dependencies]
-python = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
-dill = "^0.3.2"
-six = "^1.16.0"
-
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+license = {text = "MIT"}

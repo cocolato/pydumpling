@@ -7,3 +7,6 @@ test.py
 /my
 .vscode
 .idea
+
+dist/
+.pdm-python
