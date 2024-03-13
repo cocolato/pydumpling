@@ -6,6 +6,7 @@
 * 修复其在3.10+版本中的bug
 * 支持更多的pdb命令
 * 提供了一个方便用来调试的命令行工具
+* 支持服务器远程调试(remote pdb)
 
 pydumpling可以在代码的任何位置中，将当前Python程序的traceback写到一个文件中，可以稍后在Python调试器中加载它。目前pydump支持很多兼容PDB api的调试器（pdbpp, udb, ipdb)
 
@@ -124,7 +125,7 @@ Type "help", "copyright", "credits" or "license" for more information.
 
 ### 命令行使用
 
-使用命令行来打印traceback:
+#### 使用命令行来打印traceback:
 `python -m pydumpling --print test.deump`
 
 将会输出:
@@ -140,7 +141,7 @@ TypeError: unsupported operand type(s) for +: 'int' and 'str'
 ```
 
 
-使用命令行来进行pdb调试:
+#### 使用命令行来进行pdb调试:
 `python -m pydumpling --debug test.deump`
 
 将会打开pdb调试会话:
@@ -148,6 +149,12 @@ TypeError: unsupported operand type(s) for +: 'int' and 'str'
 -> c = a + b
 (Pdb) 
 ```
+
+#### 使用命令行来进行remote pdb调试
+`python -m pydumpling --rdebug test.deump`
+它会在机器的4444端口上打开pdb调试器，然后我们可以在另外一台机器上使用telnet、netcat来进行远程调试：
+`nc 127.0.0.1 4444`
+![alt text](static/rpdb.png)
 
 ## TODO
 - []
