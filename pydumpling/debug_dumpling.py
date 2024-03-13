@@ -17,6 +17,7 @@ def load_dumpling(filename):
         except Exception:
             return pickle.load(f)
 
+
 def mock_inspect():
     inspect.isframe = lambda obj: isinstance(
         obj, types.FrameType) or obj.__class__ == FakeFrame
@@ -24,6 +25,7 @@ def mock_inspect():
         obj, types.TracebackType) or obj.__class__ == FakeTraceback
     inspect.iscode = lambda obj: isinstance(
         obj, types.CodeType) or obj.__class__ == FakeCode
+
 
 def debug_dumpling(dump_file, pdb=pdb):
     mock_inspect()

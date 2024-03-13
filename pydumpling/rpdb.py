@@ -2,7 +2,6 @@ import pdb
 import socket
 import threading
 import sys
-import traceback
 from .debug_dumpling import load_dumpling, mock_inspect
 
 DEFAULT_ADDR = "127.0.0.1"
@@ -120,6 +119,7 @@ class OccupiedPorts(object):
         self.lock.acquire(True)
         del self.claims[port]
         self.lock.release()
+
 
 # {port: sys.stdout} pairs to track recursive rpdb invocation on same port.
 # This scheme doesn't interfere with recursive invocations on separate ports -
