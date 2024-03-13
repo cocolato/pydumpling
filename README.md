@@ -8,6 +8,7 @@ It's a fork/optimized version from [elifiner/pydump](https://github.com/elifiner
 * fix bug in python3.10+
 * supported more pdb commnd
 * a useful command line tool for debug
+* supported remote debug (rpdb)
 
 
 Pydumpling writes the `python current traceback` into a file and 
@@ -128,7 +129,7 @@ Type "help", "copyright", "credits" or "license" for more information.
 
 ### Use Command Line
 
-Use command line to print the traceback:
+#### Use command line to print the traceback:
 `python -m pydumpling --print test.deump`
 
 It will print:
@@ -144,7 +145,7 @@ TypeError: unsupported operand type(s) for +: 'int' and 'str'
 ```
 
 
-Use command line to do pdb debug:
+#### Use command line to do pdb debug:
 `python -m pydumpling --debug test.deump`
 
 It will open the pdb window:
@@ -152,6 +153,12 @@ It will open the pdb window:
 -> c = a + b
 (Pdb) 
 ```
+
+#### Use command line to do remote pdb debug:
+`python -m pydumpling --rdebug test.deump`
+It will open the debugger on port 4444, then we can access pdb using telnet、netcat... :
+`nc 127.0.0.1 4444`
+![alt text](static/rpdb.png)
 
 ## TODO
 - []
