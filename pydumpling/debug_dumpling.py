@@ -18,13 +18,17 @@ def load_dumpling(filename):
             return pickle.load(f)
 
 
-def debug_dumpling(dump_file, pdb=pdb):
+def mock_inspect():
     inspect.isframe = lambda obj: isinstance(
         obj, types.FrameType) or obj.__class__ == FakeFrame
     inspect.istraceback = lambda obj: isinstance(
         obj, types.TracebackType) or obj.__class__ == FakeTraceback
     inspect.iscode = lambda obj: isinstance(
         obj, types.CodeType) or obj.__class__ == FakeCode
+
+
+def debug_dumpling(dump_file, pdb=pdb):
+    mock_inspect()
     dumpling = load_dumpling(dump_file)
     if not parse("0.0.1") <= parse(dumpling["version"]) < parse("1.0.0"):
         raise ValueError("Unsupported dumpling version: %s" %

@@ -5,9 +5,10 @@ English | [简体中文](README_zh.md)
 It's a fork/optimized version from [elifiner/pydump](https://github.com/elifiner/pydump).The main optimization points are：
 * Save the `Python traceback` anywhere, not just when it's an exception.
 * Optimize code structure && remove redundant code
-* fix bug in python2.7 && support python3.10+
+* fix bug in python3.10+
 * supported more pdb commnd
 * a useful command line tool for debug
+* supported remote debug (rpdb)
 
 
 Pydumpling writes the `python current traceback` into a file and 
@@ -22,11 +23,10 @@ pdb and with other popular debuggers (pudb, ipdb and pdbpp).
 * If we were able to save the exception error and then use the debugger to recover the traceback at that time, we could see the entire stack variables along the traceback as if you had caught the exception at the local breakpoint.
 
 ## Install pydumpling
-Python version：>= 2.7, >=3.6
+Python version：>=3.7
 
-Not published in pypi，so use the `.whl` file install pydumpling in the dist path.
 ```
-pip install dist/pydumpling-0.1.1-py2.py3-none-any.whl
+pip install pydumpling
 ```
 
 ## How to use pydumpling
@@ -129,7 +129,7 @@ Type "help", "copyright", "credits" or "license" for more information.
 
 ### Use Command Line
 
-Use command line to print the traceback:
+#### Use command line to print the traceback:
 `python -m pydumpling --print test.deump`
 
 It will print:
@@ -145,7 +145,7 @@ TypeError: unsupported operand type(s) for +: 'int' and 'str'
 ```
 
 
-Use command line to do pdb debug:
+#### Use command line to do pdb debug:
 `python -m pydumpling --debug test.deump`
 
 It will open the pdb window:
@@ -153,6 +153,12 @@ It will open the pdb window:
 -> c = a + b
 (Pdb) 
 ```
+
+#### Use command line to do remote pdb debug:
+`python -m pydumpling --rdebug test.deump`
+It will open the debugger on port 4444, then we can access pdb using telnet、netcat... :
+`nc 127.0.0.1 4444`
+![alt text](static/rpdb.png)
 
 ## TODO
 - []

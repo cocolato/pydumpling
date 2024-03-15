@@ -1,6 +1,7 @@
 import argparse
 import os.path
 from .debug_dumpling import debug_dumpling, load_dumpling
+from .rpdb import r_post_mortem
 from .helpers import print_traceback_and_except
 
 DUMP_FILE_EXTENSION: str = ".dump"
@@ -36,6 +37,12 @@ pydumpling_cli_action_group.add_argument(
     help="enter pdb debugging interface"
 )
 
+pydumpling_cli_action_group.add_argument(
+    "--rdebug",
+    action="store_true",
+    help="enter rpdb debugging interface"
+)
+
 parser.add_argument(
     "filename",
     type=validate_file_name,
@@ -51,3 +58,5 @@ def main() -> None:
         print_traceback_and_except(dumpling_)
     elif args.debug:
         debug_dumpling(file_name)
+    elif args.rdebug:
+        r_post_mortem(file_name)

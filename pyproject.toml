@@ -11,7 +11,6 @@ includes = ["pydumpling/*.py"]
 test = [
     "pytest-order>=1.2.0",
     "flake8>=5.0.4",
-    "six>=1.16.0",
 ]
 dev = [
     "tox-pdm>=0.6.1",
@@ -23,8 +22,8 @@ build-backend = "pdm.backend"
 
 [project]
 name = "pydumpling"
-version = "0.1.2"
-description = ""
+version = "0.1.4"
+description = "Python post-mortem debugger"
 authors = [
     {name = "cocolato", email = "haiizhu@outlook.com"},
 ]
@@ -36,3 +35,7 @@ dependencies = [
 requires-python = ">=3.7"
 readme = "README.md"
 license = {text = "MIT"}
+
+
+[project.urls]
+homepage = "https://github.com/cocolato/pydumpling"
