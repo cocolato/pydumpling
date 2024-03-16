@@ -21,4 +21,4 @@ def catch_any_exception():
         save_dumping(exc_info=(exc_type, exc_value, exc_tb))
         original_hook(exc_type, exc_value, exc_tb)  # call sys original hook
 
-    sys.excepthook = original_hook
+    sys.excepthook = _hook
