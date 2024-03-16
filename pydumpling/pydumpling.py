@@ -11,13 +11,15 @@ from .fake_types import FakeFrame, FakeTraceback
 __version__ = "0.1.4"
 
 
-def save_dumping(filename=None, tb=None):
+def save_dumping(filename=None, exc_info=None):
     try:
-        if tb is None:
+        if exc_info is None:
             exc_type, exc_value, exc_tb = sys.exc_info()
+        else:
+            exc_type, exc_value, exc_tb = exc_info
 
         if filename is None:
-            filename = "%s:%d.dump" % (
+            filename = "%s-%d.dump" % (
                 exc_tb.tb_frame.f_code.co_filename, exc_tb.tb_frame.f_lineno)
 
         fake_tb = FakeTraceback(exc_tb)
