@@ -1,4 +1,6 @@
+import sys
 from traceback import print_tb, print_exception
+from .pydumpling import save_dumping
 
 
 def print_traceback_and_except(dumpling_result):
@@ -10,3 +12,13 @@ def print_traceback_and_except(dumpling_result):
         print_exception(exc_type, exc_value, exc_tb)
     else:
         print_tb(exc_tb)
+
+
+def catch_any_exception():
+    original_hook = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        save_dumping(exc_info=(exc_type, exc_value, exc_tb))
+        original_hook(exc_type, exc_value, exc_tb)  # call sys original hook
+
+    sys.excepthook = _hook
