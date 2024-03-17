@@ -4,7 +4,7 @@ import gzip
 import pdb
 import dill
 import pickle
-from distutils.version import StrictVersion
+from packaging.version import parse
 import inspect
 import types
 from .fake_types import FakeFrame, FakeTraceback, FakeCode
@@ -30,7 +30,7 @@ def mock_inspect():
 def debug_dumpling(dump_file, pdb=pdb):
     mock_inspect()
     dumpling = load_dumpling(dump_file)
-    if not StrictVersion("0.0.1") <= StrictVersion(dumpling["version"]) < StrictVersion("1.0.0"):
+    if not parse("0.0.1") <= parse(dumpling["version"]) < parse("1.0.0"):
         raise ValueError("Unsupported dumpling version: %s" %
                          dumpling["version"])
     tb = dumpling["traceback"]
