@@ -3,7 +3,6 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 from .rpdb import r_post_mortem
 from .debug_dumpling import debug_dumpling, load_dumpling
 from .pydumpling import save_dumping, dump_current_traceback, __version__
-from .helpers import catch_any_exception
 
 
 __version__ == __version__
