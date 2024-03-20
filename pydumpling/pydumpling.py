@@ -8,7 +8,7 @@ import warnings
 import inspect
 from .fake_types import FakeFrame, FakeTraceback
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 
 def save_dumping(filename=None, exc_info=None):
