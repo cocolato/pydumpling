@@ -3,6 +3,9 @@ distribution = true
 
 [tool.pdm.scripts]
 test = {composite = ["pdm install", "flake8 ./pydumpling ./tests", "pytest tests/"]}
+docs = {shell = "cd docs && make html"}  # build sphinx docs
+docs_export = { shell = "pdm export -G doc -o docs/requirements.txt --without-hashes" }  # export requirements for docs
+docs_preview = {shell = 'python -m http.server -d docs\build\html'}
 
 [tool.pdm.build]
 includes = ["pydumpling/*.py"]
@@ -29,7 +32,6 @@ authors = [
 ]
 dependencies = [
     "dill<1.0.0,>=0.3.2",
-    "six<2.0.0,>=1.16.0",
     "packaging>=24.0",
 ]
 requires-python = ">=3.7"
@@ -39,3 +41,11 @@ license = {text = "MIT"}
 
 [project.urls]
 homepage = "https://github.com/cocolato/pydumpling"
+
+[project.optional-dependencies]
+doc = [
+    "sphinx>=4.3.2",
+    "sphinx-rtd-theme>=1.3.0",
+    "sphinx-tabs>=3.4.5",
+    "sphinx-copybutton>=0.5.2",
+]
