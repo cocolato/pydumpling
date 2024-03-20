@@ -12,7 +12,7 @@ def validate_file_name(file_name: str) -> str:
     if not file_name.endswith(DUMP_FILE_EXTENSION):
         raise argparse.ArgumentTypeError("File must be .dump file")
     if not os.path.exists(file_name):
-        raise argparse.ArgumentTypeError(f"File {file_name}  not found")
+        raise argparse.ArgumentTypeError(f"File {file_name} not found")
     return file_name
 
 
