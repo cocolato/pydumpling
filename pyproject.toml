@@ -32,7 +32,6 @@ authors = [
 ]
 dependencies = [
     "dill<1.0.0,>=0.3.2",
-    "six<2.0.0,>=1.16.0",
     "packaging>=24.0",
 ]
 requires-python = ">=3.7"
