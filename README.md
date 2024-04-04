@@ -53,7 +53,7 @@ def outer():
 
 ### Save the exception traceback.
 
-In the code, find the place where we need to do the `try ... except ...` and use `save_dumpling()`. When we save the dump file, it will default to `${exception filename}:${error lineno}.dump`.
+In the code, find the place where we need to do the `try ... except ...` and use `save_dumpling()`. When we save the dump file, it will default to `${exception filename}-${error lineno}.dump`.
 
 ```python
 from pydumpling import save_dumping
@@ -159,6 +159,26 @@ It will open the pdb window:
 It will open the debugger on port 4444, then we can access pdb using telnet、netcat... :
 `nc 127.0.0.1 4444`
 ![alt text](static/rpdb.png)
+
+#### Enable global exception catching:
+```python
+from pydumpling import catch_any_exception
+
+catch_any_exception()
+
+def inner():
+    a = 1
+    b = "2"
+    c = a + b  # noqa: F841
+
+
+def outer():
+    inner()
+    
+if __name__ == "__main__":
+    outer()
+   
+```
 
 ## TODO
 - []

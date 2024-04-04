@@ -1,13 +1,16 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
 import gzip
-import pdb
-import dill
-import pickle
-from packaging.version import parse
 import inspect
+import pdb
+import pickle
 import types
-from .fake_types import FakeFrame, FakeTraceback, FakeCode
+
+import dill
+from packaging.version import parse
+
+from .fake_types import FakeCode, FakeFrame, FakeTraceback
 
 
 def load_dumpling(filename):

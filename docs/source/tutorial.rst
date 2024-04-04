@@ -122,6 +122,7 @@ help message
       -h, --help  show this help message and exit
       --print     print traceback information
       --debug     enter pdb debugging interface
+      --rdebug    enter rpdb debugging interface
 
 Print the traceback
 ###################
@@ -165,3 +166,26 @@ It will open the debugger on port 4444, then we can access pdb using `telnet`_, 
 
 
 .. image:: _static/rpdb.png
+
+
+Enable global exception catching
+################################
+
+.. code-block:: python
+
+    from pydumpling import catch_any_exception
+
+    catch_any_exception()
+
+    def inner():
+        a = 1
+        b = "2"
+        c = a + b  # noqa: F841
+
+
+    def outer():
+        inner()
+        
+    if __name__ == "__main__":
+        outer()
+

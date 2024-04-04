@@ -48,7 +48,7 @@ def outer():
 
 
 ### 在异常发生时进行异常堆栈的保存
-在异常捕获的处理代码中使用`save_dumpling()`. 如果不指定文件名，默认使用：`${exception file}:${line number of the exception}.dump`.
+在异常捕获的处理代码中使用`save_dumpling()`. 如果不指定文件名，默认使用：`${exception file}-${line number of the exception}.dump`.
 
 ```python
 from pydumpling import save_dumping
@@ -155,6 +155,26 @@ TypeError: unsupported operand type(s) for +: 'int' and 'str'
 它会在机器的4444端口上打开pdb调试器，然后我们可以在另外一台机器上使用telnet、netcat来进行远程调试：
 `nc 127.0.0.1 4444`
 ![alt text](static/rpdb.png)
+
+#### 开启全局异常捕获:
+```python
+from pydumpling import catch_any_exception
+
+catch_any_exception()
+
+def inner():
+    a = 1
+    b = "2"
+    c = a + b  # noqa: F841
+
+
+def outer():
+    inner()
+    
+if __name__ == "__main__":
+    outer()
+   
+```
 
 ## TODO
 - []

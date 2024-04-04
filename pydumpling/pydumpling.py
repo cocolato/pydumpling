@@ -1,11 +1,14 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
 import gzip
-import sys
-import dill
-import pickle
-import warnings
 import inspect
+import pickle
+import sys
+import warnings
+
+import dill
+
 from .fake_types import FakeFrame, FakeTraceback
 
 __version__ = "0.1.5"
