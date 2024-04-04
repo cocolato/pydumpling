@@ -1,5 +1,6 @@
 import sys
-from traceback import print_tb, print_exception
+from traceback import print_exception, print_tb
+
 from .pydumpling import save_dumping
 
 

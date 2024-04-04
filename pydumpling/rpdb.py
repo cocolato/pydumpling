@@ -1,7 +1,8 @@
 import pdb
 import socket
-import threading
 import sys
+import threading
+
 from .debug_dumpling import load_dumpling, mock_inspect
 
 DEFAULT_ADDR = "127.0.0.1"

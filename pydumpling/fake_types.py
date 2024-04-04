@@ -1,7 +1,9 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
 import os
 import sys
+
 import dill
 
 
@@ -41,7 +43,7 @@ class FakeType(object):
             except Exception:
                 return cls._safe_repr(v)
         else:
-            from datetime import date, time, datetime, timedelta
+            from datetime import date, datetime, time, timedelta
 
             BUILTIN = (str, unicode, int, long, float, date, time, datetime, timedelta) if sys.version_info.major == 2 \
                 else (str, int, float, date, time, datetime, timedelta)  # noqa: F821
