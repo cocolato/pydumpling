@@ -8,6 +8,7 @@ test.py
 .vscode
 .idea
 .tox
+.coverage
 
 dist/
 .pdm-python
