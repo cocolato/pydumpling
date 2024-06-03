@@ -1,20 +1,8 @@
 import argparse
-import os.path
 
 from .debug_dumpling import debug_dumpling, load_dumpling
-from .helpers import print_traceback_and_except
+from .helpers import print_traceback_and_except, validate_file_name
 from .rpdb import r_post_mortem
-
-DUMP_FILE_EXTENSION: str = ".dump"
-
-
-def validate_file_name(file_name: str) -> str:
-    """check file extension name and exists"""
-    if not file_name.endswith(DUMP_FILE_EXTENSION):
-        raise argparse.ArgumentTypeError("File must be .dump file")
-    if not os.path.exists(file_name):
-        raise argparse.ArgumentTypeError(f"File {file_name} not found")
-    return file_name
 
 
 parser = argparse.ArgumentParser(
