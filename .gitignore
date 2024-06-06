@@ -15,3 +15,5 @@ dist/
 
 # Sphinx documentation
 docs/build/
+
+!tests/dump/*
