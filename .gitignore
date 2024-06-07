@@ -8,9 +8,12 @@ test.py
 .vscode
 .idea
 .tox
+.coverage
 
 dist/
 .pdm-python
 
 # Sphinx documentation
 docs/build/
+
+!tests/dump/*

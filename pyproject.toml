@@ -2,7 +2,7 @@
 distribution = true
 
 [tool.pdm.scripts]
-test = {composite = ["pdm install", "flake8 ./pydumpling ./tests", "pytest tests/"]}
+test = {composite = ["pdm install", "flake8 ./pydumpling ./tests", "pytest --cov=pydumpling --cov-report=term-missing tests/"]}
 docs = {shell = "cd docs && make html"}  # build sphinx docs
 docs_export = { shell = "pdm export -G doc -o docs/requirements.txt --without-hashes" }  # export requirements for docs
 docs_preview = {shell = 'python -m http.server -d docs\build\html'}
@@ -14,6 +14,7 @@ includes = ["pydumpling/*.py"]
 test = [
     "pytest-order>=1.2.0",
     "flake8>=5.0.4",
+    "pytest-cov>=4.1.0",
 ]
 dev = [
     "tox-pdm>=0.6.1",

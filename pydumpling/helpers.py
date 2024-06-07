@@ -1,7 +1,12 @@
 import sys
+import os.path
+import argparse
 from traceback import print_exception, print_tb
 
 from .pydumpling import save_dumping
+
+
+DUMP_FILE_EXTENSION: str = ".dump"
 
 
 def print_traceback_and_except(dumpling_result):
@@ -23,3 +28,12 @@ def catch_any_exception():
         original_hook(exc_type, exc_value, exc_tb)  # call sys original hook
 
     sys.excepthook = _hook
+
+
+def validate_file_name(file_name: str) -> str:
+    """check file extension name and exists"""
+    if not file_name.endswith(DUMP_FILE_EXTENSION):
+        raise argparse.ArgumentTypeError("File must be .dump file")
+    if not os.path.exists(file_name):
+        raise argparse.ArgumentTypeError(f"File {file_name} not found")
+    return file_name
