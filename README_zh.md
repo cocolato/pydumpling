@@ -21,7 +21,7 @@ pydumpling可以在代码的任何位置中，将当前Python程序的traceback�
 Python版本支持：>=3.7
 
 ```
-pip install -i pydumpling
+pip install pydumpling
 ```
 
 ## 使用方法
