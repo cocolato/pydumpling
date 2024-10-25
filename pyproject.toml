@@ -52,4 +52,4 @@ doc = [
 ]
 
 [project.scripts]
-pydumpling = "pydumpling.__main__:main"
+pydumpling = "pydumpling.cli:main"
