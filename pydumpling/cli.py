@@ -3,7 +3,7 @@ import argparse
 from .debug_dumpling import debug_dumpling, load_dumpling
 from .helpers import print_traceback_and_except, validate_file_name
 from .rpdb import r_post_mortem
-
+from .vis import generate_vis
 
 parser = argparse.ArgumentParser(
     description="pydumpling cli tools",
@@ -32,6 +32,10 @@ pydumpling_cli_action_group.add_argument(
     help="enter rpdb debugging interface"
 )
 
+pydumpling_cli_action_group.add_argument(
+    "--vis", action="store_true", help="visualize the traceback"
+)
+
 parser.add_argument(
     "filename",
     type=validate_file_name,
@@ -49,3 +53,5 @@ def main() -> None:
         debug_dumpling(file_name)
     elif args.rdebug:
         r_post_mortem(file_name)
+    elif args.vis:
+        generate_vis(file_name)

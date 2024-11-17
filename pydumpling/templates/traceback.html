@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Network</title>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <script id="traceback-data" type="application/json">{{traceback}}</script>
+    <style type="text/css">
+        body {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 90vw;
+        }
+
+        .header {
+            text-align: center;
+            font-size: 1.2em;
+            font-weight: bold;
+            margin-bottom: 10px;
+            padding: 6px;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-around;
+            gap: 10px;
+            width: 100%;
+        }
+
+        .header-item {
+            padding: 5px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+            color: white;
+            font-weight: bold;
+            text-align: center;
+            flex: 1;
+        }
+
+        .dump-file {
+            background-color: #007BFF;
+            /* 蓝色 */
+        }
+
+        .exc-type {
+            background-color: #DC3545;
+            /* 红色 */
+        }
+
+        .exc-value {
+            background-color: #28A745;
+            /* 绿色 */
+        }
+
+        #traceback {
+            width: 100%;
+            height: 88vh;
+            border: 2px dashed red;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <!-- Header displaying additional information -->
+        <div class="header">
+            <div class="header-item dump-file">
+                current dump file: <span>{{dump_file_name}}</span>
+            </div>
+            <div class="header-item exc-type">
+                exc_type: <code>{{exc_type}}</code>
+            </div>
+            <div class="header-item exc-value">
+                exc_value: <code>{{exc_value}}</code>
+            </div>
+        </div>
+        <!-- Container for the network graph -->
+        <div id="traceback"></div>
+    </div>
+    <script type="text/javascript">
+        const options = {
+            interaction: {
+                navigationButtons: true,
+                keyboard: true,
+            },
+            edges: {
+                font: {
+                    size: 10
+                },
+                widthConstraint: {
+                    maximum: 300,
+                },
+            },
+            nodes: {
+                shape: "box",
+                margin: 10,
+                widthConstraint: {
+                    maximum: 1000,
+                },
+            },
+            physics: {
+                enabled: true, // 启用物理效果
+            },
+            layout: {
+                hierarchical: {
+                    direction: 'UD',
+                    sortMethod: 'directed',
+                }
+            }
+        };
+
+
+        function draw(nodes, edges, container_id, options) {
+            const networkNodes = new vis.DataSet(nodes);
+
+            // create an array with edges
+            const networkEdges = new vis.DataSet(edges);
+
+            // create a network
+            const container = document.getElementById(container_id);
+            const data = {
+                nodes: networkNodes,
+                edges: networkEdges,
+            };
+            const network = new vis.Network(container, data, options);
+        }
+
+        const tracebackData = JSON.parse(document.getElementById('traceback-data').text);
+        const rawNodes = tracebackData.map(trace => {
+            return {
+                id: trace.id,
+                label: trace.label,
+                title: `file: ${trace.extra.co_filename}`,
+                font: { multi: 'html' },
+                color: trace.extra.co_type === '<module>' ? 'lime' : 'orange'
+            }
+        });
+        const rawEdges = rawNodes.slice(0, -1).map((item, idx) => ({
+            from: item.id,
+            to: rawNodes[idx + 1].id,
+            arrows: {
+                to: {
+                    enabled: true,
+                    type: 'arrow'
+                }
+            },
+            color: '#ff0000'
+        }))
+        draw(rawNodes, rawEdges, 'traceback', options);
+    </script>
+</body>
+
+</html>

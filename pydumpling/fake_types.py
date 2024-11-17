@@ -70,6 +70,13 @@ class FakeTraceback(FakeType):
             traceback.tb_next) if traceback and traceback.tb_next else None
         self.tb_lasti = traceback.tb_lasti if traceback else 0
 
+    def serialize(self):
+        return {
+            'tb_frame': self.tb_frame.serialize() if self.tb_frame else None,
+            'tb_lineno': self.tb_lineno,
+            'tb_next': self.tb_next.serialize() if self.tb_next else None,
+        }
+
 
 class FakeFrame(FakeType):
     def __init__(self, frame):
@@ -82,6 +89,12 @@ class FakeFrame(FakeType):
         self.f_back = FakeFrame(frame.f_back) if frame.f_back else None
         self.f_lasti = frame.f_lasti
         self.f_builtins = frame.f_builtins
+
+    def serialize(self):
+        return {
+            'f_code': self.f_code.serialize(),
+            'f_lineno': self.f_lineno,
+        }
 
 
 class FakeClass(FakeType):
@@ -116,3 +129,9 @@ class FakeCode(FakeType):
 
     def co_lines(self):
         return iter(self._co_lines)
+
+    def serialize(self):
+        return {
+            'co_filename': self.co_filename,
+            'co_name': self.co_name,
+        }

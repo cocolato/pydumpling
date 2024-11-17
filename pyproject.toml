@@ -8,7 +8,7 @@ docs_export = { shell = "pdm export -G doc -o docs/requirements.txt --without-ha
 docs_preview = {shell = 'python -m http.server -d docs\build\html'}
 
 [tool.pdm.build]
-includes = ["pydumpling/*.py"]
+includes = ["pydumpling/*.py", "pydumpling/templates/*.html"]
 
 [tool.pdm.dev-dependencies]
 test = [
