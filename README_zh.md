@@ -8,7 +8,7 @@
 * 提供了一个方便用来调试的命令行工具
 * 支持服务器远程调试(remote pdb)
 
-pydumpling可以在代码的任何位置中，将当前Python程序的traceback写到一个文件中，可以稍后在Python调试器中加载它。目前pydump支持很多兼容PDB api的调试器（pdbpp, udb, ipdb)
+pydumpling可以在代码的任何位置中，将当前Python程序的traceback写到一个文件中，可以稍后在Python调试器中加载它。目前pydumpling支持很多兼容PDB api的调试器（pdbpp, udb, ipdb)
 
 ## 为什么会有Pydump?
 
