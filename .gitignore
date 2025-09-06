@@ -17,3 +17,6 @@ dist/
 docs/build/
 
 !tests/dump/*
+
+*.lock
+.python-version
