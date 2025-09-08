@@ -1,6 +1,6 @@
 import pytest
-from unittest.mock import Mock, patch
-from pydumpling.fake_types import FakeType, FakeTraceback, FakeFrame, FakeClass, FakeCode
+from unittest.mock import Mock
+from pydumpling.fake_types import FakeType, FakeTraceback, FakeFrame, FakeCode
 
 
 # Fixture for mock traceback
