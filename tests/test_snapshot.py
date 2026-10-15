@@ -187,6 +187,18 @@ def test_bounded_capture_never_calls_application_serialization_or_repr_hooks():
     assert calls == []
 
 
+def test_oserror_winerror_survives_snapshot_and_serialization():
+    import dill
+
+    error = OSError(2, "missing", "source", 2, "destination")
+    error.winerror = 2
+    saved = SnapshotContext(DumpOptions()).exception(error)["exc_value"]
+    for serializer in (pickle, dill):
+        restored = serializer.loads(serializer.dumps(saved))
+        assert restored.winerror == 2
+        assert str(restored) == str(error)
+
+
 def test_exception_fallback_keeps_custom_message_and_group_children():
     class CustomError(Exception):
         def __str__(self):
