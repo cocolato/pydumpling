@@ -89,6 +89,7 @@ def test_builtin_exception_diagnostics_survive_save_load_and_print(
             for field in (
                 "filename",
                 "filename2",
+                "winerror",
                 "name",
                 "path",
                 "lineno",
