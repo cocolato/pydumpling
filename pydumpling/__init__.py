@@ -1,6 +1,7 @@
 """Bounded Python snapshots for post-mortem debugging."""
 
 from ._version import __version__
+from .capture import capture_pid
 from .debug_dumpling import debug_dumpling, load_dumpling
 from .helpers import catch_any_exception
 from .options import DumpOptions
@@ -10,6 +11,7 @@ from .rpdb import r_post_mortem
 __all__ = [
     "__version__",
     "DumpOptions",
+    "capture_pid",
     "debug_dumpling",
     "load_dumpling",
     "save_dumping",
