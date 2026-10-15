@@ -500,6 +500,10 @@ class SnapshotContext:
             if len(reduced) > 2 and type(reduced[2]) is dict:
                 state = metadata._mapping(reduced[2], priority=("name", "path"))
                 BaseException.__setstate__(saved, state)
+            if isinstance(exc, OSError) and getattr(exc, "winerror", None) is not None:
+                # OSError reduction omits winerror; retain it in pickle state too.
+                saved.winerror = metadata.value(exc.winerror)
+                saved.__dict__["winerror"] = saved.winerror
             self._exception_copies[id(exc)] = saved
             return saved
         except Exception:
