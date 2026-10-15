@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -82,10 +83,10 @@ def test_native_pid_capture_preserves_business_frame(tmp_path):
             "-u",
             "-c",
             (
-                "import time\n"
+                "import os, time\n"
                 "def business():\n"
                 "    marker = 'native-business-local'\n"
-                "    print('ready', flush=True)\n"
+                "    print(os.getpid(), flush=True)\n"
                 "    while True:\n"
                 "        time.sleep(0.01)\n"
                 "business()\n"
@@ -95,10 +96,12 @@ def test_native_pid_capture_preserves_business_frame(tmp_path):
         stderr=subprocess.PIPE,
         text=True,
     )
+    target_pid = None
     try:
-        assert target.stdout.readline().strip() == "ready"
+        # Windows venv executables launch a child that owns the Python runtime.
+        target_pid = int(target.stdout.readline().strip())
         path = capture_pid(
-            target.pid,
+            target_pid,
             tmp_path / "native.dump",
             options=DumpOptions(max_frames=1),
             timeout=10,
@@ -109,5 +112,7 @@ def test_native_pid_capture_preserves_business_frame(tmp_path):
         assert frame.f_locals["marker"] == "native-business-local"
         assert result["traceback"].tb_next is None
     finally:
+        if target_pid is not None and target_pid != target.pid:
+            os.kill(target_pid, signal.SIGTERM)
         target.terminate()
         target.communicate(timeout=10)
