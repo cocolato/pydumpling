@@ -1,118 +1,152 @@
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+"""Pickleable frame adapters used by the standard post-mortem debugger."""
 
-import os
-import sys
-
-import dill
+import builtins
 
 
-class FakeType(object):
+class FakeType:
     @classmethod
-    def _safe_repr(cls, v):
+    def _safe_repr(cls, value):
         try:
-            return repr(v)
-        except Exception as e:
-            return "repr error: %s" % str(e)
-
-    @classmethod
-    def _convert_dict(cls, v):
-        return {cls._convert(k): cls._convert(i) for k, i in v.items()}
-
-    @classmethod
-    def _convert_obj(cls, obj):
-        try:
-            return FakeClass(cls._safe_repr(obj), cls._convert_dict(obj.__dict__))
+            return repr(value)
         except Exception:
-            return cls._convert(obj)
+            return "repr error"
 
     @classmethod
-    def _convert_seq(cls, v):
-        return map(cls._convert, v)
+    def _convert(cls, value):
+        from .options import DumpOptions
+        from .snapshot import SnapshotContext
+
+        return SnapshotContext(DumpOptions()).value(value)
 
     @classmethod
-    def _convert(cls, v):
+    def _convert_dict(cls, value):
+        return cls._convert(value)
 
-        if v is None:
-            return v
+    @classmethod
+    def _convert_obj(cls, value):
+        return cls._convert(value)
 
-        if dill is not None:
-            try:
-                dill.dumps(v)
-                return v
-            except Exception:
-                return cls._safe_repr(v)
-        else:
-            from datetime import date, datetime, time, timedelta
+    @classmethod
+    def _convert_seq(cls, value):
+        return map(cls._convert, value)
 
-            BUILTIN = (str, unicode, int, long, float, date, time, datetime, timedelta) if sys.version_info.major == 2 \
-                else (str, int, float, date, time, datetime, timedelta)  # noqa: F821
 
-            if type(v) in BUILTIN:
-                return v
+class TruncatedValue:
+    """A visible placeholder for data omitted from a bounded snapshot."""
 
-            if isinstance(v, (tuple, list, set)):
-                return type(v)(cls._convert_seq(v))
+    def __init__(self, reason, type_name="object"):
+        self.reason = reason
+        self.type_name = type_name
 
-            if isinstance(v, dict):
-                return cls._convert_dict(v)
-
-            return cls._safe_repr(v)
+    def __repr__(self):
+        return "<%s omitted: %s>" % (self.type_name, self.reason)
 
 
 class FakeTraceback(FakeType):
-
     def __init__(self, traceback=None):
-        self.tb_frame = FakeFrame(
-            traceback.tb_frame) if traceback and traceback.tb_frame else None
-        self.tb_lineno = traceback.tb_lineno if traceback else None
-        self.tb_next = FakeTraceback(
-            traceback.tb_next) if traceback and traceback.tb_next else None
-        self.tb_lasti = traceback.tb_lasti if traceback else 0
+        self.tb_frame = None
+        self.tb_lineno = None
+        self.tb_next = None
+        self.tb_lasti = 0
+        if traceback is not None:
+            from .options import DumpOptions
+            from .snapshot import SnapshotContext
+
+            captured = SnapshotContext(DumpOptions()).from_traceback(traceback)
+            if captured is not None:
+                self.__dict__.update(captured.__dict__)
 
 
 class FakeFrame(FakeType):
     def __init__(self, frame):
-        self.f_code = FakeCode(frame.f_code)
-        self.f_locals = self._convert_dict(frame.f_locals)
-        if "self" in frame.f_locals:
-            self.f_locals["self"] = self._convert_obj(frame.f_locals["self"])
-        self.f_globals = self._convert_dict(frame.f_globals)
-        self.f_lineno = frame.f_lineno
-        self.f_back = FakeFrame(frame.f_back) if frame.f_back else None
-        self.f_lasti = frame.f_lasti
-        self.f_builtins = frame.f_builtins
+        from .options import DumpOptions
+        from .snapshot import SnapshotContext
+
+        context = SnapshotContext(DumpOptions())
+        context.from_frame(frame)
+        self.__dict__.update(context.frames[id(frame)].__dict__)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("f_builtins", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.f_builtins = builtins.__dict__
+        self.__dict__.setdefault("f_locals", {})
+        self.__dict__.setdefault("f_globals", {})
+        self.__dict__.setdefault("f_back", None)
+        self.__dict__.setdefault("f_lasti", 0)
 
 
 class FakeClass(FakeType):
-
     def __init__(self, repr, vals):
+        self.__dict__.update(vals)
         self.__repr = repr
-        self.__dict__.update(vars)
 
     def __repr__(self):
-        return self.__repr
+        return self.__dict__.get("_FakeClass__repr", "<object snapshot>")
 
 
 class FakeCode(FakeType):
-
     def __init__(self, code):
-        self.co_filename = os.path.abspath(code.co_filename)
-        self.co_name = code.co_name
-        self.co_argcount = code.co_argcount
-        self.co_consts = tuple(FakeCode(c) if hasattr(
-            c, "co_filename") else c for c in code.co_consts)
-        self.co_firstlineno = code.co_firstlineno
-        self.co_lnotab = code.co_lnotab
-        self.co_varnames = code.co_varnames
-        self.co_flags = code.co_flags
-        self.co_code = code.co_code
-        self._co_lines = list(code.co_lines()) if hasattr(
-            code, "co_lines") else []
-        if hasattr(code, "co_kwonlyargcount"):
-            self.co_kwonlyargcount = code.co_kwonlyargcount
-        if hasattr(code, "co_positions"):
-            self.co_positions = code.co_positions
+        from .options import DumpOptions
+        from .snapshot import SnapshotContext
+
+        self.__dict__.update(SnapshotContext(DumpOptions()).code(code).__dict__)
 
     def co_lines(self):
-        return iter(self._co_lines)
+        lines = self.__dict__.get("_co_lines")
+        if lines:
+            return iter(lines)
+        # Old Python < 3.10 dumps only stored the legacy line table.
+        line = self.__dict__.get("co_firstlineno", 1)
+        offset = 0
+        result = []
+        table = self.__dict__.get("co_lnotab", b"")
+        for address_delta, line_delta in zip(table[::2], table[1::2]):
+            next_offset = offset + address_delta
+            if next_offset > offset:
+                result.append((offset, next_offset, line))
+            offset = next_offset
+            line += line_delta if line_delta < 128 else line_delta - 256
+        result.append(
+            (offset, max(offset + 2, len(self.__dict__.get("co_code", b""))), line)
+        )
+        return iter(result)
+
+    def co_positions(self):
+        positions = self.__dict__.get("_co_positions", ())
+        sparse = self.__dict__.get("_co_positions_sparse", {})
+        count = max(
+            self.__dict__.get("_co_position_count", 0),
+            len(positions),
+            len(self.__dict__.get("co_code", b"")) // 2,
+            max(sparse, default=-1) + 1,
+            1,
+        )
+        for index in range(count):
+            if index in sparse:
+                yield sparse[index]
+            elif index < len(positions):
+                yield positions[index]
+            else:
+                yield (None, None, None, None)
+
+    def __setstate__(self, state):
+        state = state.copy()
+        legacy_positions = state.pop("co_positions", None)
+        if "_co_positions" not in state and legacy_positions is not None:
+            try:
+                values = (
+                    legacy_positions()
+                    if callable(legacy_positions)
+                    else legacy_positions
+                )
+                state["_co_positions"] = tuple(values)
+            except Exception:
+                state["_co_positions"] = ()
+        state.setdefault("_co_positions", ())
+        state.setdefault("_co_positions_sparse", {})
+        self.__dict__.update(state)
