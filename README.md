@@ -1,184 +1,198 @@
-# Python post-mortem debugging
+# Pydumpling
 
 English | [简体中文](README_zh.md)
 
-It's a fork/optimized version from [elifiner/pydump](https://github.com/elifiner/pydump).The main optimization points are：
-* Save the `Python traceback` anywhere, not just when it's an exception.
-* Optimize code structure && remove redundant code
-* fix bug in python3.10+
-* supported more pdb commnd
-* a useful command line tool for debug
-* supported remote debug (rpdb)
+Pydumpling saves Python exception or live stack snapshots to compressed `.dump`
+files. Print a traceback, inspect saved variables with pdb, or open a remote
+debugger. Derived from [elifiner/pydump](https://github.com/elifiner/pydump).
 
+Requires Python 3.11+. Capturing another process requires CPython 3.14+.
 
-Pydumpling writes the `python current traceback` into a file and 
-can later load it in a Python debugger. It works with the built-in 
-pdb and with other popular debuggers (pudb, ipdb and pdbpp).
+## Install
 
-## Why use pydumpling?
+~~~sh
+python -m pip install pydumpling
+pydumpling --version
+~~~
 
-* We usually use `try... except ... ` to catch exceptions that occur in our programs, but do we really know why they occur?
-* When your project is running online, you suddenly get an unexpected exception that causes the process to exit. How do you reproduce this problem?
-* Not enough information in the logs to help us pinpoint online issues?
-* If we were able to save the exception error and then use the debugger to recover the traceback at that time, we could see the entire stack variables along the traceback as if you had caught the exception at the local breakpoint.
+These examples describe 0.2.0. Install the current checkout with
+`python -m pip install .` to try it before publication.
 
-## Install pydumpling
-Python version：>=3.7
+## Save an exception
 
-```
-pip install pydumpling
-```
+Save this complete example as `example.py` and run `python example.py`:
 
-## How to use pydumpling
-
-
-### Save the python traceback anywhere.
-```python
-from pydumpling import dump_current_traceback
-from inspect import currentframe
-
-
-def inner():
-    a = 1
-    b = "2"
-    dump_current_traceback("test.dump")
-    c = str(a) + b
-
-
-def outer():
-    d = 4
-    inner()
-
-```
-
-### Save the exception traceback.
-
-In the code, find the place where we need to do the `try ... except ...` and use `save_dumpling()`. When we save the dump file, it will default to `${exception filename}-${error lineno}.dump`.
-
-```python
+~~~python
 from pydumpling import save_dumping
 
-def inner():
-    a = 1
-    b = "2"
-    c = a + b
+
+def calculate():
+    quantity = 3
+    price = "12.50"
+    return quantity + price
 
 
-def outer():
-    inner()
+try:
+    calculate()
+except TypeError:
+    save_dumping("error.dump", strict=True)
+~~~
+
+~~~sh
+pydumpling --print error.dump
+pydumpling --debug error.dump
+# The module entry point also works:
+python -m pydumpling --print error.dump
+~~~
+
+Useful pdb commands include `bt`, `u`, `d`, `list`, `ll`, and `pp price`.
+A snapshot lets you inspect saved state; it cannot resume the original program.
+
+## Save the current stack
+
+~~~python
+from pydumpling import dump_current_traceback
 
 
-if __name__ == "__main__":
-    try:
-        outer()
-    except Exception:
-        save_dumping("test.dump")
-
-```
-
-Now we have the `test.dump` file, which we can use `debub_dumpling` to do pdb debug:
-```python     
-Python 3.10.6 (main, Aug  1 2022, 20:38:21) [GCC 5.4.0 20160609] on linux
-Type "help", "copyright", "credits" or "license" for more information.
->>> from pydumpling import debug_dumpling
->>> debug_dumpling("test.dump")
-> /home/loyd/vscodeFiles/pydumpling/test.py(6)inner()
--> c = a + b
-(Pdb) list 1,17
-  1     from pydumpling import save_dumping
-  2  
-  3     def inner():
-  4  >>     a = 1
-  5         b = "2"
-  6  ->     c = a + b
-  7  
-  8  
-  9     def outer():
- 10         inner()
- 11  
- 12  
- 13     if __name__ == "__main__":
- 14         try:
- 15             outer()
- 16         except Exception:
- 17             save_dumping("test.dump")
-(Pdb) ll
-  3     def inner():
-  4  >>     a = 1
-  5         b = "2"
-  6  ->     c = a + b
-(Pdb) bt
-  /home/loyd/vscodeFiles/pydumpling/test.py(15)<module>()
--> outer()
-  /home/loyd/vscodeFiles/pydumpling/test.py(10)outer()
--> inner()
-> /home/loyd/vscodeFiles/pydumpling/test.py(6)inner()
--> c = a + b
-(Pdb) pp a
-1
-(Pdb) pp b
-'2'
-(Pdb) u
-> /home/loyd/vscodeFiles/pydumpling/test.py(10)outer()
--> inner()
-(Pdb) ll
-  9     def outer():
- 10  ->     inner()
-(Pdb) 
-```
-
-### Use Command Line
-
-#### Use command line to print the traceback:
-`python -m pydumpling --print test.deump`
-
-It will print:
-```python
-Traceback (most recent call last):
-  File "/workspaces/pydumpling/tests/test_dump.py", line 20, in test_dumpling
-    outer()
-  File "/workspaces/pydumpling/tests/test_dump.py", line 14, in outer
-    inner()
-  File "/workspaces/pydumpling/tests/test_dump.py", line 10, in inner
-    c = a + b  # noqa: F841
-TypeError: unsupported operand type(s) for +: 'int' and 'str'
-```
+def calculate():
+    quantity = 3
+    price = 12.5
+    dump_current_traceback("current.dump", strict=True)
+    return quantity * price
 
 
-#### Use command line to do pdb debug:
-`python -m pydumpling --debug test.deump`
+calculate()
+~~~
 
-It will open the pdb window:
-```python
--> c = a + b
-(Pdb) 
-```
+Call `catch_any_exception()` once at application startup to capture unhandled
+main-thread exceptions. It installs `sys.excepthook` and retains the previous
+hook for normal exception reporting. It does not install thread or asyncio
+exception handlers.
 
-#### Use command line to do remote pdb debug:
-`python -m pydumpling --rdebug test.deump`
-It will open the debugger on port 4444, then we can access pdb using telnet、netcat... :
-`nc 127.0.0.1 4444`
-![alt text](static/rpdb.png)
+## Limit capture overhead
 
-#### Enable global exception catching:
-```python
-from pydumpling import catch_any_exception
+`DumpOptions()` applies these defaults:
 
-catch_any_exception()
+| Setting | Default |
+| --- | --- |
+| `max_frames` | 64 frames |
+| `max_depth` | 5 nested levels |
+| `max_items` | 100 items per container |
+| `max_string_bytes` | 4,096 bytes per captured string value |
+| `max_nodes` | 10,000 visited values |
+| `max_dump_bytes` | 16 MiB of uncompressed serialized data |
 
-def inner():
-    a = 1
-    b = "2"
-    c = a + b  # noqa: F841
+Values may be summarized when a budget is reached. Customize the budget or
+explicitly request unrestricted capture:
 
+~~~python
+from pydumpling import DumpOptions, dump_current_traceback
 
-def outer():
-    inner()
-    
-if __name__ == "__main__":
-    outer()
-   
-```
+dump_current_traceback(
+    "small.dump",
+    options=DumpOptions(max_frames=16, max_depth=3, max_items=25),
+    strict=True,
+)
+dump_current_traceback("unlimited.dump", options=DumpOptions.unlimited(), strict=True)
+~~~
 
-## TODO
-- []
+Unrestricted capture can consume substantial resources and permits custom
+object serialization hooks to execute. Omission reasons and applied budgets are
+recorded in the loaded snapshot's `snapshot_meta` dictionary.
+Unrestricted original objects can depend on their original environment or
+custom loading hooks; successful round-trips are not guaranteed for every object.
+The default readable snapshot mode is unaffected.
+
+`save_dumping(filename=None, exc_info=None, *, options=None, strict=False)` and
+`dump_current_traceback(filename=None, *, options=None, strict=False)` report
+capture/write failures as warnings by default. Use `strict=True` to raise them.
+`catch_any_exception(*, options=None)` accepts the same budgets.
+
+Loading and debugging default to at most 64 MiB of decompressed dump data.
+`load_dumpling(path, max_bytes=None)` or `debug_dumpling(path, max_bytes=None)`
+disables this limit; the CLI equivalent is `--max-load-mib 0`.
+
+## Capture a running process by PID
+
+Run this target program with CPython 3.14+ and updated Pydumpling installed:
+
+~~~python
+import os
+import time
+
+import pydumpling
+
+print(f"PID: {os.getpid()}", flush=True)
+counter = 0
+while True:
+    counter += 1
+    time.sleep(0.1)
+~~~
+
+In another terminal, replace `12345` with the printed PID:
+
+~~~sh
+pydumpling --capture-pid 12345 --output live.dump --timeout 30
+pydumpling --print live.dump
+~~~
+
+The API is `capture_pid(pid, filename, *, options=None, timeout=30) -> Path`.
+Controller and target must use the same CPython version on the same machine,
+under the same user, with shared process and filesystem namespaces. The target
+must have updated Pydumpling installed and permit CPython remote execution.
+Operating system permissions may also prevent attachment.
+
+A timeout stops waiting; an already dispatched request can still execute later.
+The CLI prints the retained request directory on timeout. Avoid submitting
+repeated requests while one is pending. Use `--unlimited` to remove capture
+budgets explicitly.
+Remove retained request files only after `status.json` confirms completion or
+the target process has exited.
+
+## Remote inspection
+
+The debugger defaults to `127.0.0.1:4444`:
+
+~~~sh
+# Server:
+pydumpling --rdebug error.dump --host 127.0.0.1 --port 4444
+
+# Workstation:
+ssh -L 4444:127.0.0.1:4444 user@server
+# A second local terminal:
+nc 127.0.0.1 4444
+~~~
+
+Remote pdb allows Python expression execution and has no built-in authentication
+or encryption. Keep it on loopback and use an SSH tunnel.
+
+## Trust and privacy
+
+Only load trusted dumps: dill and pickle deserialization can execute code.
+Size limits do not make an untrusted file safe. Snapshots can contain local
+variables, credentials, personal data, and other application state; control file
+access, retention, and sharing.
+
+Inspect dumps with matching Python and source versions. Cross-version loading
+and third-party debugger compatibility are not guaranteed. Old 0.1 dumps remain
+readable when their objects are compatible with the interpreter.
+See [0.2 migration notes](CHANGELOG.md).
+
+## Development
+
+~~~sh
+uv sync --locked --dev --extra doc
+uv run --locked ruff check .
+uv run --locked ruff format --check .
+uv run --locked pytest --cov=pydumpling --cov-report=term-missing
+uv run --locked --extra doc sphinx-build -W --keep-going -b html docs/source docs/build/html
+uv build --sdist
+uv build --wheel dist/pydumpling-0.2.0.tar.gz
+uv run --locked twine check --strict dist/*
+~~~
+
+`uv.lock` is committed. Run `uv lock` after deliberately changing dependencies
+and include the updated lockfile. CI checks Linux on Python 3.11–3.15 and Python
+3.14 on Windows/macOS, with an 85% coverage floor, strict documentation builds,
+and installed-wheel checks outside the source checkout. Hatchling builds
+distributions; uv manages development environments.
