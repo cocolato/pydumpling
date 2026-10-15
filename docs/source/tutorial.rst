@@ -1,191 +1,123 @@
 Tutorial
-=========
+========
 
-Save the python traceback anywhere
------------------------------------
+Save an exception
+-----------------
+
+Save the following as ``example.py`` and run ``python example.py``:
 
 .. code-block:: python
 
-    from pydumpling import dump_current_traceback
+   from pydumpling import save_dumping
 
 
-    def inner():
-        a = 1
-        b = "2"
-        dump_current_traceback("test.dump")
-        c = str(a) + b
+   def calculate():
+       quantity = 3
+       price = "12.50"
+       return quantity + price
 
 
-    def outer():
-        d = 4
-        inner()
+   try:
+       calculate()
+   except TypeError:
+       save_dumping("error.dump", strict=True)
 
-    outer()
-
-
-
-Save the exception traceback
-----------------------------
-.. code-block:: python
-
-    from pydumpling import save_dumping
-
-    def inner():
-        a = 1
-        b = "2"
-        c = a + b
-
-
-    def outer():
-        inner()
-
-
-    if __name__ == "__main__":
-        try:
-            outer()
-        except Exception:
-            save_dumping("test.dump")
-
-
-Use ``debug_dumpling`` to do pdb debug
---------------------------------------
+Print the snapshot or start pdb:
 
 .. code-block:: console
 
-    Python 3.10.6 (main, Aug  1 2022, 20:38:21) [GCC 5.4.0 20160609] on linux
-    Type "help", "copyright", "credits" or "license" for more information.
-    >>> from pydumpling import debug_dumpling
-    >>> debug_dumpling("test.dump")
-    > /home/loyd/vscodeFiles/pydumpling/test.py(6)inner()
-    -> c = a + b
-    (Pdb) list 1,17
-      1     from pydumpling import save_dumping
-      2
-      3     def inner():
-      4  >>     a = 1
-      5         b = "2"
-      6  ->     c = a + b
-      7
-      8
-      9     def outer():
-     10         inner()
-     11
-     12
-     13     if __name__ == "__main__":
-     14         try:
-     15             outer()
-     16         except Exception:
-     17             save_dumping("test.dump")
-    (Pdb) ll
-      3     def inner():
-      4  >>     a = 1
-      5         b = "2"
-      6  ->     c = a + b
-    (Pdb) bt
-      /home/loyd/vscodeFiles/pydumpling/test.py(15)<module>()
-    -> outer()
-      /home/loyd/vscodeFiles/pydumpling/test.py(10)outer()
-    -> inner()
-    > /home/loyd/vscodeFiles/pydumpling/test.py(6)inner()
-    -> c = a + b
-    (Pdb) pp a
-    1
-    (Pdb) pp b
-    '2'
-    (Pdb) u
-    > /home/loyd/vscodeFiles/pydumpling/test.py(10)outer()
-    -> inner()
-    (Pdb) ll
-      9     def outer():
-     10  ->     inner()
-    (Pdb)
+   pydumpling --print error.dump
+   pydumpling --debug error.dump
 
-Use command line
-----------------
+Use ``bt``, ``u``, ``d``, ``list``, ``ll``, and ``pp price`` to inspect the stack
+and variables. A dump is a saved snapshot, not a resumable Python process.
+Keep the matching Python interpreter and source checkout available.
 
-help message
-
-.. code-block:: console
-
-    python -m pydumpling --help
-
-.. code-block:: text
-
-    usage: pydumpling [options] filename
-
-    pydumpling cli tools
-
-    positional arguments:
-      filename    the .dump file
-
-    options:
-      -h, --help  show this help message and exit
-      --print     print traceback information
-      --debug     enter pdb debugging interface
-      --rdebug    enter rpdb debugging interface
-
-Print the traceback
-###################
-
-Use ``pydumpling --print test.dump`` to print the traceback information.
-
-It will print the following information:
-
-.. code-block:: text
-
-    Traceback (most recent call last):
-    File "/workspaces/pydumpling/tests/test_dump.py", line 20, in test_dumpling
-      outer()
-    File "/workspaces/pydumpling/tests/test_dump.py", line 14, in outer
-      inner()
-    File "/workspaces/pydumpling/tests/test_dump.py", line 10, in inner
-      c = a + b  # noqa: F841
-    TypeError: unsupported operand type(s) for +: 'int' and 'str'
-
-
-Do pdb debug with dump file
-############################
-
-Use ``pydumpling --debug test.deump`` to do pdb debugging with dump file.
-
-It will open the pdb window:
-
-.. code-block:: text
-
-    -> c = a + b
-    (Pdb)
-
-
-Do remote debug with dump file
-##############################
-Use ``python -m pydumpling --rdebug test.dump`` to do remote debug.
-It will open the debugger on port 4444, then we can access pdb using `telnet`_, `netcat`_ .
-
-.. _telnet: https://en.wikipedia.org/wiki/Telnet#Modern_day_uses
-.. _netcat: https://netcat.sourceforge.net/
-
-
-.. image:: _static/rpdb.png
-
-
-Enable global exception catching
-################################
+Save the current stack
+----------------------
 
 .. code-block:: python
 
-    from pydumpling import catch_any_exception
-
-    catch_any_exception()
-
-    def inner():
-        a = 1
-        b = "2"
-        c = a + b  # noqa: F841
+   from pydumpling import dump_current_traceback
 
 
-    def outer():
-        inner()
-        
-    if __name__ == "__main__":
-        outer()
+   def calculate():
+       quantity = 3
+       price = 12.5
+       dump_current_traceback("current.dump", strict=True)
+       return quantity * price
+
+
+   calculate()
+
+For unhandled main-thread exceptions, call ``catch_any_exception()`` once during
+application startup. It retains the previous ``sys.excepthook`` for normal
+reporting. Thread and asyncio exception handlers are outside its scope.
+
+See :doc:`api` for capture budgets, strict failures, and loading limits.
+
+Capture a running process
+-------------------------
+
+Run this target program with CPython 3.14+ and updated Pydumpling installed:
+
+.. code-block:: python
+
+   import os
+   import time
+
+   import pydumpling
+
+   print(f"PID: {os.getpid()}", flush=True)
+   counter = 0
+   while True:
+       counter += 1
+       time.sleep(0.1)
+
+In another terminal, replace ``12345`` with the printed PID:
+
+.. code-block:: console
+
+   pydumpling --capture-pid 12345 --output live.dump --timeout 30
+   pydumpling --print live.dump
+
+The controller and target must use the same CPython version, be on the same
+machine under the same user, and share process and filesystem namespaces. The
+target must have updated Pydumpling installed and permit CPython remote
+execution. Operating system permissions may also prevent attachment.
+
+A timeout ends the controller's wait; it cannot cancel an already dispatched
+request. The target may execute the retained request script later. The CLI prints
+the request directory on timeout. Avoid submitting repeated pending requests.
+Remove retained request files only after ``status.json`` confirms completion or
+the target has exited.
+Use ``--unlimited`` to disable capture budgets explicitly.
+
+Remote pdb through SSH
+----------------------
+
+Run the debugger on the server, then forward the loopback port from your
+workstation:
+
+.. code-block:: console
+
+   # Server:
+   pydumpling --rdebug error.dump --host 127.0.0.1 --port 4444
+   # Workstation:
+   ssh -L 4444:127.0.0.1:4444 user@server
+   # A second local terminal:
+   nc 127.0.0.1 4444
+
+The server defaults to ``127.0.0.1:4444``. Remote pdb allows Python expression
+execution and has no built-in authentication or encryption, so keep it on
+loopback and use an SSH tunnel.
+
+Trust and privacy
+-----------------
+
+Only deserialize trusted dumps. The default 64 MiB decompressed loading limit
+does not prevent dill or pickle from executing code. Snapshot values may include
+credentials and personal data; control file permissions, retention, and
+sharing. Third-party debugger and cross-Python-version compatibility are not
+guaranteed.
 
