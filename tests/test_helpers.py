@@ -104,7 +104,9 @@ def test_falsey_exception_prints_and_notices_are_visible(capsys, monkeypatch):
     ],
 )
 def test_report_escapes_text_the_stream_cannot_encode(encoding, errors, text, expected):
-    stream = io.TextIOWrapper(io.BytesIO(), encoding=encoding, errors=errors)
+    stream = io.TextIOWrapper(
+        io.BytesIO(), encoding=encoding, errors=errors, newline="\n"
+    )
     print_traceback_and_except(
         {"traceback": None, "exc_extra": {"formatted": [f"OSError: {text}\n"]}},
         file=stream,
@@ -124,7 +126,9 @@ def test_discarding_a_stream_without_a_descriptor_is_a_no_op():
 
 
 def test_report_keeps_what_the_stream_handler_can_encode():
-    stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="surrogateescape")
+    stream = io.TextIOWrapper(
+        io.BytesIO(), encoding="utf-8", errors="surrogateescape", newline="\n"
+    )
     print_traceback_and_except(
         {"traceback": None, "exc_extra": {"formatted": ["OSError: /tmp/\udcff\n"]}},
         file=stream,
