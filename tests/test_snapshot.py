@@ -1,3 +1,4 @@
+import os
 import pickle
 import sys
 import traceback
@@ -6,9 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from pydumpling import dump_current_traceback, load_dumpling
 from pydumpling.fake_types import FakeClass, TruncatedValue
 from pydumpling.options import DumpOptions
-from pydumpling.snapshot import SnapshotContext
+from pydumpling.pydumpling import _capture_frame
+from pydumpling.snapshot import _CODE_BYTES_LIMIT, _CODE_TEXT_LIMIT, SnapshotContext
 
 
 def make_stack(count):
@@ -252,3 +255,199 @@ def test_reducing_snapshot_values_preserves_placeholders_and_representations():
     assert repr(reduced) == repr(value)
     assert reduced.omitted is omitted
     assert reduced.self is reduced
+
+
+def test_attribute_names_are_names_not_string_data():
+    class Registry(dict):
+        def __init__(self):
+            super().__init__(entries=1)
+            self.owner_team = "platform"
+
+    holder = _MetadataProbe()
+    holder.long_attribute_name = "value"
+    context = SnapshotContext(DumpOptions(max_string_bytes=4))
+    registry, plain = context.value([Registry(), holder])
+    # Values obey the string budget; the names that reach them do not.
+    assert registry.owner_team == "plat"
+    assert plain.long_attribute_name == "valu"
+
+
+def test_global_names_used_by_the_frame_come_first(tmp_path):
+    path = tmp_path / "priority.dump"
+    namespace = {"__name__": "business"}
+    namespace.update((f"unused{index}", index) for index in range(5))
+    namespace.update(
+        zeta=1,
+        path=path,
+        dump_current_traceback=dump_current_traceback,
+        DumpOptions=DumpOptions,
+    )
+    exec(
+        "def business():\n"
+        "    dump_current_traceback(\n"
+        "        path, options=DumpOptions(max_frames=1, max_items=5), strict=True\n"
+        "    )\n"
+        "    return zeta\n",
+        namespace,
+    )
+    namespace["business"]()
+    names = set(load_dumpling(path)["traceback"].tb_frame.f_globals)
+    # With room for five globals, the names the code reads win over the rest,
+    # and ``__builtins__`` is never captured.
+    assert names == {
+        "__name__",
+        "dump_current_traceback",
+        "path",
+        "DumpOptions",
+        "zeta",
+    }
+
+
+def test_deep_value_does_not_cost_the_rest_of_the_frame(tmp_path):
+    path = tmp_path / "recursion.dump"
+
+    def business():
+        deep = current = []
+        for _ in range(3000):
+            nested = []
+            current.append(nested)
+            current = nested
+        important = 42
+        dump_current_traceback(
+            path, options=DumpOptions(max_frames=1, max_depth=None), strict=True
+        )
+        return deep, important
+
+    business()
+    result = load_dumpling(path)
+    metadata = result["snapshot_meta"]
+    # (dill may still give up on the deep list; pickle then writes it.)
+    assert all("serializer" in attempt for attempt in metadata["attempts"])
+    assert metadata["truncation"]["recursion"] == 1
+    assert "concurrent_mutation" not in metadata["truncation"]
+    variables = result["traceback"].tb_frame.f_locals
+    # The deep value is summarized; the other locals stay.
+    assert variables["deep"].reason == "recursion"
+    assert variables["important"] == 42
+
+
+def test_recursion_overflow_in_a_nested_mapping_is_not_a_concurrent_mutation():
+    deep = current = {}
+    for _ in range(3000):
+        current["next"] = current = {}
+    context = SnapshotContext(DumpOptions(max_depth=None))
+    captured = context.value({"deep": deep, "kept": 1})
+    # The root mapping recovers; nothing is misfiled as concurrent mutation.
+    assert captured["kept"] == 1 and captured["deep"].reason == "recursion"
+    truncation = context.metadata()["truncation"]
+    assert truncation["recursion"] == 1
+    assert "concurrent_mutation" not in truncation
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows cannot remove the working directory"
+)
+def test_capture_survives_a_deleted_working_directory(tmp_path, monkeypatch):
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    namespace = {}
+    exec(
+        compile(
+            "import sys\ndef f():\n    return sys._getframe()\n", "relative.py", "exec"
+        ),
+        namespace,
+    )
+    frame = namespace["f"]()
+    os.rmdir(gone)
+    path = tmp_path / "relative.dump"
+    _capture_frame(frame, path, options=DumpOptions(max_frames=1))
+    code = load_dumpling(path)["traceback"].tb_frame.f_code
+    # A relative path beats losing the whole snapshot.
+    assert code.co_filename == "relative.py"
+
+
+class _MetadataProbe:
+    pass
+
+
+def a_very_long_function_name_for_metadata():
+    return None
+
+
+def test_code_metadata_is_not_limited_by_max_string_bytes():
+    context = SnapshotContext(DumpOptions(max_string_bytes=2))
+    code = context.code(a_very_long_function_name_for_metadata.__code__)
+    assert code.co_name == "a_very_long_function_name_for_metadata"
+    assert code.co_filename.endswith("test_snapshot.py")
+    assert "code_metadata" not in context.metadata()["truncation"]
+    # Application strings still honour the configured budget.
+    assert context.value("abcdef") == "ab"
+    assert context.metadata()["truncation"]["max_string_bytes"] == 1
+    assert repr(context.value(_MetadataProbe())) == (
+        f"<{__name__}._MetadataProbe snapshot>"
+    )
+
+
+def test_code_metadata_has_its_own_visible_bounds():
+    code = (lambda: None).__code__
+    oversized_text = code.replace(co_filename="f" * (_CODE_TEXT_LIMIT + 10))
+    oversized_bytes = code.replace(co_code=b"\x00" * (_CODE_BYTES_LIMIT + 2))
+    for original in (oversized_text, oversized_bytes):
+        context = SnapshotContext(DumpOptions(max_string_bytes=8))
+        context.code(original)
+        truncation = context.metadata()["truncation"]
+        # Bounded by the metadata limit, reported, and not charged to the
+        # application's string budget.
+        assert truncation["code_metadata"] == 1
+        assert "max_string_bytes" not in truncation
+        # Unlimited capture disables every budget, including these.
+        unlimited = SnapshotContext(DumpOptions.unlimited())
+        captured = unlimited.code(original)
+        assert captured.co_filename.endswith(original.co_filename)
+        assert captured.co_code == original.co_code
+        assert "code_metadata" not in unlimited.metadata()["truncation"]
+
+
+def test_frame_variable_names_survive_a_tiny_string_budget(tmp_path):
+    path = tmp_path / "names.dump"
+
+    def business():
+        application_string = "value"
+        dump_current_traceback(
+            path,
+            options=DumpOptions(max_frames=1, max_string_bytes=4),
+            strict=True,
+        )
+        return application_string
+
+    business()
+    variables = load_dumpling(path)["traceback"].tb_frame.f_locals
+    # The name is an identifier; the value is application data.
+    assert variables["application_string"] == "valu"
+    assert "appl" not in variables
+
+
+def test_global_names_survive_a_local_holding_globals(tmp_path):
+    path = tmp_path / "globals.dump"
+    namespace = {
+        "dump_current_traceback": dump_current_traceback,
+        "DumpOptions": DumpOptions,
+        "path": path,
+    }
+    exec(
+        "application_global = 'value'\n"
+        "def business():\n"
+        "    namespace = globals()\n"
+        "    dump_current_traceback(\n"
+        "        path, options=DumpOptions(max_frames=1, max_string_bytes=4),\n"
+        "        strict=True,\n"
+        "    )\n",
+        namespace,
+    )
+    namespace["business"]()
+    frame = load_dumpling(path)["traceback"].tb_frame
+    # The local reaches the namespace first; its names must still survive.
+    assert frame.f_globals["application_global"] == "valu"
+    assert "appl" not in frame.f_globals
+    assert frame.f_locals["namespace"] is frame.f_globals

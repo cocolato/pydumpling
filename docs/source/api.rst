@@ -66,6 +66,19 @@ prefixes and reports omitted characters. Metadata records ``exception_summary``;
 ``code_payload_omitted`` counts code objects whose constants or bytecode were omitted.
 Budgets too small for even frame structure and metadata still cause capture to fail.
 
+Code metadata is not application data and does not follow ``max_string_bytes``.
+File names, function and class names, variable and name tables, bytecode,
+frame variable names, and attribute names keep separate fixed bounds, so a small
+string budget cannot rewrite the file or function named in a frame header,
+rename a local or an attribute, or make ``pp`` fail to find it. That holds even
+when a local such as ``globals()`` reaches a frame namespace first. Metadata
+truncation is reported as
+``code_metadata``; ``DumpOptions.unlimited()`` removes these bounds too.
+
+When ``max_depth`` is ``None``, a value nested too deeply for the interpreter is
+replaced by a placeholder and reported as ``recursion``; the other variables of
+its frame are kept.
+
 .. code-block:: python
 
    from pydumpling import DumpOptions, dump_current_traceback

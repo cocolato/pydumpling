@@ -117,11 +117,14 @@ def test_builtin_exception_diagnostics_survive_save_load_and_print(
         else:
             assert str(saved) == expected_message
     print_traceback_and_except(result)
-    output = capsys.readouterr().out
+    captured = capsys.readouterr()
     if scenario == "bounded":
-        assert "oversized-" + "x" * 22 in output
+        # Application data still obeys the budget...
+        assert "oversized-" + "x" * 22 in captured.out
+        # ...while the frame header keeps the real file and function names.
+        assert "in test_builtin_exception_diagnostics_survive" in captured.out
     else:
-        assert expected_display in output
+        assert expected_display in captured.out
 
 
 @pytest.mark.parametrize("minimal", [False, True])
@@ -538,3 +541,23 @@ def test_frame_capture_does_not_skip_input(tmp_path):
         )
     finally:
         del frame
+
+
+def test_tiny_string_budget_keeps_frame_identifiers(tmp_path):
+    def crash():
+        return 1 / 0
+
+    path = tmp_path / "identifiers.dump"
+    try:
+        crash()
+    except ZeroDivisionError:
+        save_dumping(
+            path, options=DumpOptions(max_frames=1, max_string_bytes=2), strict=True
+        )
+    result = load_dumpling(path)
+    frame = result["traceback"].tb_frame
+    # Code metadata is diagnostic structure, not a captured string value.
+    assert frame.f_code.co_name == "crash"
+    assert frame.f_code.co_filename.endswith("test_dump.py")
+    # User-facing text still obeys the budget.
+    assert result["snapshot_meta"]["truncation"]["max_string_bytes"]
