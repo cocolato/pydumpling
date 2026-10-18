@@ -15,7 +15,7 @@ python -m pip install pydumpling
 pydumpling --version
 ~~~
 
-以下示例对应 0.2.0。发布前体验当前仓库代码，可使用 `python -m pip install .`。
+以下示例对应 0.2.0。
 
 ## 保存异常现场
 

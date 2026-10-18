@@ -15,8 +15,7 @@ python -m pip install pydumpling
 pydumpling --version
 ~~~
 
-These examples describe 0.2.0. Install the current checkout with
-`python -m pip install .` to try it before publication.
+These examples describe 0.2.0.
 
 ## Save an exception
 
