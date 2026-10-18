@@ -1,6 +1,8 @@
 """Pickleable frame adapters used by the standard post-mortem debugger."""
 
 import builtins
+import pprint
+import reprlib
 
 
 class FakeType:
@@ -40,6 +42,103 @@ class TruncatedValue:
 
     def __repr__(self):
         return "<%s omitted: %s>" % (self.type_name, self.reason)
+
+
+class FakeContainer:
+    """Mixin for a captured instance of a dict, list, tuple, or set subclass.
+
+    Entries live in the builtin base, ``_base``.  The original type name,
+    instance attributes, slots, and named fields live in ``__dict__``.
+    """
+
+    __slots__ = ()
+
+    def __hash__(self):
+        # Immutable copies hash like the tuple or frozenset they equal, so an
+        # equal plain value finds them in a captured dict or set.  Mutable
+        # copies, and immutable ones holding unhashable entries, hash by
+        # identity so every copy still works as a set member or mapping key.
+        base = type(self)._base
+        if base is tuple or base is frozenset:
+            try:
+                return base.__hash__(self)
+            except TypeError:
+                pass
+        return object.__hash__(self)
+
+    @reprlib.recursive_repr()
+    def __repr__(self):
+        return "%s(%r)" % (_original_name(self), type(self)._base(self))
+
+    def __reduce_ex__(self, protocol):
+        # Pickle's default reduction calls ``self.items()``, which a captured
+        # attribute named ``items`` would hide, so entries are read through
+        # the builtin base.  Mutable entries travel in the state, restored
+        # after the empty copy is memoized, so a copy containing itself still
+        # pickles; immutable entries cannot refer back to their copy.
+        cls = type(self)
+        base = cls._base
+        entries = list(dict.items(self) if base is dict else base.__iter__(self))
+        if cls._extend is None:
+            return cls, (entries,), (self.__dict__, ())
+        return cls, (), (self.__dict__, entries)
+
+    def __setstate__(self, state):
+        attributes, entries = state
+        if entries:
+            type(self)._extend(self, entries)
+        if attributes:
+            self.__dict__.update(attributes)
+
+
+class FakeDict(FakeContainer, dict):
+    _base, _extend = dict, dict.update
+
+
+class FakeList(FakeContainer, list):
+    _base, _extend = list, list.extend
+
+
+class FakeTuple(FakeContainer, tuple):
+    _base, _extend = tuple, None
+
+
+class FakeSet(FakeContainer, set):
+    _base, _extend = set, set.update
+
+
+class FakeFrozenSet(FakeContainer, frozenset):
+    _base, _extend = frozenset, None
+
+
+def _original_name(copy):
+    return copy.__dict__.get("_FakeContainer__type", type(copy)._base.__name__)
+
+
+def _pprint_container(printer, value, stream, indent, allowance, context, level):
+    name = _original_name(value)
+    stream.write(name + "(")
+    indent += len(name) + 1
+    if type(value)._base is dict and dict.__len__(value):
+        # A plain dict would have its keys sorted; keep the captured order.
+        stream.write("{")
+        printer._format_dict_items(
+            list(dict.items(value)), stream, indent, allowance + 2, context, level
+        )
+        stream.write("}")
+    else:
+        printer._format(
+            type(value)._base(value), stream, indent, allowance + 1, context, level
+        )
+    stream.write(")")
+
+
+# pprint, and so pdb's ``pp``, lays out only types whose ``__repr__`` it knows;
+# without this a long copy would print on a single line.
+if hasattr(pprint.PrettyPrinter, "_dispatch") and hasattr(
+    pprint.PrettyPrinter, "_format_dict_items"
+):
+    pprint.PrettyPrinter._dispatch[FakeContainer.__repr__] = _pprint_container
 
 
 class FakeTraceback(FakeType):

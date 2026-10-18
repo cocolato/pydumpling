@@ -1,17 +1,30 @@
+import builtins
 import os
 import pickle
 import sys
 import traceback
+import tracemalloc
+from collections import Counter, OrderedDict, defaultdict, namedtuple
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
 
-from pydumpling import dump_current_traceback, load_dumpling
-from pydumpling.fake_types import FakeClass, TruncatedValue
+from pydumpling import dump_current_traceback, load_dumpling, save_dumping
+from pydumpling.fake_types import (
+    FakeClass,
+    FakeDict,
+    FakeList,
+    FakeTuple,
+    TruncatedValue,
+)
 from pydumpling.options import DumpOptions
 from pydumpling.pydumpling import _capture_frame
-from pydumpling.snapshot import _CODE_BYTES_LIMIT, _CODE_TEXT_LIMIT, SnapshotContext
+from pydumpling.snapshot import (
+    _CODE_BYTES_LIMIT,
+    _CODE_TEXT_LIMIT,
+    SnapshotContext,
+)
 
 
 def make_stack(count):
@@ -257,6 +270,263 @@ def test_reducing_snapshot_values_preserves_placeholders_and_representations():
     assert reduced.self is reduced
 
 
+def test_container_subclasses_keep_entries_type_and_attributes():
+    import dill
+
+    class Registry(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.owner = "team-a"
+
+    class SlottedList(list):
+        __slots__ = ("owner",)
+
+    record = namedtuple("Record", "x y")
+    ordered = OrderedDict(a=1, b=2, c=3)
+    ordered.move_to_end("a")
+    slotted = SlottedList([1, 2])
+    slotted.owner = "team-b"
+    status = os.stat(__file__)
+    context = SnapshotContext(DumpOptions())
+    captured = context.value(
+        {
+            "counter": Counter("aab"),
+            "ordered": ordered,
+            "default": defaultdict(list, items=[1]),
+            "record": record(1, 2),
+            "status": status,
+            "registry": Registry(entries=2),
+            "slotted": slotted,
+            "unset": SlottedList([3]),
+        }
+    )
+    assert type(captured["counter"]) is FakeDict
+    assert repr(captured["counter"]) == "collections.Counter({'a': 2, 'b': 1})"
+    # dict.items would replay insertion order; an LRU cache needs link order.
+    assert list(captured["ordered"]) == ["b", "c", "a"]
+    assert captured["default"] == {"items": [1]}
+    assert "default_factory" in vars(captured["default"])
+    # Named fields and struct sequence fields outside the tuple stay attributes.
+    assert type(captured["record"]) is FakeTuple
+    assert captured["record"] == (1, 2) and captured["record"].x == 1
+    assert captured["status"] == tuple(status)
+    assert captured["status"].st_mtime == status.st_mtime
+    assert captured["registry"] == {"entries": 2}
+    assert captured["registry"].owner == "team-a"
+    assert type(captured["slotted"]) is FakeList
+    assert captured["slotted"].owner == "team-b"
+    assert "owner" not in vars(captured["unset"])
+    # Nothing is lost except default_factory, a class, which is never captured.
+    assert context.metadata()["truncation"] == {"unsupported_type": 1}
+    for restored in (
+        pickle.loads(pickle.dumps(captured)),
+        dill.loads(dill.dumps(captured)),
+        # A reduction stage captures the copies again.
+        SnapshotContext(DumpOptions()).value(captured),
+    ):
+        assert repr(restored["counter"]) == repr(captured["counter"])
+        assert restored["record"].y == 2
+        assert restored["status"].st_size == status.st_size
+        assert restored["registry"].owner == "team-a"
+
+
+@pytest.mark.parametrize(
+    "options, reason",
+    [
+        (DumpOptions(max_items=1), "max_items"),
+        (DumpOptions(max_items=None, max_nodes=3), "max_nodes"),
+    ],
+)
+def test_ordered_dict_budget_bounds_temporary_memory(options, reason):
+    value = OrderedDict((i, i + 20000) for i in range(20000))
+    value.move_to_end(0)
+    context = SnapshotContext(options)
+    # Measure capture allocations, excluding the already-existing application data.
+    tracemalloc.start()
+    try:
+        captured = context.value(value)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert list(captured.items()) == [(1, 20001)]
+    assert context.metadata()["truncation"][reason] == 1
+    assert peak < 512 * 1024
+
+
+def test_ordered_dict_with_hooked_keys_keeps_the_frame(tmp_path):
+    class Key:
+        armed = False
+
+        def __hash__(self):
+            if Key.armed:
+                raise AssertionError("application __hash__ called")
+            return 1
+
+    path = tmp_path / "ordered.dump"
+
+    def business():
+        important = 42
+        ordered = OrderedDict([(Key(), "first"), ("plain", 1)])
+        ordered.move_to_end("plain", last=False)
+        Key.armed = True
+        try:
+            dump_current_traceback(path, options=DumpOptions(max_frames=1), strict=True)
+        finally:
+            Key.armed = False
+        return important, ordered
+
+    business()
+    result = load_dumpling(path)
+    assert result["snapshot_meta"]["attempts"] == []
+    variables = result["traceback"].tb_frame.f_locals
+    assert variables["important"] == 42
+    # CPython's OrderedDict iterator would hash the key, so the entries keep
+    # insertion order instead of link order, and the snapshot says so.
+    assert list(variables["ordered"].values()) == ["first", 1]
+    assert result["snapshot_meta"]["truncation"]["mapping_order"] == 1
+
+
+def test_ordered_dict_with_plain_tuple_keys_keeps_link_order():
+    ordered = OrderedDict([((1, "a"), 1), ((2, "b"), 2)])
+    ordered.move_to_end((1, "a"))
+    context = SnapshotContext(DumpOptions())
+    assert list(context.value(ordered)) == [(2, "b"), (1, "a")]
+    assert "mapping_order" not in context.metadata()["truncation"]
+
+
+def test_ordered_dict_budget_preserves_priority_and_memoized_keys():
+    value = OrderedDict(a=None, b=None, c=None)
+    value.move_to_end("a")
+    context = SnapshotContext(DumpOptions(max_nodes=6))
+    for key in value:
+        context.value(key)
+    context.value(None)
+    captured = context._mapping(value, priority=("c",))
+    assert list(captured.items()) == [("c", None), ("b", None), ("a", None)]
+    assert context.metadata()["truncation"] == {}
+
+
+@pytest.mark.parametrize(
+    "options, expected, reason",
+    [
+        (DumpOptions(max_items=1), {"a": 1}, "max_items"),
+        (DumpOptions(max_nodes=3), {"a": 1, "b": 2}, "max_nodes"),
+    ],
+)
+def test_container_slots_respect_budgets(options, expected, reason):
+    class SlottedList(list):
+        __slots__ = ("a", "b", "c", "unset")
+
+    value = SlottedList()
+    value.a, value.b, value.c = 1, 2, 3
+    context = SnapshotContext(options)
+    captured = context.value(value)
+    attributes = vars(captured).copy()
+    attributes.pop("_FakeContainer__type")
+    assert attributes == expected
+    assert context.metadata()["truncation"] == {reason: 1}
+
+
+def test_container_slots_share_item_budget_with_instance_attributes():
+    class SlottedList(list):
+        __slots__ = ("a", "__dict__")
+
+    value = SlottedList()
+    value.a, value.owner = 1, "team-a"
+    context = SnapshotContext(DumpOptions(max_items=1))
+    captured = context.value(value)
+    assert captured.owner == "team-a"
+    assert not hasattr(captured, "a")
+    assert context.metadata()["truncation"] == {"max_items": 1}
+
+
+def test_container_copies_with_cycles_or_shadowing_attributes_serialize(tmp_path):
+    import dill
+
+    class EasyDict(dict):
+        """Mirrors every key as an attribute, as config objects often do."""
+
+        def __init__(self, **entries):
+            super().__init__(**entries)
+            self.__dict__.update(entries)
+
+    class Looped(list):
+        pass
+
+    class LoopedSet(set):
+        __hash__ = object.__hash__
+
+    path = tmp_path / "cycles.dump"
+
+    def business():
+        important = 42
+        config = EasyDict(items=[1], name="cfg")
+        looped = Looped()
+        looped.append(looped)
+        looped_set = LoopedSet()
+        looped_set.add(looped_set)
+        looped_set.owner = "team-a"
+        dump_current_traceback(path, options=DumpOptions(max_frames=1), strict=True)
+        return important, config, looped, looped_set
+
+    business()
+    result = load_dumpling(path)
+    # One such value must not cost the frame: both serializers succeed, so the
+    # writer never falls back to a minimal snapshot.
+    assert result["snapshot_meta"]["attempts"] == []
+    variables = result["traceback"].tb_frame.f_locals
+    assert variables["important"] == 42
+    # ``items`` shadows dict.items on the copy, as it does on the original.
+    assert variables["config"] == {"items": [1], "name": "cfg"}
+    assert variables["config"].items == [1]
+    assert variables["looped"][0] is variables["looped"]
+    for restored in (variables, pickle.loads(pickle.dumps(variables))):
+        (member,) = restored["looped_set"]
+        assert member is restored["looped_set"]
+        assert member.owner == "team-a"
+    assert dill.loads(dill.dumps(variables["config"])).name == "cfg"
+
+
+def test_container_subclass_copies_stay_hashable():
+    class FrozenMapping(dict):
+        __slots__ = ()
+
+        def __hash__(self):
+            return hash(frozenset(self.items()))
+
+    class Odd(tuple):
+        def __hash__(self):
+            return 1
+
+    mapping = FrozenMapping(a=1)
+    context = SnapshotContext(DumpOptions())
+    # A plain dict copy, or a tuple copy holding a list, would be unhashable.
+    captured = context.value(
+        {"members": {mapping, Odd(([1],))}, "keys": {(mapping,): "value"}}
+    )
+    member = next(item for item in captured["members"] if type(item) is FakeDict)
+    assert member == {"a": 1}
+    assert ([1],) in [tuple(item) for item in captured["members"]]
+    ((key, value),) = captured["keys"].items()
+    assert key[0] is member and value == "value"
+    assert context.metadata()["truncation"] == {}
+    restored = pickle.loads(pickle.dumps(captured))
+    assert len(restored["members"]) == 2
+
+
+def test_immutable_copies_are_found_by_equal_plain_values():
+    point = namedtuple("Point", "x y")
+    tags = type("Tags", (frozenset,), {})
+    captured = SnapshotContext(DumpOptions()).value(
+        {"by_point": {point(1, 2): "hit"}, "tags": {tags({"a"})}}
+    )
+    # A copy equals the plain value, so lookups with one must find it.
+    assert captured["by_point"][(1, 2)] == "hit"
+    assert frozenset({"a"}) in captured["tags"]
+    restored = pickle.loads(pickle.dumps(captured))
+    assert restored["by_point"][(1, 2)] == "hit"
+
+
 def test_attribute_names_are_names_not_string_data():
     class Registry(dict):
         def __init__(self):
@@ -270,6 +540,75 @@ def test_attribute_names_are_names_not_string_data():
     # Values obey the string budget; the names that reach them do not.
     assert registry.owner_team == "plat"
     assert plain.long_attribute_name == "valu"
+
+
+def test_captured_copies_survive_a_reduction_stage_unchanged():
+    holder = _MetadataProbe()
+    holder.answer = 42
+    first = SnapshotContext(DumpOptions())
+    copies = first.value([Counter(a=1), holder])
+    # A reduction stage captures the copies again with halved budgets.
+    again = SnapshotContext(DumpOptions(max_string_bytes=4))
+    counter, plain = again.value(copies)
+    # Bookkeeping keys are restored, never converted as data.
+    assert vars(counter) == {"_FakeContainer__type": "collections.Counter"}
+    assert repr(plain) == repr(copies[1]) and plain.answer == 42
+    assert "_Fak" not in vars(plain)
+    assert again.metadata()["truncation"] == {}
+
+
+def test_subclass_attribute_hides_a_base_slot_as_in_attribute_lookup():
+    class Base(list):
+        __slots__ = ("label",)
+
+    class Child(Base):
+        @property
+        def label(self):
+            return "property"
+
+    value = Child([1])
+    Base.label.__set__(value, "slot")
+    captured = SnapshotContext(DumpOptions()).value(value)
+    # The original's ``label`` is the property, so the slot is not its value.
+    assert value.label == "property"
+    assert "label" not in vars(captured)
+
+
+def test_many_instances_of_one_container_type_keep_their_fields():
+    record = namedtuple("Record", "x")
+    captured = SnapshotContext(DumpOptions()).value([record(i) for i in range(50)])
+    assert [item.x for item in captured] == list(range(50))
+
+
+def test_container_copies_pretty_print_across_lines():
+    import pprint
+
+    captured = SnapshotContext(DumpOptions()).value(
+        Counter({f"key{index}": index for index in range(8)})
+    )
+    lines = pprint.pformat(captured, width=40).splitlines()
+    # pdb's ``pp`` keeps the layout and the original type name.
+    assert len(lines) == 8
+    assert lines[0].startswith("collections.Counter({")
+
+
+def test_plain_dicts_keep_keys_named_like_snapshot_bookkeeping(tmp_path):
+    path = tmp_path / "business.dump"
+
+    def business():
+        payload = {"_FakeClass__repr": "r", "_FakeContainer__type": "t", "answer": 42}
+        dump_current_traceback(path, options=DumpOptions(max_frames=1), strict=True)
+        return payload
+
+    business()
+    result = load_dumpling(path)
+    # Only a snapshot copy's own attributes are bookkeeping; business keys stay.
+    assert result["traceback"].tb_frame.f_locals["payload"] == {
+        "_FakeClass__repr": "r",
+        "_FakeContainer__type": "t",
+        "answer": 42,
+    }
+    assert result["snapshot_meta"]["attempts"] == []
 
 
 def test_global_names_used_by_the_frame_come_first(tmp_path):
@@ -301,6 +640,37 @@ def test_global_names_used_by_the_frame_come_first(tmp_path):
         "DumpOptions",
         "zeta",
     }
+
+
+@pytest.mark.skipif(
+    not hasattr(builtins, "frozendict"), reason="frozendict is new in Python 3.15"
+)
+def test_frozendict_is_captured_as_a_mapping():
+    import dill
+
+    class Settings(builtins.frozendict):
+        def items(self):
+            raise AssertionError("application items called")
+
+    context = SnapshotContext(DumpOptions())
+    captured = context.value(
+        {
+            "plain": builtins.frozendict(a=1, nested=[2]),
+            "settings": Settings(b=2),
+            "members": {builtins.frozendict(k=1)},
+        }
+    )
+    # Every copy is a FakeDict, so the dump also loads before Python 3.15.
+    assert type(captured["plain"]) is FakeDict
+    assert repr(captured["plain"]) == "frozendict({'a': 1, 'nested': [2]})"
+    # Entries are read through frozendict.items, never the subclass override.
+    assert repr(captured["settings"]).endswith("Settings({'b': 2})")
+    (member,) = captured["members"]
+    assert type(member) is FakeDict and member == {"k": 1}
+    assert context.metadata()["truncation"] == {}
+    for serializer in (pickle, dill):
+        restored = serializer.loads(serializer.dumps(captured))
+        assert repr(restored["plain"]) == repr(captured["plain"])
 
 
 def test_deep_value_does_not_cost_the_rest_of_the_frame(tmp_path):
@@ -409,6 +779,70 @@ def test_code_metadata_has_its_own_visible_bounds():
         assert "code_metadata" not in unlimited.metadata()["truncation"]
 
 
+def test_capture_runs_no_application_hooks(tmp_path):
+    calls = []
+
+    class Meta(type):
+        def __getattribute__(cls, name):
+            if name == "__mro__":
+                calls.append("metaclass __mro__")
+            return type.__getattribute__(cls, name)
+
+        # Type checks compare by identity: ``x in tuple`` would call __eq__
+        # and a set lookup would call __hash__.
+        def __eq__(cls, other):
+            calls.append("metaclass __eq__")
+            return type.__eq__(cls, other)
+
+        def __hash__(cls):
+            calls.append("metaclass __hash__")
+            return type.__hash__(cls)
+
+    class Proxy(metaclass=Meta):
+        def __init__(self):
+            self.answer = 42
+
+        @property
+        def __class__(self):
+            calls.append("__class__")
+            raise AssertionError("application __class__ read")
+
+    class Items(list, metaclass=Meta):
+        __slots__ = ("owner",)
+
+        def __iter__(self):
+            calls.append("__iter__")
+            return iter(self[:1])
+
+    class Planted:
+        __dict__ = Proxy()
+
+    class HostileError(Exception):
+        @property
+        def __class__(self):
+            calls.append("exception __class__")
+            raise AssertionError("application __class__ read")
+
+    path = tmp_path / "hostile.dump"
+    items = Items([1, 2, 3])
+    items.owner = "team-a"
+    _proxy, _planted = Proxy(), Planted()  # Captured as frame locals.
+    try:
+        raise HostileError("hostile-boom")
+    except HostileError:
+        calls.clear()
+        save_dumping(path, options=DumpOptions(max_frames=1), strict=True)
+    assert calls == []
+    result = load_dumpling(path)
+    variables = result["traceback"].tb_frame.f_locals
+    assert variables["_proxy"].answer == 42
+    # Entries are read through the base type, so the override cannot hide any.
+    assert variables["items"] == [1, 2, 3] and variables["items"].owner == "team-a"
+    planted = variables["_planted"]
+    assert vars(planted) == {"_FakeClass__repr": repr(planted)}
+    assert "hostile-boom" in "".join(result["exc_extra"]["formatted"])
+
+
 def test_frame_variable_names_survive_a_tiny_string_budget(tmp_path):
     path = tmp_path / "names.dump"
 
@@ -451,3 +885,25 @@ def test_global_names_survive_a_local_holding_globals(tmp_path):
     assert frame.f_globals["application_global"] == "valu"
     assert "appl" not in frame.f_globals
     assert frame.f_locals["namespace"] is frame.f_globals
+
+
+def test_group_check_never_reads_an_overridden_class(monkeypatch):
+    import pydumpling.snapshot as snapshot_module
+
+    class HostileError(Exception):
+        @property
+        def __class__(self):
+            raise AssertionError("application __class__ read")
+
+    monkeypatch.setattr(
+        snapshot_module,
+        "_BUILTIN_EXCEPTIONS",
+        {**snapshot_module._BUILTIN_EXCEPTIONS, id(HostileError): HostileError},
+    )
+    context = SnapshotContext(DumpOptions())
+    extra = context.exception(HostileError("hostile-boom"))
+    assert "hostile-boom" in "".join(extra["formatted"])
+    # Reading __class__ while copying the exception would be swallowed into
+    # exception_state.  (Only the stdlib formatter reads the copy's class,
+    # which a real builtin exception cannot override.)
+    assert "exception_state" not in context.metadata()["truncation"]

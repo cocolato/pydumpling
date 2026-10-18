@@ -125,7 +125,28 @@ also display a snapshot notice when values were summarized.
 and exception class names. Omission counts accumulate across reductions;
 ``limits`` retains the requested budgets and ``effective_limits`` records the
 reduced traversal budgets when used. A serializer change alone does not discard
-captured variables.
+captured variables. Instances of ``dict``, ``list``, ``tuple``, ``set``, and
+``frozenset`` subclasses such as ``Counter``, ``OrderedDict``, ``defaultdict``,
+or ``namedtuple`` become snapshot subclasses of the same base (``FakeDict``,
+``FakeList``, ``FakeTuple``, ``FakeSet``, ``FakeFrozenSet``). They keep every
+entry, show the original type name in their ``repr``, and keep instance
+attributes, filled ``__slots__``, named tuple fields, and struct sequence fields
+such as ``os.stat_result.st_mtime`` as attributes, so ``pp record.x`` still
+works. ``OrderedDict`` entries keep their own order, including ``move_to_end``
+changes. CPython hashes every key while reading that order, so when a key's type
+could run application code during hashing, the entries keep insertion order
+instead and ``mapping_order`` is recorded. On Python 3.15+, ``frozendict``,
+which is not a ``dict`` subclass, and its subclasses are captured the same way
+as ``FakeDict`` copies whose ``repr`` names the original type, so such a
+snapshot still loads on older Pythons.
+Tuple and frozenset copies hash like the plain values they equal, so
+``pp cache[(1, 2)]`` finds a named tuple key; other copies, and those holding
+unhashable entries, hash by identity. Every copy therefore stays usable as a set
+member or mapping key, and ``pp`` lays copies out across lines. Container
+entries are read through the base type, so an application ``__iter__`` or
+``items`` override is neither called nor able to hide entries. Types are
+compared by identity, so an overridden ``__class__`` or
+a metaclass ``__eq__`` or ``__hash__`` is never run.
 
 ``format_version`` versions the complete snapshot schema, including FakeCode's
 line and position tables, independently of the package ``version``. New writers
