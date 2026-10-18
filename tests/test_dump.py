@@ -117,7 +117,7 @@ def test_builtin_exception_diagnostics_survive_save_load_and_print(
         else:
             assert str(saved) == expected_message
     print_traceback_and_except(result)
-    output = capsys.readouterr().err
+    output = capsys.readouterr().out
     if scenario == "bounded":
         assert "oversized-" + "x" * 22 in output
     else:
@@ -167,7 +167,7 @@ def test_unrenderable_exception_survives_save_load_and_print(
             assert frame.f_locals["_marker"] == "preserved-local"
             assert "serialization_fallback" not in truncation
         print_traceback_and_except(restored)
-        output = capsys.readouterr().err
+        output = capsys.readouterr().out
         assert "crash" in output
         assert ("SyntaxError" if kind == "syntax" else "ValueError") in output
         if kind == "group":
@@ -485,7 +485,7 @@ def test_large_exception_summary_does_not_prevent_saving(
     assert sum(len(text.encode("utf-8")) for text in fields) <= 2048
     assert len("".join(restored["exc_extra"]["formatted"]).encode("utf-8")) <= 2048
     print_traceback_and_except(restored)
-    output = capsys.readouterr().err
+    output = capsys.readouterr().out
     assert "ExceptionGroup" in output and "ValueError" in output
     assert "omitted" in output
 
@@ -505,7 +505,7 @@ def test_exception_with_unserializable_attribute_still_saves(tmp_path, capsys):
     except FalseyError:
         save_dumping(path, options=DumpOptions(max_frames=1), strict=True)
     print_traceback_and_except(load_dumpling(path))
-    output = capsys.readouterr().err
+    output = capsys.readouterr().out
     assert "FalseyError" in output
     assert "diagnostic message" in output
 

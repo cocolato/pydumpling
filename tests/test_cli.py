@@ -25,7 +25,66 @@ def test_module_help_version_and_print(snapshot, capsys):
         assert result.returncode == 0, result.stderr
         assert "pydumpling" in result.stdout
     assert main(["--print", str(snapshot)]) == 0
-    assert "snapshot" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    # The traceback is the command's product and must survive a pipe.
+    assert "in snapshot" in captured.out
+    assert "Snapshot is incomplete" not in captured.out
+
+
+def test_print_sends_the_report_to_stdout_and_the_notice_to_stderr(tmp_path, capsys):
+    path = tmp_path / "notice.dump"
+    dump_current_traceback(
+        path, options=DumpOptions(max_frames=1, max_items=1), strict=True
+    )
+    assert main(["--print", str(path)]) == 0
+    captured = capsys.readouterr()
+    # A pipe or a redirect must receive the whole traceback...
+    assert 'File "' in captured.out
+    # ...while the diagnostic notice stays on stderr.
+    assert "Snapshot is incomplete" in captured.err
+    assert "Snapshot is incomplete" not in captured.out
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe semantics")
+def test_print_into_a_closed_pipe_stops_quietly(snapshot):
+    import os
+
+    reader, writer = os.pipe()
+    os.close(reader)  # The reader is gone before the report is written.
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pydumpling", "--print", str(snapshot)],
+            stdout=writer,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    finally:
+        os.close(writer)
+    # Like a tool ended by SIGPIPE: status 128 + 13 and no error report.
+    assert result.returncode == 141
+    assert "Broken pipe" not in result.stderr
+    assert "Exception ignored" not in result.stderr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe semantics")
+def test_print_with_a_closed_stderr_still_writes_the_report(snapshot):
+    import os
+
+    reader, writer = os.pipe()
+    os.close(reader)  # Only the notice's reader is gone.
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pydumpling", "--print", str(snapshot)],
+            stdout=subprocess.PIPE,
+            stderr=writer,
+            text=True,
+            check=False,
+        )
+    finally:
+        os.close(writer)
+    assert result.returncode == 0
+    assert 'File "' in result.stdout
 
 
 @pytest.mark.parametrize(

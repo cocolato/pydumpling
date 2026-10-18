@@ -1,4 +1,5 @@
 import argparse
+import io
 import sys
 
 import pytest
@@ -66,7 +67,11 @@ def test_falsey_exception_prints_and_notices_are_visible(capsys, monkeypatch):
 
     error = FalseyError("example")
     calls = []
-    monkeypatch.setattr(helpers, "print_exception", lambda *args: calls.append(args))
+    monkeypatch.setattr(
+        helpers,
+        "format_exception",
+        lambda *args: calls.append(args) or ["FalseyError: example\n"],
+    )
     print_traceback_and_except(
         {
             "traceback": None,
@@ -75,6 +80,55 @@ def test_falsey_exception_prints_and_notices_are_visible(capsys, monkeypatch):
         }
     )
     assert calls[0][1] is error
-    assert "frames=2" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    # The report is the command's product; the notice is a diagnostic.
+    assert captured.out == "FalseyError: example\n"
+    assert "frames=2" in captured.err
     print_snapshot_notice({})
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("encoding", "errors", "text", "expected"),
+    [
+        ("ascii", "strict", "/tmp/\udcff caf\xe9", b"/tmp/\\udcff caf\\xe9"),
+        # Redirected stdout on Windows: a legacy code page with surrogateescape.
+        (
+            "cp1252",
+            "surrogateescape",
+            "\u914d\u7f6e caf\xe9",
+            b"\\u914d\\u7f6e caf\xe9",
+        ),
+        # UTF-8 mode: surrogateescape cannot encode a lone high surrogate.
+        ("utf-8", "surrogateescape", "split \ud83d", b"split \\ud83d"),
+    ],
+)
+def test_report_escapes_text_the_stream_cannot_encode(encoding, errors, text, expected):
+    stream = io.TextIOWrapper(io.BytesIO(), encoding=encoding, errors=errors)
+    print_traceback_and_except(
+        {"traceback": None, "exc_extra": {"formatted": [f"OSError: {text}\n"]}},
+        file=stream,
+    )
+    stream.flush()
+    # The report is escaped as standard error would escape it, not aborted.
+    assert stream.buffer.getvalue() == b"OSError: " + expected + b"\n"
+
+
+def test_discarding_a_stream_without_a_descriptor_is_a_no_op():
+    from pydumpling.helpers import discard_stream
+
+    stream = io.StringIO()
+    discard_stream(stream)
+    stream.write("still usable")
+    assert stream.getvalue() == "still usable"
+
+
+def test_report_keeps_what_the_stream_handler_can_encode():
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="surrogateescape")
+    print_traceback_and_except(
+        {"traceback": None, "exc_extra": {"formatted": ["OSError: /tmp/\udcff\n"]}},
+        file=stream,
+    )
+    stream.flush()
+    # surrogateescape restores the undecodable byte of the original path.
+    assert stream.buffer.getvalue() == b"OSError: /tmp/\xff\n"

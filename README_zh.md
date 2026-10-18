@@ -44,6 +44,9 @@ pydumpling --debug error.dump
 python -m pydumpling --print error.dump
 ~~~
 
+`--print` 会把 traceback 和异常文本写到标准输出，因此可以正常用于管道和重定向；
+省略提示仍然输出到标准错误。
+
 常用 pdb 命令包括 `bt`、`u`、`d`、`list`、`ll` 和 `pp price`。
 快照用于检查保存下来的状态，无法恢复或继续执行原来的程序。
 

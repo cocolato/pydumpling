@@ -41,6 +41,10 @@
   A timeout stops waiting; an already sent request may still execute later.
 - Provide an installed `pydumpling` console command, `--version`, and remote
   `--host` / `--port` options alongside `python -m pydumpling`.
+- Write the `--print` report to standard output; notices stay on standard
+  error, and a reader that exits early (`| head`) ends the command quietly.
+- Export `DumpFormatError`, `CaptureTimeoutError`, and `CaptureInterruptedError`
+  from the `pydumpling` package.
 
 ### Development and documentation
 
