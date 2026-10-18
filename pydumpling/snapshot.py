@@ -21,6 +21,15 @@ _CLASS_DICT = type.__dict__["__dict__"]
 _CLASS_MRO = type.__dict__["__mro__"]
 _CLASS_MODULE = type.__dict__["__module__"]
 _CLASS_QUALNAME = type.__dict__["__qualname__"]
+# Code metadata (file names, function and class names, variable and name
+# tables) is diagnostic structure, not application data. Truncating it yields
+# frame headers that name the wrong file or function, so it has its own fixed
+# bound instead of following ``max_string_bytes``.  Bytecode has the same
+# problem but a much larger natural size, so it gets a separate bound; the
+# ``outer`` reduction stage still drops it entirely when bytes are tight.
+# ``DumpOptions.unlimited()`` disables both bounds.
+_CODE_TEXT_LIMIT = 4096
+_CODE_BYTES_LIMIT = 64 * 1024
 SNAPSHOT_FORMAT_VERSION = 1
 _BUILTIN_EXCEPTIONS = frozenset(
     value
@@ -50,6 +59,12 @@ class SnapshotContext:
         self._payload_codes = set()
         self._exception_copies = {}
         self._node_marker = TruncatedValue("max_nodes")
+        self._namespaces = set()
+        self._code_text_limit, self._code_bytes_limit = (
+            (None, None)
+            if options.is_unlimited
+            else (_CODE_TEXT_LIMIT, _CODE_BYTES_LIMIT)
+        )
 
     def metadata(self):
         return {
@@ -73,19 +88,60 @@ class SnapshotContext:
         module = _CLASS_MODULE.__get__(cls, type(cls))
         name = _CLASS_QUALNAME.__get__(cls, type(cls))
         module = module if type(module) is str else "?"
-        return self._text(name if module == "builtins" else module + "." + name)
+        return self._code_text(name if module == "builtins" else module + "." + name)
 
-    def _text(self, value):
-        limit = self.options.max_string_bytes
+    def _bounded_text(self, value, limit, reason):
         if limit is None:
             return value
         # Slice before encoding so a multi-gigabyte string is never copied.
         prefix = value[:limit]
-        encoded = prefix.encode("utf-8", "surrogatepass")
-        if len(value) == len(prefix) and len(encoded) <= limit:
+        if (
+            len(value) == len(prefix)
+            and len(prefix.encode("utf-8", "surrogatepass")) <= limit
+        ):
             return value
-        self._truncation["max_string_bytes"] += 1
-        return encoded[:limit].decode("utf-8", "ignore")
+        self._truncation[reason] += 1
+        return _utf8_prefix(value, limit)
+
+    def _bounded_bytes(self, value, limit, reason):
+        if limit is not None and len(value) > limit:
+            self._truncation[reason] += 1
+        return value[:limit] if limit is not None else value[:]
+
+    def _text(self, value):
+        return self._bounded_text(
+            value, self.options.max_string_bytes, "max_string_bytes"
+        )
+
+    def _code_text(self, value):
+        """Bound code metadata by its own limit, never by ``max_string_bytes``."""
+        return self._bounded_text(value, self._code_text_limit, "code_metadata")
+
+    @staticmethod
+    def _absolute_filename(filename):
+        """Resolve a source path, tolerating a working directory that is gone."""
+        if filename.startswith("<") and filename.endswith(">"):
+            return filename
+        try:
+            return os.path.abspath(filename)
+        except OSError:
+            # A deleted working directory must not cost the whole snapshot.
+            return filename
+
+    def _attribute_mapping(self, attrs, depth, *, priority=(), private=None):
+        """Capture an attribute dict, whose keys are names, not string data.
+
+        ``private`` is the bookkeeping attribute of a snapshot copy captured
+        again; its caller restores it, so it is not converted as data.
+        """
+        if private is not None:
+            attrs = {
+                key: item
+                for key, item in dict.items(attrs)
+                if type(key) is not str or key != private
+            }
+        self._namespaces.add(id(attrs))
+        return self._mapping(attrs, depth, priority=priority)
 
     def _remember(self, original, captured):
         self.objects[id(original)] = captured
@@ -177,7 +233,11 @@ class SnapshotContext:
         self._remember(value, captured)
         attrs = self._attributes(value)
         if attrs is not None:
-            converted = self._mapping(attrs, depth + 1)
+            converted = self._attribute_mapping(
+                attrs,
+                depth + 1,
+                private="_FakeClass__repr" if value_type is FakeClass else None,
+            )
             captured.__dict__.update(converted)
             captured.__dict__["_FakeClass__repr"] = representation
         else:
@@ -218,6 +278,7 @@ class SnapshotContext:
             self._truncation["max_depth"] += 1
             return self._remember(source, {})
         captured = self._remember(source, {})
+        names = id(source) in self._namespaces
         selected = set()
         count = 0
         preferred = set(priority)
@@ -252,16 +313,42 @@ class SnapshotContext:
                 if not self._has_nodes():
                     self._truncation["max_nodes"] += 1
                     break
-                converted_key = self.value(key, depth + 1)
-                converted_value = self.value(item, depth + 1)
+                converted_key = (
+                    self._code_text(key)
+                    if names and type(key) is str
+                    else self.value(key, depth + 1)
+                )
+                if depth:
+                    converted_value = self.value(item, depth + 1)
+                else:
+                    converted_value = self._root_value(item)
                 try:
                     captured[converted_key] = converted_value
                 except TypeError:
                     self._truncation["unsupported_key"] += 1
                 count += 1
+        except RecursionError:
+            raise
         except RuntimeError:
             self._truncation["concurrent_mutation"] += 1
         return captured
+
+    def _root_value(self, item):
+        """Capture a root mapping's entry, recovering from a recursion overflow.
+
+        Only a root mapping, such as a frame namespace, is far enough from the
+        interpreter's limit to recover, so one value nested too deeply does
+        not cost the rest of the frame.
+        """
+        mark = len(self.objects)
+        try:
+            return self.value(item, 1)
+        except RecursionError:
+            # Forget the copies the overflow left half built, so other
+            # references capture those objects afresh.
+            for identity in list(itertools.islice(self.objects, mark, None)):
+                del self.objects[identity]
+            return self._remember(item, self._omit("recursion", item))
 
     def _native_items(self, values):
         limit = self.options.max_items
@@ -278,22 +365,18 @@ class SnapshotContext:
         captured = object.__new__(FakeCode)
         self.codes[id(code)] = captured
         self._code_sources[id(code)] = code
-        filename = self._text(code.co_filename)
-        captured.co_filename = (
-            filename
-            if filename.startswith("<") and filename.endswith(">")
-            else os.path.abspath(filename)
-        )
-        captured.co_name = self._text(code.co_name)
+        filename = self._code_text(code.co_filename)
+        captured.co_filename = self._absolute_filename(filename)
+        captured.co_name = self._code_text(code.co_name)
         captured.co_qualname = (
-            self._text(getattr(code, "co_qualname", code.co_name))
+            self._code_text(getattr(code, "co_qualname", code.co_name))
             if type(getattr(code, "co_qualname", None)) is str
             else captured.co_name
         )
         captured.co_firstlineno = code.co_firstlineno
         captured.co_flags = code.co_flags
         captured.co_varnames = tuple(
-            self._text(name) for name in self._native_items(code.co_varnames)
+            self._code_text(name) for name in self._native_items(code.co_varnames)
         )
         argcount = getattr(code, "co_argcount", 0)
         kwcount = getattr(code, "co_kwonlyargcount", 0)
@@ -319,7 +402,7 @@ class SnapshotContext:
             captured.co_flags &= ~8
         captured.co_names = (
             tuple(
-                self._text(name)
+                self._code_text(name)
                 for name in self._native_items(getattr(code, "co_names", ()))
             )
             if type(getattr(code, "co_names", ())) is tuple
@@ -363,8 +446,12 @@ class SnapshotContext:
         self._payload_codes.add(id(original))
         constants = self.value(original.co_consts)
         captured.co_consts = constants if type(constants) is tuple else ()
-        bytecode = self.value(original.co_code)
-        captured.co_code = bytecode if type(bytecode) is bytes else b""
+        bytecode = original.co_code
+        captured.co_code = (
+            self._bounded_bytes(bytecode, self._code_bytes_limit, "code_metadata")
+            if type(bytecode) is bytes
+            else b""
+        )
 
     def _location(self, original, captured, lasti, lineno):
         if not any(start <= lasti < end for start, end, _ in captured._co_lines):
@@ -443,7 +530,16 @@ class SnapshotContext:
             )
         # Capture innermost locals first, then outer locals, then globals.
         if not self.minimal:
-            for original, _, _ in reversed(entries):
+            # Register every namespace before capturing any value, so a local
+            # holding globals() cannot capture that namespace first with its
+            # variable names cut to the string budget.
+            namespaces = [
+                (original, original.f_locals, original.f_globals)
+                for original, _, _ in entries
+            ]
+            for _, local_names, global_names in namespaces:
+                self._namespaces.update((id(local_names), id(global_names)))
+            for original, local_names, _ in reversed(namespaces):
                 frame = self.frames[id(original)]
                 code = frame.f_code
                 argument_count = (
@@ -453,13 +549,13 @@ class SnapshotContext:
                     + bool(code.co_flags & 8)
                 )
                 frame.f_locals = self._mapping(
-                    original.f_locals,
+                    local_names,
                     priority=("self",) + code.co_varnames[:argument_count],
                 )
-            for original, _, _ in reversed(entries):
+            for original, _, global_names in reversed(namespaces):
                 frame = self.frames[id(original)]
                 frame.f_globals = self._mapping(
-                    original.f_globals, priority=("__name__",) + frame.f_code.co_names
+                    global_names, priority=("__name__",) + frame.f_code.co_names
                 )
         elif entries:
             self._truncation["minimal_snapshot"] += 1
@@ -498,7 +594,9 @@ class SnapshotContext:
             arguments = metadata.value(reduced[1])
             saved = type(exc)(*arguments)
             if len(reduced) > 2 and type(reduced[2]) is dict:
-                state = metadata._mapping(reduced[2], priority=("name", "path"))
+                state = metadata._attribute_mapping(
+                    reduced[2], 0, priority=("name", "path")
+                )
                 BaseException.__setstate__(saved, state)
             if isinstance(exc, OSError) and getattr(exc, "winerror", None) is not None:
                 # OSError reduction omits winerror; retain it in pickle state too.

@@ -43,6 +43,11 @@
   `--host` / `--port` options alongside `python -m pydumpling`.
 - Write the `--print` report to standard output; notices stay on standard
   error, and a reader that exits early (`| head`) ends the command quietly.
+- Keep file, function, variable, and attribute names out of `max_string_bytes`,
+  so a small string budget no longer renames frames, locals, or attributes.
+- A value nested too deeply for the interpreter no longer discards the other
+  variables of its frame; it is reported as `recursion`. A removed working
+  directory no longer fails the capture.
 - Export `DumpFormatError`, `CaptureTimeoutError`, and `CaptureInterruptedError`
   from the `pydumpling` package.
 
