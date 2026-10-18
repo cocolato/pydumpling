@@ -7,7 +7,7 @@ import sys
 from ._version import __version__
 from .capture import capture_pid
 from .debug_dumpling import DEFAULT_MAX_BYTES, debug_dumpling, load_dumpling
-from .helpers import print_traceback_and_except, validate_file_name
+from .helpers import discard_stream, print_traceback_and_except, validate_file_name
 from .options import DumpOptions
 from .rpdb import DEFAULT_ADDR, DEFAULT_PORT, r_post_mortem
 
@@ -96,7 +96,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Return zero on success; usage errors exit 2 and operation errors return 1."""
+    """Return zero on success; usage errors exit 2 and operation errors return 1.
+
+    An interrupt returns 130, and ``--print`` into a closed pipe returns 141.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.capture_pid is not None:
@@ -130,9 +133,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(output)
         elif args.print:
-            print_traceback_and_except(
-                load_dumpling(args.filename, max_bytes=args.max_load_mib)
-            )
+            dumpling = load_dumpling(args.filename, max_bytes=args.max_load_mib)
+            try:
+                print_traceback_and_except(dumpling)
+                sys.stdout.flush()
+            except BrokenPipeError:
+                # The report's reader closed the pipe early, as ``| head``
+                # does; the notice handles its own stream.  Stop quietly like
+                # tools ended by SIGPIPE, so the final flush cannot fail again.
+                discard_stream(sys.stdout)
+                return 141  # 128 + SIGPIPE
         elif args.debug:
             debug_dumpling(args.filename, max_bytes=args.max_load_mib)
         else:

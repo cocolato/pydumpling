@@ -45,6 +45,9 @@ pydumpling --debug error.dump
 python -m pydumpling --print error.dump
 ~~~
 
+`--print` writes the traceback and exception text to standard output, so it
+survives a pipe or a redirect; the omission notice stays on standard error.
+
 Useful pdb commands include `bt`, `u`, `d`, `list`, `ll`, and `pp price`.
 A snapshot lets you inspect saved state; it cannot resume the original program.
 

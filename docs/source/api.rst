@@ -101,7 +101,7 @@ Loading and debugging
    Read a trusted compressed dump and return the snapshot dictionary. The byte
    limit applies to decompressed data. ``max_bytes=None`` disables it.
    Invalid gzip, undecodable payloads, unsupported formats, and invalid snapshot
-   structures raise ``pydumpling.debug_dumpling.DumpFormatError``. Filesystem
+   structures raise ``pydumpling.DumpFormatError``. Filesystem
    errors such as missing files or denied access keep their original types.
 
 New snapshots expose capture budgets, Python version, frame counts, and omission
@@ -155,8 +155,10 @@ Running-process capture
    namespaces. The target needs the updated Pydumpling installed and must permit
    CPython remote execution. Operating system permissions can prevent attachment.
 
-Timeout stops waiting rather than cancelling a dispatched request. The request
-script is retained and may execute later; the CLI prints its directory. Avoid
+Timeout stops waiting rather than cancelling a dispatched request and raises
+``pydumpling.CaptureTimeoutError``; an interrupted wait raises
+``pydumpling.CaptureInterruptedError``. Both carry ``request_directory``. The
+request script is retained and may execute later; the CLI prints its directory. Avoid
 submitting repeated requests while one is pending. Remove the retained directory
 only after its ``status.json`` confirms completion or the target has exited.
 
@@ -168,7 +170,14 @@ Choose exactly one action: ``--print``, ``--debug``, ``--rdebug``, or
 ``--capture-pid PID``. The first three take a dump filename; PID capture takes
 ``--output FILE`` and optionally ``--timeout SECONDS`` or ``--unlimited``.
 
-``--host`` and ``--port`` configure remote debugging; ``--timeout`` also limits
+``--print`` writes the stored traceback and exception text to standard output,
+so the report survives a pipe or a redirect; the snapshot notice and other
+diagnostics stay on standard error. Characters the output encoding cannot
+represent, such as lone surrogates from undecodable paths, are escaped as
+standard error would escape them. If the reader closes the pipe early, as
+``head`` does, the command stops quietly with status 141; if only the notice's
+reader is gone, the report is still written. ``--host`` and ``--port``
+configure remote debugging; ``--timeout`` also limits
 waiting for a remote client. ``--max-load-mib`` sets
 the decompressed loading limit in MiB; zero disables it. Use ``--help`` for all
 options and ``--version`` for the installed version.

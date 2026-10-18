@@ -212,7 +212,7 @@ def test_legacy_position_table_can_be_printed(tmp_path, capsys):
     frame.f_lasti = dumpling["traceback"].tb_lasti = 20
     filename, _ = write_dumpling(tmp_path, dumpling)
     print_traceback_and_except(load_dumpling(filename))
-    assert "snapshot_frame" in capsys.readouterr().err
+    assert "snapshot_frame" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
