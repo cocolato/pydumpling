@@ -9,12 +9,23 @@ import reprlib
 import sys
 import traceback
 import types
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from dataclasses import asdict, replace
 
 import dill
 
-from .fake_types import FakeClass, FakeCode, FakeFrame, FakeTraceback, TruncatedValue
+from .fake_types import (
+    FakeClass,
+    FakeCode,
+    FakeDict,
+    FakeFrame,
+    FakeFrozenSet,
+    FakeList,
+    FakeSet,
+    FakeTraceback,
+    FakeTuple,
+    TruncatedValue,
+)
 from .options import DumpOptions
 
 _CLASS_DICT = type.__dict__["__dict__"]
@@ -30,12 +41,72 @@ _CLASS_QUALNAME = type.__dict__["__qualname__"]
 # ``DumpOptions.unlimited()`` disables both bounds.
 _CODE_TEXT_LIMIT = 4096
 _CODE_BYTES_LIMIT = 64 * 1024
+# Types are compared by identity throughout.  ``isinstance`` falls back to an
+# instance's ``__class__`` attribute, ``x in tuple`` calls a metaclass
+# ``__eq__``, and a set lookup calls a metaclass ``__hash__``; application code
+# can override any of them.
+#
+# Each builtin container base maps to the copy type of its exact instances and
+# the snapshot subclass for instances of its subclasses.
+_CONTAINER_TYPES = [
+    (dict, dict, FakeDict),
+    (list, list, FakeList),
+    (tuple, tuple, FakeTuple),
+    (set, set, FakeSet),
+    (frozenset, frozenset, FakeFrozenSet),
+]
+if hasattr(builtins, "frozendict"):
+    # Python 3.15+.  frozendict is not a dict subclass, and every copy is a
+    # FakeDict so a snapshot taken on 3.15 still loads on older Pythons.
+    _CONTAINER_TYPES.append((builtins.frozendict, FakeDict, FakeDict))
+_CONTAINER_BASES = {id(entry[0]): entry for entry in _CONTAINER_TYPES}
 SNAPSHOT_FORMAT_VERSION = 1
-_BUILTIN_EXCEPTIONS = frozenset(
-    value
+_BUILTIN_EXCEPTIONS = {
+    id(value): value
     for value in builtins.__dict__.values()
     if isinstance(value, type) and issubclass(value, BaseException)
+}
+
+
+def _type_mro(value):
+    """A value's type MRO, bypassing instance and metaclass attribute hooks."""
+    cls = type(value)
+    return _CLASS_MRO.__get__(cls, type(cls))
+
+
+def _derives(value, base):
+    """Whether ``base`` is in the type MRO of ``value``, compared by identity."""
+    return any(cls is base for cls in _type_mro(value))
+
+
+def _container_base(value):
+    """The builtin container ``value`` stores entries in, and its copy types."""
+    for cls in _type_mro(value):
+        entry = _CONTAINER_BASES.get(id(cls))
+        if entry is not None:
+            return entry
+    return None, None, None
+
+
+# Key types whose hashing and comparison run only builtin code.
+_PLAIN_KEY_TYPES = frozenset(
+    map(id, (str, int, float, complex, bool, bytes, types.NoneType))
 )
+
+
+def _plain_key(key):
+    """Whether hashing or comparing ``key`` runs no application code."""
+    if type(key) is tuple:
+        return all(id(type(item)) in _PLAIN_KEY_TYPES for item in key)
+    return id(type(key)) in _PLAIN_KEY_TYPES
+
+
+def _key_order(source, view, ordered):
+    """A mapping's keys in its own order."""
+    # move_to_end changes an OrderedDict's link order but not dict.items.
+    # CPython's OrderedDict iterator hashes every key it passes, so callers
+    # request link order only for plain keys.
+    return OrderedDict.__iter__(source) if ordered else (key for key, _ in view)
 
 
 class SnapshotContext:
@@ -59,7 +130,10 @@ class SnapshotContext:
         self._payload_codes = set()
         self._exception_copies = {}
         self._node_marker = TruncatedValue("max_nodes")
+        # Frame namespaces keep their variable names whichever path reaches
+        # them first; see ``_build``.
         self._namespaces = set()
+        self._layouts = {}
         self._code_text_limit, self._code_bytes_limit = (
             (None, None)
             if options.is_unlimited
@@ -128,6 +202,30 @@ class SnapshotContext:
             # A deleted working directory must not cost the whole snapshot.
             return filename
 
+    def _layout(self, value):
+        """Member descriptors and named tuple fields of ``type(value)``, cached."""
+        cls = type(value)
+        layout = self._layouts.get(id(cls))
+        if layout is None:
+            members = []
+            fields = ()
+            seen = set()
+            for owner in _type_mro(value):
+                for name, member in _CLASS_DICT.__get__(owner, type(owner)).items():
+                    # The first definition in the MRO wins, as in attribute
+                    # lookup, so a subclass property hides a base slot.
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    if type(member) is types.MemberDescriptorType:
+                        members.append((name, member))
+                    elif name == "_fields" and type(member) is tuple:
+                        if all(type(field) is str for field in member):
+                            fields = member
+            # Keeping the type alive keeps its id from being reused.
+            layout = self._layouts[id(cls)] = (cls, members, fields)
+        return layout[1], layout[2]
+
     def _attribute_mapping(self, attrs, depth, *, priority=(), private=None):
         """Capture an attribute dict, whose keys are names, not string data.
 
@@ -142,6 +240,44 @@ class SnapshotContext:
             }
         self._namespaces.add(id(attrs))
         return self._mapping(attrs, depth, priority=priority)
+
+    def _fill_container(self, value, copy, depth):
+        """Keep a container subclass's type name and attributes beside its entries.
+
+        Instance attributes, filled slots, struct sequence fields outside the
+        tuple part, and named tuple fields all become attributes of the copy.
+        """
+        namespace = copy.__dict__
+        cls = type(value)
+        own = cls is type(copy)
+        attrs = self._attributes(value) or {}
+        if attrs:
+            namespace.update(
+                self._attribute_mapping(
+                    attrs, depth + 1, private="_FakeContainer__type" if own else None
+                )
+            )
+        members, fields = self._layout(value)
+        for name, member in members:
+            try:
+                item = member.__get__(value, cls)
+            except Exception:
+                continue  # An unset slot holds nothing.
+            if (
+                self.options.max_items is not None
+                and len(namespace) >= self.options.max_items
+            ):
+                self._truncation["max_items"] += 1
+                break
+            if not self._has_nodes():
+                self._truncation["max_nodes"] += 1
+                break
+            namespace[name] = self.value(item, depth + 1)
+        if fields and type(copy) is FakeTuple:
+            namespace.update(zip(fields, copy))
+        namespace["_FakeContainer__type"] = (
+            attrs.get("_FakeContainer__type") if own else self._type_name(value)
+        )
 
     def _remember(self, original, captured):
         self.objects[id(original)] = captured
@@ -165,7 +301,12 @@ class SnapshotContext:
         value_type = type(value)
         if value_type is TruncatedValue:
             return self._remember(value, value)
-        if value_type in (type(None), bool, float, complex):
+        if (
+            value_type is types.NoneType
+            or value_type is bool
+            or value_type is float
+            or value_type is complex
+        ):
             return self._remember(value, value)
         if value_type is int:
             limit = self.options.max_string_bytes
@@ -174,12 +315,13 @@ class SnapshotContext:
             return self._remember(value, value)
         if value_type is str:
             return self._remember(value, self._text(value))
-        if value_type in (bytes, bytearray):
-            limit = self.options.max_string_bytes
-            if limit is not None and len(value) > limit:
-                self._truncation["max_string_bytes"] += 1
-            captured = value[:limit] if limit is not None else value[:]
-            return self._remember(value, captured)
+        if value_type is bytes or value_type is bytearray:
+            return self._remember(
+                value,
+                self._bounded_bytes(
+                    value, self.options.max_string_bytes, "max_string_bytes"
+                ),
+            )
         if self.options.is_unlimited and not self.minimal:
             serializer = dill if self.serializer == "dill" else pickle
             try:
@@ -190,11 +332,19 @@ class SnapshotContext:
         limit = self.options.max_depth
         if limit is not None and depth >= limit:
             return self._remember(value, self._omit("max_depth", value))
-        if value_type is dict:
-            return self._mapping(value, depth, counted=True)
-        if value_type in (list, tuple, set, frozenset):
-            mutable = value_type in (list, set)
-            captured = [] if value_type in (list, tuple) else set()
+        base, plain, snapshot_type = _container_base(value)
+        # A subclass keeps its entries in a snapshot subclass of its base,
+        # with its type name and attributes alongside.
+        target = plain if value_type is base else snapshot_type
+        if snapshot_type is FakeDict:  # dict, and frozendict on Python 3.15+
+            captured = self._mapping(value, depth, counted=True, container=target)
+            if target is snapshot_type:
+                self._fill_container(value, captured, depth)
+            return captured
+        if base is not None:
+            sequence = base is list or base is tuple
+            mutable = base is list or base is set
+            captured = target() if mutable else ([] if sequence else set())
             self._remember(
                 value,
                 captured
@@ -204,7 +354,9 @@ class SnapshotContext:
                 ),
             )
             count = 0
-            for item in value:
+            # Iterate through the base type: a subclass ``__iter__`` must be
+            # neither executed nor able to hide entries.
+            for item in base.__iter__(value):
                 if (
                     self.options.max_items is not None
                     and count >= self.options.max_items
@@ -215,14 +367,13 @@ class SnapshotContext:
                     self._truncation["max_nodes"] += 1
                     break
                 converted = self.value(item, depth + 1)
-                captured.append(converted) if value_type in (
-                    list,
-                    tuple,
-                ) else captured.add(converted)
+                captured.append(converted) if sequence else captured.add(converted)
                 count += 1
             if not mutable:
-                captured = value_type(captured)
+                captured = target(captured)
                 self._remember(value, captured)
+            if target is snapshot_type:
+                self._fill_container(value, captured, depth)
             return captured
         representation = (
             FakeClass.__repr__(value)
@@ -248,9 +399,9 @@ class SnapshotContext:
     def _attributes(value):
         # Call only Python's real instance-dictionary descriptor.  In
         # particular, never invoke an application property named __dict__.
-        for cls in _CLASS_MRO.__get__(type(value), type(type(value))):
+        for cls in _type_mro(value):
             descriptor = _CLASS_DICT.__get__(cls, type(cls)).get("__dict__")
-            if isinstance(descriptor, types.GetSetDescriptorType):
+            if type(descriptor) is types.GetSetDescriptorType:
                 try:
                     attrs = descriptor.__get__(value, type(value))
                     return attrs if type(attrs) is dict else None
@@ -260,10 +411,10 @@ class SnapshotContext:
                 return None
         return None
 
-    def _mapping(self, source, depth=0, *, priority=(), counted=False):
+    def _mapping(self, source, depth=0, *, priority=(), counted=False, container=dict):
         if id(source) in self.objects:
             cached = self.objects[id(source)]
-            if type(cached) is dict:
+            if type(cached) is dict or type(cached) is FakeDict:
                 return cached
             # A mapping root may fit even when a deeper reference was omitted.
             if not isinstance(cached, TruncatedValue) or cached.reason != "max_depth":
@@ -276,39 +427,68 @@ class SnapshotContext:
             self._nodes += 1
         if self.options.max_depth is not None and depth >= self.options.max_depth:
             self._truncation["max_depth"] += 1
-            return self._remember(source, {})
-        captured = self._remember(source, {})
+            return self._remember(source, container())
+        captured = self._remember(source, container())
+        # Frame variable names are identifiers, not application string values,
+        # so a string budget must not rewrite them.
         names = id(source) in self._namespaces
-        selected = set()
         count = 0
         preferred = set(priority)
-        view = dict.items(source) if isinstance(source, dict) else source.items()
-        # Iterating builtin dict items avoids executing arbitrary key hashes
-        # or equality methods just to retrieve the value already in the dict.
-        if preferred:
-            first = (
-                (key, item)
-                for key, item in view
-                if type(key) is str and key in preferred
-            )
-            second = (
-                (key, item)
-                for key, item in view
-                if type(key) is not str or key not in preferred
-            )
-            items = itertools.chain(first, second)
-        else:
-            items = view
         try:
+            # The builtin base's items skip a subclass ``items`` override and
+            # run no key hash or equality method.
+            reader = _container_base(source)[0]
+            view = reader.items(source) if reader is not None else source.items()
+            ordered = _derives(source, OrderedDict)
+            if ordered and not all(map(_plain_key, dict.keys(source))):
+                # Reading link order would run a key's own __hash__; keep
+                # insertion order instead and say so.
+                ordered = False
+                self._truncation["mapping_order"] += 1
+            # Select the bounded keys first: preferred names first, then the
+            # rest, each group in the mapping's own order.
+            keys = (
+                key
+                for key in _key_order(source, view, ordered)
+                if type(key) is not str or key != "__builtins__"
+            )
+            if preferred:
+                keys = itertools.chain(
+                    (
+                        key
+                        for key in _key_order(source, view, ordered)
+                        if type(key) is str
+                        and key in preferred
+                        and key != "__builtins__"
+                    ),
+                    (
+                        key
+                        for key in keys
+                        if type(key) is not str or key not in preferred
+                    ),
+                )
+            limit, reason = self.options.max_items, "max_items"
+            nodes = self.options.max_nodes
+            if nodes is not None and not names and (limit is None or nodes < limit):
+                # Each entry not already memoized costs a node, so the node
+                # budget also bounds the selection and its temporary memory.
+                limit, reason = nodes, "max_nodes"
+            # One extra key lets the loop below report truncation.
+            chosen = dict.fromkeys(
+                id(key)
+                for key in itertools.islice(keys, None if limit is None else limit + 1)
+            )
+            remaining = len(chosen)
+            for key, item in view:
+                if not remaining:
+                    break
+                if chosen.get(id(key), ()) is None:
+                    chosen[id(key)] = (key, item)
+                    remaining -= 1
+            items = (entry for entry in chosen.values() if entry is not None)
             for key, item in items:
-                if id(key) in selected or (type(key) is str and key == "__builtins__"):
-                    continue
-                selected.add(id(key))
-                if (
-                    self.options.max_items is not None
-                    and count >= self.options.max_items
-                ):
-                    self._truncation["max_items"] += 1
+                if limit is not None and count >= limit:
+                    self._truncation[reason] += 1
                     break
                 if not self._has_nodes():
                     self._truncation["max_nodes"] += 1
@@ -328,6 +508,8 @@ class SnapshotContext:
                     self._truncation["unsupported_key"] += 1
                 count += 1
         except RecursionError:
+            # Not a concurrent mutation: let the enclosing root mapping, or
+            # the writer's minimal fallback, handle the overflow.
             raise
         except RuntimeError:
             self._truncation["concurrent_mutation"] += 1
@@ -579,7 +761,9 @@ class SnapshotContext:
         return head
 
     def _builtin_exception(self, exc):
-        if type(exc) not in _BUILTIN_EXCEPTIONS or isinstance(exc, BaseExceptionGroup):
+        if _BUILTIN_EXCEPTIONS.get(id(type(exc))) is not type(exc) or _derives(
+            exc, BaseExceptionGroup
+        ):
             return None
         if id(exc) in self._exception_copies:
             return self._exception_copies[id(exc)]
@@ -598,7 +782,7 @@ class SnapshotContext:
                     reduced[2], 0, priority=("name", "path")
                 )
                 BaseException.__setstate__(saved, state)
-            if isinstance(exc, OSError) and getattr(exc, "winerror", None) is not None:
+            if _derives(exc, OSError) and getattr(exc, "winerror", None) is not None:
                 # OSError reduction omits winerror; retain it in pickle state too.
                 saved.winerror = metadata.value(exc.winerror)
                 saved.__dict__["winerror"] = saved.winerror
@@ -628,7 +812,7 @@ class SnapshotContext:
         for arg in itertools.islice(args, self.options.max_items):
             if type(arg) is str:
                 converted.append(self._text(arg))
-            elif type(arg) in (bool, float, type(None)):
+            elif type(arg) is bool or type(arg) is float or arg is None:
                 converted.append(arg)
             elif type(arg) is int and (
                 self.options.max_string_bytes is None
@@ -697,12 +881,16 @@ class SnapshotContext:
             count += 1
             attributes = self._attributes(current)
             current_notes = attributes.get("__notes__") if attributes else None
-            if saved is None and type(current_notes) in (list, tuple):
+            if saved is None and (
+                type(current_notes) is list or type(current_notes) is tuple
+            ):
                 for note in current_notes[: max(0, limit - count)]:
                     if type(note) is str:
                         formatted.append(self._text(note + "\n"))
                         count += 1
-            if isinstance(current, BaseExceptionGroup):
+            # MRO identity, not isinstance: for a non-group exception the
+            # type check would fall back to the application's ``__class__``.
+            if _derives(current, BaseExceptionGroup):
                 children = BaseExceptionGroup.exceptions.__get__(current, type(current))
                 for child in reversed(children[:limit]):
                     pending.append((child, depth + 1))

@@ -43,6 +43,9 @@
   `--host` / `--port` options alongside `python -m pydumpling`.
 - Write the `--print` report to standard output; notices stay on standard
   error, and a reader that exits early (`| head`) ends the command quietly.
+- Capture `Counter`, `OrderedDict`, `defaultdict`, `namedtuple`, Python 3.15's
+  `frozendict`, and other container subclasses with their entries, type name,
+  and attributes instead of an empty placeholder.
 - Keep file, function, variable, and attribute names out of `max_string_bytes`,
   so a small string budget no longer renames frames, locals, or attributes.
 - A value nested too deeply for the interpreter no longer discards the other
