@@ -28,7 +28,10 @@ Import ``DumpOptions`` from ``pydumpling``. Pass an options object to
      - 16 MiB of uncompressed serialized data
 
 Values that exceed traversal budgets may be summarized. Writers capture once,
-then try dill and pickle on the same captured graph with separate output buffers.
+then try pickle and dill on the same captured graph with separate output buffers.
+A bounded snapshot holds only builtin and pydumpling types, so the much faster
+pickle goes first; ``DumpOptions.unlimited()`` keeps original objects that may
+need dill, so dill goes first there. Dumps are gzip-compressed at level 6.
 If neither fits the byte budget, reductions first omit frame globals, then omit
 outer-frame locals while retaining the innermost frame's arguments and locals.
 The latter step also drops code constants and bytecode, retaining argument names
@@ -147,15 +150,29 @@ entries are read through the base type, so an application ``__iter__`` or
 ``items`` override is neither called nor able to hide entries. Types are
 compared by identity, so an overridden ``__class__`` or
 a metaclass ``__eq__`` or ``__hash__`` is never run.
+Instances of ``str``, ``bytes``, ``int``, and ``float`` subclasses, such as
+``IntEnum`` and ``StrEnum`` members, become ``FakeStr``, ``FakeBytes``,
+``FakeInt``, or ``FakeFloat`` copies. They keep the value, the original type
+name in their ``repr``, and instance attributes and filled slots, so
+``pp member._name_`` still works, and they compare and hash like the plain value
+they equal. The value is read through the base type, so no application
+``__str__``, ``__int__``, or ``__getitem__`` runs, and it has the budget of a
+plain value: kept at any depth, with text and bytes cut to ``max_string_bytes``
+and an integer larger than that replaced by a placeholder. Its attributes and
+slots are nested data and follow ``max_depth``.
 
 ``format_version`` versions the complete snapshot schema, including FakeCode's
 line and position tables, independently of the package ``version``. New writers
-emit format 1. Missing format versions are treated as legacy format 0; unknown
-versions are rejected. Format 1 compatibility depends on the schema version;
-the producer's package version must be well formed but may belong to another
-release series. Only legacy format 0 uses the historical package-version range.
-Incompatible changes to internal encodings must increment
-this format version and provide an explicit reader migration.
+emit format 2, which adds the ``FakeStr``, ``FakeBytes``, ``FakeInt``, and
+``FakeFloat`` copies. Format 2 only adds types, so readers load format 1 dumps
+unchanged; Pydumpling 0.2.0 reads only format 1, rejecting format 2 dumps or,
+when they contain the new copies, failing to decode them. Missing format
+versions are treated as legacy format 0; unknown versions are rejected. Format
+compatibility depends on the schema version; the producer's package version
+must be well formed but may belong to another release series. Only legacy
+format 0 uses the historical package-version range. Incompatible changes to
+internal encodings must increment this format version and provide an explicit
+reader migration.
 
 ``debug_dumpling(dump_file, pdb=pdb, *, max_bytes=64 * 1024 * 1024)``
    Load a trusted snapshot and start post-mortem inspection with pdb or a

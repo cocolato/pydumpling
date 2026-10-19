@@ -1,6 +1,7 @@
 """Pickleable frame adapters used by the standard post-mortem debugger."""
 
 import builtins
+import copyreg
 import pprint
 import reprlib
 
@@ -52,6 +53,7 @@ class FakeContainer:
     """
 
     __slots__ = ()
+    _type_key = "_FakeContainer__type"
 
     def __hash__(self):
         # Immutable copies hash like the tuple or frozenset they equal, so an
@@ -69,19 +71,6 @@ class FakeContainer:
     @reprlib.recursive_repr()
     def __repr__(self):
         return "%s(%r)" % (_original_name(self), type(self)._base(self))
-
-    def __reduce_ex__(self, protocol):
-        # Pickle's default reduction calls ``self.items()``, which a captured
-        # attribute named ``items`` would hide, so entries are read through
-        # the builtin base.  Mutable entries travel in the state, restored
-        # after the empty copy is memoized, so a copy containing itself still
-        # pickles; immutable entries cannot refer back to their copy.
-        cls = type(self)
-        base = cls._base
-        entries = list(dict.items(self) if base is dict else base.__iter__(self))
-        if cls._extend is None:
-            return cls, (entries,), (self.__dict__, ())
-        return cls, (), (self.__dict__, entries)
 
     def __setstate__(self, state):
         attributes, entries = state
@@ -111,11 +100,43 @@ class FakeFrozenSet(FakeContainer, frozenset):
     _base, _extend = frozenset, None
 
 
+class FakeScalar:
+    """Mixin for a captured instance of a str, bytes, int, or float subclass.
+
+    The value lives in the builtin base, ``_base``, so the copy hashes and
+    compares like the plain value it equals.  The original type name, instance
+    attributes, and slots live in ``__dict__``.
+    """
+
+    __slots__ = ()
+    _type_key = "_FakeScalar__type"
+
+    def __repr__(self):
+        return "%s(%r)" % (_original_name(self), type(self)._base(self))
+
+
+class FakeStr(FakeScalar, str):
+    _base = str
+
+
+class FakeBytes(FakeScalar, bytes):
+    _base = bytes
+
+
+class FakeInt(FakeScalar, int):
+    _base = int
+
+
+class FakeFloat(FakeScalar, float):
+    _base = float
+
+
 def _original_name(copy):
-    return copy.__dict__.get("_FakeContainer__type", type(copy)._base.__name__)
+    cls = type(copy)
+    return copy.__dict__.get(cls._type_key, cls._base.__name__)
 
 
-def _pprint_container(printer, value, stream, indent, allowance, context, level):
+def _pprint_copy(printer, value, stream, indent, allowance, context, level):
     name = _original_name(value)
     stream.write(name + "(")
     indent += len(name) + 1
@@ -138,7 +159,8 @@ def _pprint_container(printer, value, stream, indent, allowance, context, level)
 if hasattr(pprint.PrettyPrinter, "_dispatch") and hasattr(
     pprint.PrettyPrinter, "_format_dict_items"
 ):
-    pprint.PrettyPrinter._dispatch[FakeContainer.__repr__] = _pprint_container
+    pprint.PrettyPrinter._dispatch[FakeContainer.__repr__] = _pprint_copy
+    pprint.PrettyPrinter._dispatch[FakeScalar.__repr__] = _pprint_copy
 
 
 class FakeTraceback(FakeType):
@@ -249,3 +271,39 @@ class FakeCode(FakeType):
         state.setdefault("_co_positions", ())
         state.setdefault("_co_positions_sparse", {})
         self.__dict__.update(state)
+
+
+# Snapshot copies carry captured attributes in ``__dict__``, where a name such
+# as ``__reduce_ex__``, ``__getstate__`` or ``items`` would hide the method the
+# default reduction looks up on the instance.  pickle, dill, and copy consult
+# copyreg's dispatch table first, so these reducers look nothing up on the copy.
+
+
+def _reduce_object(copy):
+    return copyreg.__newobj__, (type(copy),), copy.__dict__
+
+
+def _reduce_container(copy):
+    # Entries are read through the builtin base.  Mutable entries travel in the
+    # state, restored after the empty copy is memoized, so a copy containing
+    # itself still pickles; immutable entries cannot refer back to their copy.
+    cls = type(copy)
+    base = cls._base
+    entries = list(dict.items(copy) if base is dict else base.__iter__(copy))
+    if cls._extend is None:
+        return cls, (entries,), (copy.__dict__, ())
+    return cls, (), (copy.__dict__, entries)
+
+
+def _reduce_scalar(copy):
+    # The value travels as a plain instance of the base, which any Python loads.
+    cls = type(copy)
+    return cls, (cls._base(copy),), copy.__dict__
+
+
+copyreg.pickle(FakeClass, _reduce_object)
+for _copy_type in (FakeDict, FakeList, FakeTuple, FakeSet, FakeFrozenSet):
+    copyreg.pickle(_copy_type, _reduce_container)
+for _copy_type in (FakeStr, FakeBytes, FakeInt, FakeFloat):
+    copyreg.pickle(_copy_type, _reduce_scalar)
+del _copy_type
