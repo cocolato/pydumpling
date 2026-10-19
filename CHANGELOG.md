@@ -4,6 +4,53 @@
 
 ### Runtime and capture
 
+- Add `DumpOptions(embed_source_lines=N)`: store N lines of source context on
+  each side of every captured frame's current line (`None` embeds whole
+  files). `--debug` and `--rdebug` sessions show the embedded source through
+  `list` for files missing on the viewing machine; local files keep
+  precedence. When the byte budget is exceeded, source is omitted before
+  reducing captured variables, and reported as `source_omitted`.
+- Add `pydumpling --html FILE dump`: a standalone, script-free HTML report
+  with the exception, a source window per frame, and locals tables.
+- Stream every serialization attempt through gzip directly into its temporary
+  dump file instead of building the full pickled snapshot in memory first. On
+  a string-heavy workload the writer's peak drops by about 40 percent, and a
+  failed attempt still leaves any previous dump untouched.
+- Look up the value memo once per captured value instead of twice.
+
+### Development and documentation
+
+- Add `pydumpling --json` for an
+  indented JSON report of a dump: capture metadata, exception details, frames
+  with guarded `repr` locals (plus globals behind `--globals`), and truncation
+  reasons. `pydumpling --info` prints the stored metadata as a human-readable
+  summary. Both keep the quiet 141 pipe semantics of `--print`.
+- Add `benchmarks/bench_capture.py`, a fixed-workload script comparing capture,
+  write, load, and report timings between revisions.
+- Split the internal `pydumpling.snapshot` module into a package
+  (`snapshot.context`, `snapshot.values`, `snapshot.frames`,
+  `snapshot.exceptions`, `snapshot.reduce`, `snapshot.identity`) and moved
+  hooks to `pydumpling.hooks` and report formatting to `pydumpling.report`.
+  `pydumpling.snapshot` and `pydumpling.helpers` keep re-exporting the same
+  names; behavior is unchanged.
+
+### Runtime and capture
+
+- Record the creation time, capture duration, pid, host name, working
+  directory, command line, and capturing thread in `snapshot_meta`; every
+  field degrades to `None` when the environment cannot provide it.
+- Give automatically generated dump names the source line, a UTC timestamp,
+  the pid, and a per-process sequence, so repeated failures never overwrite an
+  earlier snapshot.
+- Add `DumpManager(directory, *, retention=50, options=None)` with
+  `save_exception()`, `save_current()`, `target()`, and `prune()`: unique
+  names in one directory, oldest dumps by file modification time removed beyond `retention`
+  (`retention=None` keeps everything).
+- `catch_any_exception(*, options=None, include_threads=False, manager=None)`
+  can also hook `threading.excepthook` and save through a `DumpManager`;
+  add `install_asyncio_handler(loop=None, *, options=None)` for event loops
+  and `restore_exception_hooks()` to remove every installed hook while
+  keeping later third-party hooks.
 - Keep the value, type name, and attributes of `str`, `bytes`, `int`, and
   `float` subclass instances, such as `IntEnum` and `StrEnum` members, under
   the budgets of plain values instead of an empty placeholder.

@@ -50,6 +50,44 @@ survives a pipe or a redirect; the omission notice stays on standard error.
 Useful pdb commands include `bt`, `u`, `d`, `list`, `ll`, and `pp price`.
 A snapshot lets you inspect saved state; it cannot resume the original program.
 
+## Print machine-readable and metadata views
+
+~~~sh
+pydumpling --json error.dump                # indented JSON report
+pydumpling --json --globals error.dump       # include each frame's globals
+pydumpling --info error.dump                 # versions, budgets, truncation
+~~~
+
+The JSON object carries capture metadata (`created_at`, `pid`, `thread_name`,
+`duration_ms`, versions), the exception (`type`, `message`, `formatted` text,
+or `null` for stack snapshots), a `frames` list from outermost to innermost,
+and the `truncation` mapping; variable values are guarded `repr` strings, so
+the output pipes cleanly into `jq` and CI tooling.
+
+## Embed source and share an HTML report
+
+~~~python
+from pydumpling import DumpOptions, save_dumping
+
+try:
+    risky_step()
+except ValueError:
+    save_dumping("error.dump", options=DumpOptions(embed_source_lines=5), strict=True)
+~~~
+
+`embed_source_lines` stores that many lines of context around each frame's
+current line inside the dump (`None` embeds whole files). `pydumpling --debug`
+then shows that source in `list` even on a machine without the checkout, while
+local files keep serving their own source. If the dump exceeds its byte budget,
+embedded source is dropped before captured variables are reduced.
+
+~~~sh
+pydumpling --html report.html error.dump   # standalone HTML, no scripts
+~~~
+
+The HTML report shows the exception, a source window per frame (embedded
+source preferred, falling back to local files), and the locals table.
+
 ## Save the current stack
 
 ~~~python
@@ -68,8 +106,33 @@ calculate()
 
 Call `catch_any_exception()` once at application startup to capture unhandled
 main-thread exceptions. It installs `sys.excepthook` and retains the previous
-hook for normal exception reporting. It does not install thread or asyncio
-exception handlers.
+hook for normal exception reporting. Pass `include_threads=True` to also
+capture exceptions that end a `threading.Thread`, and
+`restore_exception_hooks()` to remove every installed hook again. For asyncio,
+call `install_asyncio_handler()` inside async code (or pass `loop=`) to capture
+exceptions the event loop reports.
+
+## Manage a dump directory
+
+`DumpManager` saves into one directory with unique names and bounded retention:
+
+~~~python
+from pydumpling import DumpManager
+
+manager = DumpManager("dumps", retention=20)
+try:
+    risky_step()
+except ValueError:
+    manager.save_exception()  # or save_current() for the current stack
+~~~
+
+Every default file name now carries the source line, a UTC timestamp, the pid,
+and a per-process sequence, so repeated failures never overwrite an earlier
+snapshot. The manager prunes by file modification time, using names to break
+ties. Hooks accept the manager
+directly: `catch_any_exception(manager=manager, include_threads=True)`. Each
+saved snapshot records its creation time, duration, pid, host name, working
+directory, command line, and capturing thread in `snapshot_meta`.
 
 ## Limit capture overhead
 
@@ -108,7 +171,9 @@ The default readable snapshot mode is unaffected.
 `save_dumping(filename=None, exc_info=None, *, options=None, strict=False)` and
 `dump_current_traceback(filename=None, *, options=None, strict=False)` report
 capture/write failures as warnings by default. Use `strict=True` to raise them.
-`catch_any_exception(*, options=None)` accepts the same budgets.
+`catch_any_exception(*, options=None, include_threads=False, manager=None)`
+accepts the same budgets, and `install_asyncio_handler(loop=None, *, options=None)`
+covers an event loop; both keep the previous hooks reporting.
 
 Loading and debugging default to at most 64 MiB of decompressed dump data.
 `load_dumpling(path, max_bytes=None)` or `debug_dumpling(path, max_bytes=None)`

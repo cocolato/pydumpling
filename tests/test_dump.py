@@ -4,9 +4,12 @@ import gzip
 import inspect
 import os
 import pickle
+import re
 import subprocess
 import sys
+import threading
 import traceback
+from datetime import datetime
 
 import pytest
 
@@ -410,13 +413,13 @@ def test_byte_budget_reduction_preserves_values_and_original_capture(
     import pydumpling.pydumpling as writer
 
     live = {"answer": 42}
-    original = writer._serialize
+    original = writer._stream_dump
 
-    def serialize(payload, serializer, limit):
+    def stream_dump(payload, filename, serializer, limit):
         live["answer"] = 99
-        return original(payload, serializer, limit)
+        return original(payload, filename, serializer, limit)
 
-    monkeypatch.setattr(writer, "_serialize", serialize)
+    monkeypatch.setattr(writer, "_stream_dump", stream_dump)
 
     def business():
         marker = live
@@ -478,7 +481,7 @@ def test_capture_failure_still_attempts_minimal_snapshot(tmp_path, monkeypatch):
 def test_reduction_failure_falls_back_without_recapturing(tmp_path, monkeypatch):
     import pydumpling.pydumpling as writer
 
-    serialize = writer._serialize
+    stream_dump = writer._stream_dump
     reduce = writer.reduce_snapshot
     capture = writer.SnapshotContext.from_frame
     captures = []
@@ -487,17 +490,17 @@ def test_reduction_failure_falls_back_without_recapturing(tmp_path, monkeypatch)
         captures.append(context.minimal)
         return capture(context, frame)
 
-    def exceed_budget(payload, serializer, limit):
+    def exceed_budget(payload, filename, serializer, limit):
         if "effective_limits" not in payload["snapshot_meta"]:
             raise writer.DumpTooLargeError("injected byte limit")
-        return serialize(payload, serializer, limit)
+        return stream_dump(payload, filename, serializer, limit)
 
     def fail_reduction(payload, options, *, stage):
         if stage == "reduced":
             raise RuntimeError("injected reduction failure")
         return reduce(payload, options, stage=stage)
 
-    monkeypatch.setattr(writer, "_serialize", exceed_budget)
+    monkeypatch.setattr(writer, "_stream_dump", exceed_budget)
     monkeypatch.setattr(writer, "reduce_snapshot", fail_reduction)
     monkeypatch.setattr(writer.SnapshotContext, "from_frame", capture_once)
     path = tmp_path / "reduction-fallback.dump"
@@ -693,3 +696,45 @@ def test_tiny_string_budget_keeps_frame_identifiers(tmp_path):
     assert frame.f_code.co_filename.endswith("test_dump.py")
     # User-facing text still obeys the budget.
     assert result["snapshot_meta"]["truncation"]["max_string_bytes"]
+
+
+def test_repeated_default_saves_never_overwrite(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for _ in range(3):
+        try:
+            raise ValueError("example")
+        except ValueError:
+            save_dumping(strict=True)
+    names = sorted(path.name for path in tmp_path.glob("*.dump"))
+    assert len(names) == 3
+    # Names carry the source line, a UTC timestamp, and the pid, so repeated
+    # failures keep every snapshot.
+    pattern = re.compile(
+        rf"test_dump\.py-\d+-\d{{8}}T\d{{6}}\.\d{{3}}-{re.escape(str(os.getpid()))}"
+        r"-\d{6}\.dump"
+    )
+    assert all(pattern.fullmatch(name) for name in names)
+
+
+def test_default_filename_for_the_current_stack(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    dump_current_traceback(strict=True)
+    assert len(list(tmp_path.glob("*.dump"))) == 1
+
+
+def test_saved_metadata_records_process_context(tmp_path):
+    path = tmp_path / "meta.dump"
+    try:
+        raise ValueError("example")
+    except ValueError:
+        save_dumping(path, strict=True)
+    metadata = load_dumpling(path)["snapshot_meta"]
+    assert metadata["pid"] == os.getpid()
+    assert metadata["created_at"].endswith("Z")
+    datetime.fromisoformat(metadata["created_at"])
+    assert metadata["thread_name"] == threading.current_thread().name
+    assert type(metadata["duration_ms"]) is int
+    assert metadata["duration_ms"] >= 0
+    assert metadata["cwd"] == os.getcwd()
+    if len(sys.argv) <= 256:
+        assert metadata["argv"] == sys.argv

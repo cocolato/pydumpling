@@ -50,6 +50,42 @@ python -m pydumpling --print error.dump
 常用 pdb 命令包括 `bt`、`u`、`d`、`list`、`ll` 和 `pp price`。
 快照用于检查保存下来的状态，无法恢复或继续执行原来的程序。
 
+## 机器可读与元数据视图
+
+~~~sh
+pydumpling --json error.dump                # 缩进 JSON 报告
+pydumpling --json --globals error.dump       # 额外包含每帧 globals
+pydumpling --info error.dump                 # 版本、预算、截断信息
+~~~
+
+JSON 对象包含捕获元数据（`created_at`、`pid`、`thread_name`、`duration_ms`、
+各版本号）、异常（`type`、`message`、`formatted` 文本；栈快照为 `null`）、
+从最外层到最内层的 `frames` 列表，以及 `truncation` 映射；
+变量值是带保护的 `repr` 字符串，可直接接入 `jq` 和 CI 工具链。
+
+## 嵌入源码与 HTML 报告
+
+~~~python
+from pydumpling import DumpOptions, save_dumping
+
+try:
+    risky_step()
+except ValueError:
+    save_dumping("error.dump", options=DumpOptions(embed_source_lines=5), strict=True)
+~~~
+
+`embed_source_lines` 会在 dump 内保存每帧当前行上下各 N 行源码
+（`None` 表示整个文件）。在没有源码的机器上 `pydumpling --debug` 的
+`list` 也能显示源码；本地仍存在的文件优先显示本地版本。
+超出 dump 字节预算时，先舍弃内嵌源码，再缩减捕获的变量。
+
+~~~sh
+pydumpling --html report.html error.dump   # 单文件 HTML，无脚本依赖
+~~~
+
+HTML 报告展示异常、每帧的源码窗口（优先嵌入的源码，其次本地文件）
+和 locals 表格。
+
 ## 保存当前调用栈
 
 ~~~python
@@ -67,8 +103,32 @@ calculate()
 ~~~
 
 在应用启动阶段调用一次 `catch_any_exception()`，可以保存主线程的未处理异常。
-它安装 `sys.excepthook`，并保留之前的 hook 来正常打印异常，
-不会安装线程或 asyncio 的异常处理器。
+它安装 `sys.excepthook`，并保留之前的 hook 来正常打印异常。
+传入 `include_threads=True` 可同时捕获结束线程的异常，
+`restore_exception_hooks()` 可移除已安装的全部钩子。
+asyncio 场景在异步代码内调用 `install_asyncio_handler()`（或显式传入 `loop=`），
+捕获事件循环上报的异常。
+
+## 管理快照目录
+
+`DumpManager` 把快照统一保存到一个目录，文件名唯一并限制保留数量：
+
+~~~python
+from pydumpling import DumpManager
+
+manager = DumpManager("dumps", retention=20)
+try:
+    risky_step()
+except ValueError:
+    manager.save_exception()  # 当前栈用 save_current()
+~~~
+
+默认文件名现在包含源码行号、UTC 时间戳、pid 和进程内序号，
+同一处反复出错也不会覆盖之前的快照。管理器按文件修改时间清理旧快照，
+时间相同时按文件名排序。
+钩子可直接接入管理器：`catch_any_exception(manager=manager, include_threads=True)`。
+每份快照的 `snapshot_meta` 记录创建时间、耗时、pid、主机名、工作目录、
+命令行和捕获线程。
 
 ## 控制快照开销
 
@@ -104,7 +164,9 @@ dump_current_traceback("unlimited.dump", options=DumpOptions.unlimited(), strict
 `save_dumping(filename=None, exc_info=None, *, options=None, strict=False)` 和
 `dump_current_traceback(filename=None, *, options=None, strict=False)`
 默认通过 warning 报告捕获或写入失败；传入 `strict=True` 可直接抛出异常。
-`catch_any_exception(*, options=None)` 支持相同的捕获预算。
+`catch_any_exception(*, options=None, include_threads=False, manager=None)`
+支持相同的捕获预算，`install_asyncio_handler(loop=None, *, options=None)`
+覆盖事件循环；两者都保留原有钩子的正常上报。
 
 加载和调试默认最多读取 64 MiB 解压后的 dump 数据。
 使用 `load_dumpling(path, max_bytes=None)` 或

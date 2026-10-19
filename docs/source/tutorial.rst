@@ -52,7 +52,13 @@ Save the current stack
 
 For unhandled main-thread exceptions, call ``catch_any_exception()`` once during
 application startup. It retains the previous ``sys.excepthook`` for normal
-reporting. Thread and asyncio exception handlers are outside its scope.
+reporting. Pass ``include_threads=True`` to also capture exceptions that end a
+thread, and ``restore_exception_hooks()`` to stop saving snapshots again. For
+asyncio, call ``install_asyncio_handler()`` inside async code. To keep every
+snapshot in one directory with bounded retention, build a
+``DumpManager("dumps", retention=20)`` and pass it as ``manager``; hooks and
+plain saves then write uniquely named files, with older dumps pruned by file
+modification time.
 
 See :doc:`api` for capture budgets, strict failures, and loading limits.
 

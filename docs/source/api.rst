@@ -27,13 +27,23 @@ Import ``DumpOptions`` from ``pydumpling``. Pass an options object to
    * - ``max_dump_bytes``
      - 16 MiB of uncompressed serialized data
 
+``embed_source_lines`` is a count, not a budget: zero (the default) embeds no
+source, a positive number embeds that many lines of context on each side of
+every captured frame's current line, and ``None`` embeds whole files. Embedded
+lines are stored per file in the dump's ``source`` mapping and each line is
+bounded like code metadata. ``DumpOptions.unlimited()`` disables the budgets
+but leaves source embedding at its own setting.
+
 Values that exceed traversal budgets may be summarized. Writers capture once,
-then try pickle and dill on the same captured graph with separate output buffers.
+then try pickle and dill on the same captured graph, each attempt streaming
+through gzip into its own temporary file, so the full serialized form never
+sits in memory and a failed attempt changes no existing dump.
 A bounded snapshot holds only builtin and pydumpling types, so the much faster
 pickle goes first; ``DumpOptions.unlimited()`` keeps original objects that may
 need dill, so dill goes first there. Dumps are gzip-compressed at level 6.
-If neither fits the byte budget, reductions first omit frame globals, then omit
-outer-frame locals while retaining the innermost frame's arguments and locals.
+If neither fits the byte budget, reductions first omit embedded source, then
+frame globals, then outer-frame locals while retaining the innermost frame's
+arguments and locals.
 The latter step also drops code constants and bytecode, retaining argument names
 and source location tables. These steps preserve the retained values and their
 shared references. If that
@@ -89,8 +99,8 @@ its frame are kept.
    options = DumpOptions(max_frames=16, max_depth=3, max_items=25)
    dump_current_traceback("small.dump", options=options, strict=True)
 
-Writers and exception hook
---------------------------
+Writers and exception hooks
+---------------------------
 
 ``save_dumping(filename=None, exc_info=None, *, options=None, strict=False)``
    Capture the current exception or an explicit ``(type, value, traceback)``
@@ -102,13 +112,40 @@ Writers and exception hook
 Both writers accept paths, return ``None``, and report failures with
 ``RuntimeWarning`` by default. Set ``strict=True`` to raise errors instead.
 An omitted filename uses an automatically generated name in the current
-directory. An existing output file is replaced atomically after successful
-serialization.
+directory: the source file, the failing line, a UTC timestamp in milliseconds,
+the pid, and a per-process sequence, so repeated failures never overwrite an
+earlier snapshot. An existing output file is
+replaced atomically after successful serialization.
 
-``catch_any_exception(*, options=None)``
+``catch_any_exception(*, options=None, include_threads=False, manager=None)``
    Install a main-thread ``sys.excepthook`` that saves unhandled exceptions,
    then invokes the previous hook for normal reporting. Call it once at
-   application startup. Thread and asyncio exception handlers are not installed.
+   application startup. ``include_threads=True`` also hooks
+   ``threading.excepthook`` for exceptions that end a thread. ``manager`` is a
+   ``DumpManager`` used to place and prune every saved dump; give capture
+   budgets to the manager instead of ``options``. Re-running updates budgets
+   without replacing installed hooks.
+
+``install_asyncio_handler(loop=None, *, options=None)``
+   Save snapshots for exceptions an asyncio event loop reports. Call it from
+   async code to hook the running loop, or pass ``loop`` explicitly. The
+   loop's previous handler, or its default, still reports each exception,
+   even if saving fails.
+
+``restore_exception_hooks()``
+   Remove every hook installed by the functions above, restoring the hooks
+   that were active at installation. Hooks another package installed on top
+   of ours stay installed.
+
+``DumpManager(directory, *, retention=50, options=None)``
+   Save into one directory with unique names and bounded retention.
+   ``save_exception(exc_info=None, *, options=None, strict=False)`` and
+   ``save_current(*, options=None, strict=False)`` mirror the writers and
+   return the written path, or ``None`` when a non-strict save failed;
+   ``target()`` builds a fresh managed path, and ``prune()`` deletes the
+   oldest dumps beyond ``retention`` and returns them (``retention=None``
+   keeps everything). Per-call ``options`` override the manager's budgets.
+   Pruning follows file modification time, with names breaking ties.
 
 Loading and debugging
 ---------------------
@@ -121,7 +158,11 @@ Loading and debugging
    errors such as missing files or denied access keep their original types.
 
 New snapshots expose capture budgets, Python version, frame counts, and omission
-reasons in ``snapshot_meta``. Inspect ``snapshot_meta["truncation"]`` to see which
+reasons in ``snapshot_meta``, plus process context: ``created_at`` (UTC
+ISO 8601), ``duration_ms``, ``pid``, ``hostname``, ``cwd``, ``argv`` (bounded
+like code metadata, past 256 entries reported as ``argv_entries``), and the
+capturing ``thread_name``. Environment fields are ``None`` where the
+environment cannot provide them. Inspect ``snapshot_meta["truncation"]`` to see which
 budgets or unsupported values limited the capture. CLI printing and debugging
 also display a snapshot notice when values were summarized.
 ``snapshot_meta["attempts"]`` lists failed stages, serializers (when applicable),
@@ -190,6 +231,18 @@ in another thread waits until the active session exits, and the connection
 ``timeout`` does not bound that wait. Other application threads do not acquire
 this lock and can observe the temporary global state. Prefer debugging dumps in
 a separate process when the application must keep serving concurrent work.
+Inside a session, ``list`` and ``ll`` show source embedded with
+``embed_source_lines`` for files missing on this machine; files that still
+exist locally keep showing their local source, and the injection is removed
+when the session ends.
+
+Embedded source is stored as a ``source`` mapping of
+``{filename: {"lines": {lineno: text}, "total": file_lines}}``. Each line is
+bounded like code metadata. When the byte budget is exceeded, the ``source``
+reduction stage drops the mapping (reported as ``source_omitted``) before any
+captured variables are reduced. The ``minimal`` fallback also omits source.
+The ``--html`` reporter prefers embedded source when drawing a frame's
+context and falls back to the local file.
 
 .. warning::
 
@@ -217,9 +270,10 @@ Command line
 ------------
 
 Both ``pydumpling`` and ``python -m pydumpling`` expose the same interface.
-Choose exactly one action: ``--print``, ``--debug``, ``--rdebug``, or
-``--capture-pid PID``. The first three take a dump filename; PID capture takes
-``--output FILE`` and optionally ``--timeout SECONDS`` or ``--unlimited``.
+Choose exactly one action: ``--print``, ``--json``, ``--info``, ``--html
+FILE``, ``--debug``, ``--rdebug``, or ``--capture-pid PID``. The first five
+take a dump filename; PID capture takes ``--output FILE`` and optionally
+``--timeout SECONDS`` or ``--unlimited``.
 
 ``--print`` writes the stored traceback and exception text to standard output,
 so the report survives a pipe or a redirect; the snapshot notice and other
@@ -227,7 +281,19 @@ diagnostics stay on standard error. Characters the output encoding cannot
 represent, such as lone surrogates from undecodable paths, are escaped as
 standard error would escape them. If the reader closes the pipe early, as
 ``head`` does, the command stops quietly with status 141; if only the notice's
-reader is gone, the report is still written. ``--host`` and ``--port``
+reader is gone, the report is still written.
+
+``--json`` prints the same snapshot as an indented JSON object: top-level
+capture metadata (format and package versions, Python version, ``created_at``,
+``pid``, ``thread_name``, ``duration_ms``), the exception (``type``,
+``message``, and ``formatted`` text, or ``null`` for a stack snapshot), a
+``frames`` list from outermost to innermost, and the ``truncation`` mapping.
+Variable values are guarded ``repr`` strings. ``--globals`` adds each frame's
+globals to the JSON output (locals are always included). ``--info`` prints the stored metadata as
+a human-readable summary: creation time, versions, capture budgets, effective
+budgets after reductions, truncation reasons, and failed save attempts.
+
+``--host`` and ``--port``
 configure remote debugging; ``--timeout`` also limits
 waiting for a remote client. ``--max-load-mib`` sets
 the decompressed loading limit in MiB; zero disables it. Use ``--help`` for all

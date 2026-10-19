@@ -2,6 +2,8 @@
 
 import gzip
 import inspect
+import linecache
+import os
 import pdb
 import pickle
 import signal
@@ -163,9 +165,51 @@ def load_dumpling(
     return _validate_dumpling(dumpling)
 
 
+def _padded_source_lines(entry):
+    """A 1-based line list from a stored ``{lineno: text}`` mapping."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("lines"), dict):
+        return None
+    numbers = {}
+    for number, text in entry["lines"].items():
+        if type(number) is not int or number < 1 or type(text) is not str:
+            return None
+        numbers[number] = text
+    if not numbers:
+        return None
+    lines = [""] * max(numbers)
+    for number, text in numbers.items():
+        lines[number - 1] = text
+    return lines
+
+
+def inject_sources(sources) -> list[str]:
+    """Fill ``linecache`` for embedded files without a readable local copy.
+
+    Local files win: an unchanged checkout shows its own source. Injected
+    entries use a ``None`` mtime, so ``linecache.checkcache`` keeps them.
+    Malformed entries from a hand-edited dump are skipped, not fatal.
+    """
+    injected = []
+    if not isinstance(sources, dict):
+        return injected
+    for filename, entry in sources.items():
+        if not isinstance(filename, str) or os.path.isfile(filename):
+            continue
+        lines = _padded_source_lines(entry)
+        if lines is None:
+            continue
+        linecache.cache[filename] = (sum(map(len, lines)), None, lines, filename)
+        injected.append(filename)
+    return injected
+
+
 @contextmanager
-def mock_inspect():
-    """Use with ``with mock_inspect():``; restore inspect/tracing state on exit."""
+def mock_inspect(sources=None):
+    """Use with ``with mock_inspect():``; restore inspect/tracing state on exit.
+
+    ``sources`` is a dump's embedded source mapping; while the context is
+    active, pdb's ``list`` shows it for files missing on this machine.
+    """
     with _COMPAT_LOCK:
         original = inspect.isframe, inspect.istraceback, inspect.iscode
         original_trace = sys.gettrace()
@@ -179,6 +223,7 @@ def mock_inspect():
                 (frame, frame.f_trace, frame.f_trace_lines, frame.f_trace_opcodes)
             )
             frame = frame.f_back
+        injected = inject_sources(sources)
         inspect.isframe = lambda obj: isinstance(obj, (types.FrameType, FakeFrame))
         inspect.istraceback = lambda obj: isinstance(
             obj, (types.TracebackType, FakeTraceback)
@@ -187,6 +232,8 @@ def mock_inspect():
         try:
             yield
         finally:
+            for filename in injected:
+                linecache.cache.pop(filename, None)
             inspect.isframe, inspect.istraceback, inspect.iscode = original
             # Older Bdb quit/continue stops the process-wide trace; continue
             # also deletes local trace hooks along the live caller stack.
@@ -210,8 +257,8 @@ def debug_dumpling(
     max_bytes: int | None = DEFAULT_MAX_BYTES,
 ) -> None:
     dumpling = load_dumpling(dump_file, max_bytes=max_bytes)
-    from .helpers import print_snapshot_notice
+    from .report import print_snapshot_notice
 
     print_snapshot_notice(dumpling)
-    with mock_inspect():
+    with mock_inspect(dumpling.get("source")):
         pdb.post_mortem(dumpling["traceback"])

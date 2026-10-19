@@ -7,8 +7,15 @@ import sys
 from ._version import __version__
 from .capture import capture_pid
 from .debug_dumpling import DEFAULT_MAX_BYTES, debug_dumpling, load_dumpling
-from .helpers import discard_stream, print_traceback_and_except, validate_file_name
 from .options import DumpOptions
+from .report import (
+    discard_stream,
+    print_info_report,
+    print_json_report,
+    print_traceback_and_except,
+    validate_file_name,
+    write_html_report,
+)
 from .rpdb import DEFAULT_ADDR, DEFAULT_PORT, r_post_mortem
 
 
@@ -56,6 +63,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--print", action="store_true", help="print a stored traceback"
     )
     actions.add_argument(
+        "--json",
+        action="store_true",
+        help="print a stored traceback as JSON",
+    )
+    actions.add_argument(
+        "--info", action="store_true", help="print stored snapshot metadata"
+    )
+    actions.add_argument(
+        "--html",
+        metavar="FILE",
+        help="write a standalone HTML report",
+    )
+    actions.add_argument(
         "--debug", action="store_true", help="debug a snapshot with pdb"
     )
     actions.add_argument(
@@ -76,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", help=f"remote bind address (default: {DEFAULT_ADDR})")
     parser.add_argument(
         "--port", type=_port, help=f"remote bind port (default: {DEFAULT_PORT})"
+    )
+    parser.add_argument(
+        "--globals",
+        action="store_true",
+        help="include frame globals in JSON output",
     )
     parser.add_argument(
         "--timeout",
@@ -102,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.globals and not args.json:
+        parser.error("--globals requires --json")
     if args.capture_pid is not None:
         if args.filename is not None or not args.output:
             parser.error(
@@ -132,10 +159,15 @@ def main(argv: list[str] | None = None) -> int:
                 timeout=args.timeout if args.timeout is not None else 30.0,
             )
             print(output)
-        elif args.print:
+        elif args.print or args.json or args.info:
             dumpling = load_dumpling(args.filename, max_bytes=args.max_load_mib)
             try:
-                print_traceback_and_except(dumpling)
+                if args.info:
+                    print_info_report(dumpling)
+                elif args.json:
+                    print_json_report(dumpling, include_globals=args.globals)
+                else:
+                    print_traceback_and_except(dumpling)
                 sys.stdout.flush()
             except BrokenPipeError:
                 # The report's reader closed the pipe early, as ``| head``
@@ -143,6 +175,9 @@ def main(argv: list[str] | None = None) -> int:
                 # tools ended by SIGPIPE, so the final flush cannot fail again.
                 discard_stream(sys.stdout)
                 return 141  # 128 + SIGPIPE
+        elif args.html is not None:
+            dumpling = load_dumpling(args.filename, max_bytes=args.max_load_mib)
+            print(write_html_report(dumpling, args.html))
         elif args.debug:
             debug_dumpling(args.filename, max_bytes=args.max_load_mib)
         else:

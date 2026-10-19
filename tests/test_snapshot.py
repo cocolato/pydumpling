@@ -2,10 +2,12 @@ import builtins
 import os
 import pickle
 import sys
+import threading
 import traceback
 import tracemalloc
 from collections import Counter, OrderedDict, defaultdict, namedtuple
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from enum import IntEnum, StrEnum
 from types import SimpleNamespace
 
@@ -25,10 +27,11 @@ from pydumpling.fake_types import (
 )
 from pydumpling.options import DumpOptions
 from pydumpling.pydumpling import _capture_frame
-from pydumpling.snapshot import (
+from pydumpling.snapshot import SnapshotContext
+from pydumpling.snapshot.context import (
+    _ARGV_LIMIT,
     _CODE_BYTES_LIMIT,
     _CODE_TEXT_LIMIT,
-    SnapshotContext,
 )
 
 
@@ -1161,7 +1164,7 @@ def test_global_names_survive_a_local_holding_globals(tmp_path):
 
 
 def test_group_check_never_reads_an_overridden_class(monkeypatch):
-    import pydumpling.snapshot as snapshot_module
+    import pydumpling.snapshot.exceptions as exceptions_module
 
     class HostileError(Exception):
         @property
@@ -1169,9 +1172,9 @@ def test_group_check_never_reads_an_overridden_class(monkeypatch):
             raise AssertionError("application __class__ read")
 
     monkeypatch.setattr(
-        snapshot_module,
+        exceptions_module,
         "_BUILTIN_EXCEPTIONS",
-        {**snapshot_module._BUILTIN_EXCEPTIONS, id(HostileError): HostileError},
+        {**exceptions_module._BUILTIN_EXCEPTIONS, id(HostileError): HostileError},
     )
     context = SnapshotContext(DumpOptions())
     extra = context.exception(HostileError("hostile-boom"))
@@ -1180,3 +1183,63 @@ def test_group_check_never_reads_an_overridden_class(monkeypatch):
     # exception_state.  (Only the stdlib formatter reads the copy's class,
     # which a real builtin exception cannot override.)
     assert "exception_state" not in context.metadata()["truncation"]
+
+
+def test_metadata_records_process_context():
+    context = SnapshotContext(DumpOptions())
+    context.from_frame(sys._getframe())
+    metadata = context.metadata()
+    assert metadata["pid"] == os.getpid()
+    assert metadata["thread_name"] == threading.current_thread().name
+    assert metadata["created_at"].endswith("Z")
+    moment = datetime.fromisoformat(metadata["created_at"])
+    assert abs((datetime.now(timezone.utc) - moment).total_seconds()) < 60
+    assert type(metadata["duration_ms"]) is int
+    assert metadata["duration_ms"] >= 0
+    assert isinstance(metadata["hostname"], str)
+    assert metadata["cwd"] == os.getcwd()
+    if len(sys.argv) <= _ARGV_LIMIT:
+        assert metadata["argv"] == sys.argv
+
+
+def test_metadata_environment_degrades_gracefully(monkeypatch):
+    def unavailable():
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(os, "getcwd", unavailable)
+    monkeypatch.setattr("socket.gethostname", unavailable)
+    monkeypatch.delattr(sys, "argv")
+    metadata = SnapshotContext(DumpOptions()).metadata()
+    assert metadata["cwd"] is None
+    assert metadata["hostname"] is None
+    assert metadata["argv"] is None
+
+
+def test_metadata_bounds_a_huge_command_line(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["x" * (_CODE_TEXT_LIMIT + 10)]
+        + [str(index) for index in range(_ARGV_LIMIT + 44)],
+    )
+    context = SnapshotContext(DumpOptions())
+    metadata = context.metadata()
+    argv = metadata["argv"]
+    assert len(argv) == _ARGV_LIMIT
+    assert metadata["truncation"]["argv_entries"] == 45
+    assert metadata["truncation"]["code_metadata"] == 1
+    assert len(argv[0]) <= _CODE_TEXT_LIMIT
+
+
+def test_metadata_records_the_capturing_thread():
+    result = {}
+
+    def worker():
+        context = SnapshotContext(DumpOptions())
+        context.from_frame(sys._getframe())
+        result["thread_name"] = context.metadata()["thread_name"]
+
+    thread = threading.Thread(target=worker, name="pydumpling-worker")
+    thread.start()
+    thread.join()
+    assert result["thread_name"] == "pydumpling-worker"
