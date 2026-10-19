@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Runtime and capture
+
+- Keep the value, type name, and attributes of `str`, `bytes`, `int`, and
+  `float` subclass instances, such as `IntEnum` and `StrEnum` members, under
+  the budgets of plain values instead of an empty placeholder.
+- Save bounded snapshots faster: they are written with pickle before dill and
+  compressed at gzip level 6. Unlimited capture keeps dill first.
+- A captured attribute named like a pickling hook, such as `__reduce_ex__` or
+  `__getstate__`, no longer makes a snapshot unsavable.
+- Write snapshot format 2, which adds the scalar subclass copies. Format 1
+  dumps still load; Pydumpling 0.2.0 cannot read format 2.
+
 ## 0.2.0 — 2026-10-18
 
 ### Runtime and capture

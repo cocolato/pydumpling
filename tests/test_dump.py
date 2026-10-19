@@ -3,6 +3,7 @@
 import gzip
 import inspect
 import os
+import pickle
 import subprocess
 import sys
 import traceback
@@ -37,6 +38,33 @@ def test_exception_round_trip(tmp_path):
     assert tb.tb_next.tb_frame.f_back is tb.tb_frame
     if os.name == "posix":
         assert path.stat().st_mode & 0o777 == 0o600
+
+
+# Kept early in the module: a later test also drives dill into a failed
+# write, and a leaked buffer there aborts the run before this assertion.
+def test_failed_dill_attempt_leaves_no_exported_buffer(tmp_path, monkeypatch):
+    import gc
+
+    unraisable = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
+
+    def crash():
+        _values = {str(index): "x" * 4096 + str(index) for index in range(100)}
+        raise ValueError("boom")
+
+    try:
+        crash()
+    except ValueError:
+        # Too small for either serializer, so dill, tried last, fails too.
+        save_dumping(
+            tmp_path / "small.dump",
+            options=DumpOptions(max_frames=1, max_dump_bytes=8192),
+            strict=True,
+        )
+    gc.collect()
+    # Without clearing the failed frames, collecting dill's kept error frees a
+    # still-exported buffer and Python reports an unraisable BufferError.
+    assert unraisable == []
 
 
 @pytest.mark.parametrize(
@@ -199,7 +227,7 @@ def test_current_stack_includes_caller_and_default_file_is_in_cwd(
     assert result["snapshot_meta"]["truncation"]
 
 
-def test_partial_dill_failure_restarts_pickle(tmp_path, monkeypatch):
+def test_partial_pickle_failure_restarts_dill(tmp_path, monkeypatch):
     import pydumpling.pydumpling as writer
 
     live = {"answer": 42}
@@ -213,20 +241,124 @@ def test_partial_dill_failure_restarts_pickle(tmp_path, monkeypatch):
     def partial_write(payload, output, **kwargs):
         output.write(b"BROKEN")
         live["answer"] = 99
-        raise TypeError("dill failed after writing")
+        raise TypeError("pickle failed after writing")
 
     monkeypatch.setattr(writer.SnapshotContext, "from_frame", capture)
-    monkeypatch.setattr(writer.dill, "dump", partial_write)
+    # A bounded snapshot is written with C pickle first, dill second.
+    monkeypatch.setattr(writer.pickle, "dump", partial_write)
     path = tmp_path / "fallback.dump"
     dump_current_traceback(path, options=DumpOptions(max_frames=1), strict=True)
     assert gzip.decompress(path.read_bytes()).startswith(b"\x80")
     restored = load_dumpling(path)
-    assert restored["dump_type"] == "PICKLE"
+    assert restored["dump_type"] == "DILL"
     assert restored["traceback"].tb_frame.f_locals["live"]["answer"] == 42
     assert len(captures) == 1
     assert restored["snapshot_meta"]["attempts"] == [
-        {"stage": "full", "serializer": "dill", "error": "TypeError"}
+        {"stage": "full", "serializer": "pickle", "error": "TypeError"}
     ]
+
+
+# The threading module's globals hold itertools objects, whose pickle support
+# Python 3.12+ deprecates, and, under coverage, a tracer dill cannot locate.
+@pytest.mark.filterwarnings("ignore:Pickle, copy, and deepcopy:DeprecationWarning")
+@pytest.mark.filterwarnings("ignore::dill.PicklingWarning")
+def test_unlimited_probe_uses_the_serializer_that_writes(tmp_path, monkeypatch):
+    import math
+    import threading
+
+    namespace = {
+        "__name__": "__main__",
+        "dump_current_traceback": dump_current_traceback,
+        "math": math,
+    }
+    exec(
+        "def configured(values=(index for index in range(3))):\n"
+        "    return values\n"
+        "def business(path, options):\n"
+        "    kept = 42\n"
+        "    handler = configured\n"
+        "    module = math\n"
+        "    dump_current_traceback(path, options=options, strict=True)\n",
+        namespace,
+    )
+    # pickle finds this function by name, but dill writes __main__ functions
+    # by value and fails on the generator default; pickle cannot write the
+    # module.  Accepting the function on a pickle probe fails both writers.
+    monkeypatch.setattr(
+        sys.modules["__main__"], "configured", namespace["configured"], raising=False
+    )
+    path = tmp_path / "probe.dump"
+    # A fresh thread keeps the unlimited capture free of test-runner objects.
+    thread = threading.Thread(
+        target=namespace["business"], args=(path, DumpOptions.unlimited())
+    )
+    thread.start()
+    thread.join()
+    restored = load_dumpling(path, max_bytes=None)
+    innermost = restored["traceback"]
+    while innermost.tb_next is not None:
+        innermost = innermost.tb_next
+    assert restored["snapshot_meta"]["attempts"] == []
+    assert innermost.tb_frame.f_locals["kept"] == 42
+    assert innermost.tb_frame.f_locals["module"] is math
+
+
+def test_bounded_snapshot_of_awkward_objects_is_written_with_pickle(tmp_path):
+    import threading
+
+    path = tmp_path / "awkward.dump"
+
+    def business():
+        class Local:
+            pass
+
+        callback = lambda value: value  # noqa: E731 - pickle rejects it
+        generator = (index for index in range(3))
+        lock = threading.Lock()
+        instance = Local()
+        try:
+            raise ValueError(callback)
+        except ValueError:
+            save_dumping(path, options=DumpOptions(max_frames=1), strict=True)
+        return generator, lock, instance
+
+    business()
+    restored = load_dumpling(path)
+    # Capture leaves no original object behind, so fast pickle always fits.
+    assert restored["dump_type"] == "PICKLE"
+    assert restored["snapshot_meta"]["attempts"] == []
+
+
+def test_dumps_are_compressed_at_level_six(tmp_path, monkeypatch):
+    import pydumpling.pydumpling as writer
+
+    levels = []
+    gzip_file = writer.gzip.GzipFile
+
+    def recording(*args, **kwargs):
+        levels.append(kwargs.get("compresslevel", 9))
+        return gzip_file(*args, **kwargs)
+
+    monkeypatch.setattr(writer.gzip, "GzipFile", recording)
+    path = tmp_path / "level.dump"
+    dump_current_traceback(path, options=DumpOptions(max_frames=1), strict=True)
+    assert levels == [6]
+
+
+@pytest.mark.parametrize(
+    "options, dump_type",
+    [(DumpOptions(), "PICKLE"), (DumpOptions.unlimited(), "DILL")],
+)
+def test_serializer_order_follows_the_capture_mode(tmp_path, options, dump_type):
+    import pydumpling.pydumpling as writer
+
+    path = tmp_path / "order.dump"
+    # Both serializers can write this payload, so the first one tried wins: a
+    # bounded snapshot goes to fast pickle, unlimited original objects to dill.
+    writer._write_snapshot(
+        path, lambda minimal: {"snapshot_meta": {"truncation": {}}}, options
+    )
+    assert pickle.loads(gzip.decompress(path.read_bytes()))["dump_type"] == dump_type
 
 
 @pytest.mark.parametrize("failure", ["serialization", "replace", "budget"])
@@ -315,9 +447,9 @@ def test_byte_budget_reduction_preserves_values_and_original_capture(
     assert metadata["attempts"] == [
         {"stage": stage, "serializer": serializer, "error": "DumpTooLargeError"}
         for stage in ("full", "globals", "outer")
-        for serializer in ("dill", "pickle")
+        for serializer in ("pickle", "dill")
     ]
-    assert result["format_version"] == 1
+    assert result["format_version"] == 2
 
 
 def test_capture_failure_still_attempts_minimal_snapshot(tmp_path, monkeypatch):

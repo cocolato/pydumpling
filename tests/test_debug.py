@@ -76,7 +76,7 @@ def test_load_legacy_serializers_and_read_limit(tmp_path, serializer):
         load_dumpling(filename, max_bytes=size - 1)
 
 
-@pytest.mark.parametrize("version", [-1, 2, True, "1", None])
+@pytest.mark.parametrize("version", [-1, 3, True, "1", None])
 def test_reject_unsupported_snapshot_format(tmp_path, version):
     snapshot = make_dumpling()
     snapshot["format_version"] = version
@@ -85,15 +85,19 @@ def test_reject_unsupported_snapshot_format(tmp_path, version):
         load_dumpling(filename)
 
 
+@pytest.mark.parametrize("format_version", [1, 2])
 @pytest.mark.parametrize("version", ["0.0.0", "1.0.0", "2.0.0"])
-def test_current_format_is_independent_of_package_version(tmp_path, version):
+def test_current_format_is_independent_of_package_version(
+    tmp_path, version, format_version
+):
+    # Format 2 only adds types, so format 1 dumps from 0.2.0 still load.
     snapshot = make_dumpling()
-    snapshot.update(format_version=1, version=version)
+    snapshot.update(format_version=format_version, version=version)
     filename, _ = write_dumpling(tmp_path, snapshot)
     assert load_dumpling(filename)["traceback"].tb_frame.f_locals["value"] == 42
 
 
-@pytest.mark.parametrize("format_version", [0, 1])
+@pytest.mark.parametrize("format_version", [0, 1, 2])
 def test_package_version_must_still_be_well_formed(tmp_path, format_version):
     snapshot = make_dumpling()
     snapshot.update(format_version=format_version, version="invalid version")

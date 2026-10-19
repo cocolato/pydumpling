@@ -57,13 +57,14 @@ the running Python interpreter. Cross-Python-version compatibility is not
 guaranteed. Use the matching interpreter and source checkout for inspection.
 Snapshots cannot resume execution of the original process.
 
-New dumps carry ``format_version=1`` independently of the package version.
+New dumps carry ``format_version=2`` independently of the package version;
+format 1 dumps from 0.2.0 still load, but 0.2.0 cannot read format 2.
 Unversioned dumps are read as legacy format 0; unknown schema versions are
 rejected. Serialization retries reuse the captured graph, and byte-budget
 failures omit globals and outer-frame locals before reducing fault-frame values.
 Oversized exception reports become bounded summaries with omission counts.
-Format 1 uses the schema version for compatibility; the historical package-version
-range applies only to legacy format 0. See
+Formats 1 and 2 use the schema version for compatibility; the historical
+package-version range applies only to legacy format 0. See
 :doc:`api` for retry metadata and concurrency limits of embedded debuggers.
 
 New capability

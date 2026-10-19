@@ -15,13 +15,17 @@ from dataclasses import asdict, replace
 import dill
 
 from .fake_types import (
+    FakeBytes,
     FakeClass,
     FakeCode,
     FakeDict,
+    FakeFloat,
     FakeFrame,
     FakeFrozenSet,
+    FakeInt,
     FakeList,
     FakeSet,
+    FakeStr,
     FakeTraceback,
     FakeTuple,
     TruncatedValue,
@@ -60,7 +64,15 @@ if hasattr(builtins, "frozendict"):
     # FakeDict so a snapshot taken on 3.15 still loads on older Pythons.
     _CONTAINER_TYPES.append((builtins.frozendict, FakeDict, FakeDict))
 _CONTAINER_BASES = {id(entry[0]): entry for entry in _CONTAINER_TYPES}
-SNAPSHOT_FORMAT_VERSION = 1
+# Exact scalars are kept as they are; each scalar base maps to the snapshot
+# subclass for instances of its subclasses, such as IntEnum or StrEnum members.
+_SCALAR_COPIES = {
+    id(copy_type._base): copy_type
+    for copy_type in (FakeStr, FakeBytes, FakeInt, FakeFloat)
+}
+# Format 2 adds the str, bytes, int, and float subclass copies; it only adds
+# types, so format 1 dumps load unchanged.
+SNAPSHOT_FORMAT_VERSION = 2
 _BUILTIN_EXCEPTIONS = {
     id(value): value
     for value in builtins.__dict__.values()
@@ -86,6 +98,15 @@ def _container_base(value):
         if entry is not None:
             return entry
     return None, None, None
+
+
+def _scalar_copy_type(value):
+    """The snapshot subclass for a str, bytes, int, or float subclass instance."""
+    for cls in _type_mro(value):
+        copy_type = _SCALAR_COPIES.get(id(cls))
+        if copy_type is not None:
+            return copy_type
+    return None
 
 
 # Key types whose hashing and comparison run only builtin code.
@@ -118,6 +139,8 @@ class SnapshotContext:
         self.options = options
         self.serializer = serializer
         self.minimal = minimal
+        # Evaluated once: the dataclass property walks every field per call.
+        self._unlimited = options.is_unlimited and not minimal
         self.frames = {}
         self.codes = {}
         self.objects = {}
@@ -241,8 +264,8 @@ class SnapshotContext:
         self._namespaces.add(id(attrs))
         return self._mapping(attrs, depth, priority=priority)
 
-    def _fill_container(self, value, copy, depth):
-        """Keep a container subclass's type name and attributes beside its entries.
+    def _fill_copy(self, value, copy, depth):
+        """Keep a subclass's type name and attributes beside its entries or value.
 
         Instance attributes, filled slots, struct sequence fields outside the
         tuple part, and named tuple fields all become attributes of the copy.
@@ -250,12 +273,25 @@ class SnapshotContext:
         namespace = copy.__dict__
         cls = type(value)
         own = cls is type(copy)
+        key = type(copy)._type_key
         attrs = self._attributes(value) or {}
+        type_name = attrs.get(key) if own else self._type_name(value)
+        limit = self.options.max_depth
+        if limit is not None and depth >= limit:
+            # Only a scalar copy gets here: its value is kept at any depth,
+            # like a plain value, but its attributes and slots are nested
+            # data and follow the depth budget.
+            # Only an exact str name is compared: a str subclass attribute name
+            # could run its own ``__ne__``, so any other name counts as data.
+            if any(
+                type(name) is not str or name != key for name in attrs
+            ) or self._filled_slot(value):
+                self._truncation["max_depth"] += 1
+            namespace[key] = type_name
+            return
         if attrs:
             namespace.update(
-                self._attribute_mapping(
-                    attrs, depth + 1, private="_FakeContainer__type" if own else None
-                )
+                self._attribute_mapping(attrs, depth + 1, private=key if own else None)
             )
         members, fields = self._layout(value)
         for name, member in members:
@@ -275,9 +311,18 @@ class SnapshotContext:
             namespace[name] = self.value(item, depth + 1)
         if fields and type(copy) is FakeTuple:
             namespace.update(zip(fields, copy))
-        namespace["_FakeContainer__type"] = (
-            attrs.get("_FakeContainer__type") if own else self._type_name(value)
-        )
+        namespace[key] = type_name
+
+    def _filled_slot(self, value):
+        """Whether any slot of ``value`` holds a value; runs no application code."""
+        cls = type(value)
+        for _, member in self._layout(value)[0]:
+            try:
+                member.__get__(value, cls)
+            except Exception:
+                continue
+            return True
+        return False
 
     def _remember(self, original, captured):
         self.objects[id(original)] = captured
@@ -322,13 +367,14 @@ class SnapshotContext:
                     value, self.options.max_string_bytes, "max_string_bytes"
                 ),
             )
-        if self.options.is_unlimited and not self.minimal:
-            serializer = dill if self.serializer == "dill" else pickle
-            try:
-                serializer.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        if self._unlimited:
+            if self._serializable(value):
                 return self._remember(value, value)
-            except Exception:
-                self._truncation["unserializable"] += 1
+            self._truncation["unserializable"] += 1
+        copy_type = _scalar_copy_type(value)
+        if copy_type is not None:
+            # Like an exact scalar, the value is kept at any depth.
+            return self._scalar(value, copy_type, depth)
         limit = self.options.max_depth
         if limit is not None and depth >= limit:
             return self._remember(value, self._omit("max_depth", value))
@@ -339,7 +385,7 @@ class SnapshotContext:
         if snapshot_type is FakeDict:  # dict, and frozendict on Python 3.15+
             captured = self._mapping(value, depth, counted=True, container=target)
             if target is snapshot_type:
-                self._fill_container(value, captured, depth)
+                self._fill_copy(value, captured, depth)
             return captured
         if base is not None:
             sequence = base is list or base is tuple
@@ -373,7 +419,7 @@ class SnapshotContext:
                 captured = target(captured)
                 self._remember(value, captured)
             if target is snapshot_type:
-                self._fill_container(value, captured, depth)
+                self._fill_copy(value, captured, depth)
             return captured
         representation = (
             FakeClass.__repr__(value)
@@ -394,6 +440,47 @@ class SnapshotContext:
         else:
             self._truncation["unsupported_type"] += 1
         return captured
+
+    def _scalar(self, value, copy_type, depth):
+        """Copy a str, bytes, int, or float subclass instance and its attributes.
+
+        The value is read through the base type, so no application
+        ``__getitem__``, ``__len__``, ``__int__``, or ``bit_length`` runs, and it
+        has the budget of an exact instance.
+        """
+        base = copy_type._base
+        limit = self.options.max_string_bytes
+        if base is int:
+            if limit is not None and int.bit_length(value) > limit * 8:
+                return self._remember(value, self._omit("max_string_bytes", value))
+            plain = int.__int__(value)
+        elif base is float:
+            plain = float.__float__(value)
+        else:
+            # The base slice copies at most one item past the budget into an
+            # exact instance: enough to see the budget was exceeded.
+            head = base.__getitem__(value, slice(None if limit is None else limit + 1))
+            plain = (
+                self._text(head)
+                if base is str
+                else self._bounded_bytes(head, limit, "max_string_bytes")
+            )
+        captured = self._remember(value, copy_type(plain))
+        self._fill_copy(value, captured, depth)
+        return captured
+
+    def _serializable(self, value):
+        """Whether the writer can keep this original object as it is."""
+        # Probe with the serializer that writes the snapshot.  pickle and dill
+        # accept different objects: a value only pickle can write costs a
+        # failed dill attempt, and next to one only dill can write, both
+        # writers fail and the snapshot falls back to minimal.
+        serializer = dill if self.serializer == "dill" else pickle
+        try:
+            serializer.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _attributes(value):
@@ -830,8 +917,11 @@ class SnapshotContext:
         converted = tuple(converted)
         if not converted:
             return ""
-        if len(converted) == 1 and type(converted[0]) is str:
-            return converted[0]
+        if len(converted) == 1 and (
+            type(converted[0]) is str or type(converted[0]) is FakeStr
+        ):
+            # As str(exc) would, without the subclass's own __str__.
+            return str.__str__(converted[0])
         formatter = reprlib.Repr()
         formatter.maxstring = self.options.max_string_bytes or 4096
         formatter.maxother = formatter.maxstring
@@ -846,14 +936,11 @@ class SnapshotContext:
             "exc_value": None,
             "type_name": type_name,
         }
-        if self.options.is_unlimited and not self.minimal:
-            serializer = dill if self.serializer == "dill" else pickle
-            try:
-                serializer.dumps((type(exc), exc), protocol=pickle.HIGHEST_PROTOCOL)
+        if self._unlimited:
+            if self._serializable((type(exc), exc)):
                 extra.update(exc_type=type(exc), exc_value=exc)
                 return extra
-            except Exception:
-                self._truncation["unserializable_exception"] += 1
+            self._truncation["unserializable_exception"] += 1
         extra["message"] = self._exception_message(exc)
         saved = self._builtin_exception(exc)
         if not self.minimal and saved is not None:

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import warnings
 from pathlib import Path
+from traceback import clear_frames
 from types import FrameType, TracebackType
 from typing import Callable
 
@@ -40,10 +41,19 @@ class _LimitedBuffer(io.BytesIO):
 
 def _serialize(payload: dict, serializer: str, limit: int | None) -> bytes:
     with _LimitedBuffer(limit) as buffer:
-        if serializer == "dill":
-            dill.dump(payload, buffer, protocol=pickle.HIGHEST_PROTOCOL, byref=True)
-        else:
-            pickle.dump(payload, buffer, protocol=pickle.HIGHEST_PROTOCOL)
+        try:
+            if serializer == "dill":
+                dill.dump(payload, buffer, protocol=pickle.HIGHEST_PROTOCOL, byref=True)
+            else:
+                pickle.dump(payload, buffer, protocol=pickle.HIGHEST_PROTOCOL)
+        except BaseException as error:
+            # dill's pure-Python framer keeps a view of its frame buffer in the
+            # failed frames.  Clear their locals so the kept error does not
+            # leave that buffer exported until garbage collection.  Every
+            # exception, KeyboardInterrupt and SystemExit included, is then
+            # re-raised unchanged.
+            clear_frames(error.__traceback__)
+            raise
         return buffer.getvalue()
 
 
@@ -52,8 +62,10 @@ def _atomic_write(filename: Pathish, data: bytes) -> Path:
     fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     try:
         with os.fdopen(fd, "wb") as output:
+            # Level 6 compresses faster than the default 9 for a slightly
+            # larger file; the gain depends on the data.
             with gzip.GzipFile(
-                filename="", fileobj=output, mode="wb", mtime=0
+                filename="", fileobj=output, mode="wb", mtime=0, compresslevel=6
             ) as compressed:
                 compressed.write(data)
             output.flush()
@@ -81,13 +93,17 @@ def _write_snapshot(
         payload = reduce_snapshot(factory(True), options, stage="minimal")
         stage = "minimal"
     payload["format_version"] = SNAPSHOT_FORMAT_VERSION
+    # A bounded snapshot holds only builtins and pydumpling's own types, which
+    # C pickle writes many times faster than dill.  Original objects kept by an
+    # unlimited capture, such as lambdas or local classes, may need dill.
+    serializers = ("dill", "pickle") if options.is_unlimited else ("pickle", "dill")
     while True:
         metadata = payload["snapshot_meta"]
         metadata["attempts"] = attempts
         if stage != "full":
             metadata["truncation"]["serialization_fallback"] = 1
         too_large = False
-        for serializer in ("dill", "pickle"):
+        for serializer in serializers:
             payload["dump_type"] = serializer.upper()
             try:
                 data = _serialize(payload, serializer, options.max_dump_bytes)
