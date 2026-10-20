@@ -51,6 +51,8 @@ class SnapshotContext(ValuesMixin, FramesMixin, ExceptionsMixin):
         # Evaluated once: the dataclass property walks every field per call.
         self._unlimited = options.is_unlimited and not minimal
         self.frames = {}
+        # Every line a traceback entry or frame reported, per captured frame.
+        self._frame_lines = {}
         self.codes = {}
         self.objects = {}
         self._sources = {}

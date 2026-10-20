@@ -3,7 +3,6 @@
 import gzip
 import inspect
 import itertools
-import linecache
 import os
 import pickle
 import re
@@ -22,13 +21,21 @@ from ._version import __version__
 from .fake_types import FakeTraceback
 from .options import DumpOptions
 from .snapshot import SNAPSHOT_FORMAT_VERSION, SnapshotContext, reduce_snapshot
-from .snapshot.context import _CODE_TEXT_LIMIT
+from .snapshot.context import _utf8_prefix
 
 Pathish = str | os.PathLike[str]
 
 DUMP_FILE_EXTENSION = ".dump"
 # The sequence keeps names unique even within the same millisecond.
 _DUMP_SEQUENCE = itertools.count(1)
+# The writer's temporary file is mkstemp's ".{name}.XXXXXXXX" next to the
+# target; a generated name leaves room for it within the 255-byte file name
+# limit that common filesystems share.
+_DUMP_NAME_LIMIT = 255 - len("..") - 8
+# The timestamp and sequence that end every generated name.
+_DUMP_NAME_TAIL = re.compile(
+    r"-(\d{8}T\d{6}\.\d{3})-\d+-(\d+)" + re.escape(DUMP_FILE_EXTENSION) + "$"
+)
 
 
 class DumpTooLargeError(ValueError):
@@ -55,43 +62,52 @@ class _LimitedWriter:
         return self._stream.write(data)
 
 
-def _stream_dump(
-    payload: dict, filename: Pathish, serializer: str, limit: int | None
-) -> Path:
-    """Serialize through gzip straight into an atomically committed dump.
+def _stream_dump(payload: dict, output, serializer: str, limit: int | None) -> None:
+    """Serialize ``payload`` through gzip into ``output``, replacing its content.
 
     The pickled form is compressed and written as it is produced, so the full
-    serialized snapshot never sits in memory. Any failure after the temporary
-    file exists still leaves a previous dump at ``filename`` intact.
+    serialized snapshot never sits in memory.
+    """
+    output.seek(0)
+    output.truncate()
+    # Level 6 compresses faster than the default 9 for a slightly larger
+    # file; the gain depends on the data.
+    with gzip.GzipFile(
+        filename="", fileobj=output, mode="wb", mtime=0, compresslevel=6
+    ) as compressed:
+        try:
+            writer = _LimitedWriter(compressed, limit)
+            if serializer == "dill":
+                dill.dump(payload, writer, protocol=pickle.HIGHEST_PROTOCOL, byref=True)
+            else:
+                pickle.dump(payload, writer, protocol=pickle.HIGHEST_PROTOCOL)
+        except BaseException as error:
+            # dill's pure-Python framer keeps a view of its frame buffer in the
+            # failed frames.  Clear their locals so the kept error does not
+            # leave that buffer exported until garbage collection.  Every
+            # exception, KeyboardInterrupt and SystemExit included, is then
+            # re-raised unchanged.
+            clear_frames(error.__traceback__)
+            raise
+
+
+def _write_snapshot(
+    filename: Pathish,
+    factory: Callable[[bool], dict],
+    options: DumpOptions,
+) -> Path:
+    """Capture a snapshot and commit the first attempt that fits, atomically.
+
+    Every attempt rewrites one temporary file, so a path that cannot be
+    created fails before any capture work and a commit error is never retried
+    as a serialization failure. Any failure leaves a previous dump at
+    ``filename`` intact.
     """
     target = Path(filename).absolute()
     fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     try:
         with os.fdopen(fd, "wb") as output:
-            # Level 6 compresses faster than the default 9 for a slightly
-            # larger file; the gain depends on the data.
-            with gzip.GzipFile(
-                filename="", fileobj=output, mode="wb", mtime=0, compresslevel=6
-            ) as compressed:
-                try:
-                    writer = _LimitedWriter(compressed, limit)
-                    if serializer == "dill":
-                        dill.dump(
-                            payload,
-                            writer,
-                            protocol=pickle.HIGHEST_PROTOCOL,
-                            byref=True,
-                        )
-                    else:
-                        pickle.dump(payload, writer, protocol=pickle.HIGHEST_PROTOCOL)
-                except BaseException as error:
-                    # dill's pure-Python framer keeps a view of its frame buffer
-                    # in the failed frames.  Clear their locals so the kept
-                    # error does not leave that buffer exported until garbage
-                    # collection.  Every exception, KeyboardInterrupt and
-                    # SystemExit included, is then re-raised unchanged.
-                    clear_frames(error.__traceback__)
-                    raise
+            _write_attempts(output, factory, options)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, target)
@@ -103,11 +119,7 @@ def _stream_dump(
     return target
 
 
-def _write_snapshot(
-    filename: Pathish,
-    factory: Callable[[bool], dict],
-    options: DumpOptions,
-) -> Path:
+def _write_attempts(output, factory: Callable[[bool], dict], options: DumpOptions):
     attempts = []
     stage = "full"
     try:
@@ -130,9 +142,8 @@ def _write_snapshot(
         for serializer in serializers:
             payload["dump_type"] = serializer.upper()
             try:
-                return _stream_dump(
-                    payload, filename, serializer, options.max_dump_bytes
-                )
+                _stream_dump(payload, output, serializer, options.max_dump_bytes)
+                return
             except Exception as error:
                 last_error = error
                 too_large |= isinstance(error, DumpTooLargeError)
@@ -143,7 +154,6 @@ def _write_snapshot(
                         "error": type(error).__name__,
                     }
                 )
-                continue
         if stage == "minimal":
             raise last_error
         while True:
@@ -196,17 +206,44 @@ def _dump_target(
 
     The path is ``stem-lineno-timestamp-pid-sequence.dump`` in UTC
     milliseconds. The per-process sequence keeps repeated captures unique;
-    retention uses file modification times rather than name order.
+    retention uses file modification times rather than name order. A long
+    stem is cut, by its UTF-8 size, so this name and the writer's temporary
+    name both fit file name limits; the snapshot keeps the full source path.
     """
     stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem) or "snapshot"
-    parts = [stem]
-    if lineno is not None:
-        parts.append(str(lineno))
+    parts = [] if lineno is None else [str(lineno)]
     parts.append(datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")[:-3])
     parts.append(str(os.getpid()))
     parts.append(f"{next(_DUMP_SEQUENCE):06d}")
+    tail = "-" + "-".join(parts) + DUMP_FILE_EXTENSION
+    budget = _DUMP_NAME_LIMIT - len(tail)
+    if len(stem.encode("utf-8", "surrogatepass")) > budget:
+        stem = _utf8_prefix(stem, budget) or "snapshot"
     parent = Path() if directory is None else Path(directory)
-    return parent / ("-".join(parts) + DUMP_FILE_EXTENSION)
+    return parent / (stem + tail)
+
+
+def _dump_order(name: str) -> tuple[str, int]:
+    """The UTC timestamp and sequence a generated name carries, for ordering.
+
+    Names this package did not generate sort before every generated name.
+    """
+    match = _DUMP_NAME_TAIL.search(name)
+    return (match[1], int(match[2])) if match else ("", 0)
+
+
+def _exc_info(
+    exc_info: tuple | None,
+) -> tuple[type[BaseException], BaseException, TracebackType]:
+    """The validated exception triple; ``None`` means the active exception."""
+    exc_type, exc_value, exc_tb = sys.exc_info() if exc_info is None else exc_info
+    if not isinstance(exc_value, BaseException) or not isinstance(
+        exc_tb, TracebackType
+    ):
+        raise ValueError("save_dumping requires an active exception with a traceback")
+    if not isinstance(exc_type, type) or not issubclass(exc_type, BaseException):
+        raise ValueError("exc_info must contain an exception type, value and traceback")
+    return exc_type, exc_value, exc_tb
 
 
 def _innermost_traceback(exc_tb: TracebackType) -> TracebackType:
@@ -215,48 +252,13 @@ def _innermost_traceback(exc_tb: TracebackType) -> TracebackType:
     return exc_tb
 
 
-def _embedded_sources(context: SnapshotContext, settings: DumpOptions) -> dict:
-    """Read a window of source around each captured line, best effort.
-
-    ``embed_source_lines`` is zero (embed nothing), a window half-width, or
-    ``None`` for whole files. Reading runs through linecache and tolerates
-    files that moved or vanished; each line is bounded like code metadata.
-    """
-    span = settings.embed_source_lines
-    if span == 0:
-        return {}
-    wanted = {}
-    for frame in context.frames.values():
-        filename = frame.f_code.co_filename
-        if filename.startswith("<") and filename.endswith(">"):
-            continue
-        wanted.setdefault(filename, set()).add(frame.f_lineno)
-    sources = {}
-    for filename, linenos in wanted.items():
-        lines = linecache.getlines(filename)
-        if not lines:
-            continue
-        if span is None:
-            selected = {
-                number: lines[number - 1] for number in range(1, len(lines) + 1)
-            }
-        else:
-            selected = {}
-            for lineno in linenos:
-                for number in range(
-                    max(1, lineno - span), min(len(lines), lineno + span) + 1
-                ):
-                    selected[number] = lines[number - 1]
-        sources[filename] = {
-            "lines": {
-                number: text
-                if len(text) <= _CODE_TEXT_LIMIT
-                else text[:_CODE_TEXT_LIMIT]
-                for number, text in selected.items()
-            },
-            "total": len(lines),
-        }
-    return sources
+def _complete_payload(context: SnapshotContext, payload: dict) -> dict:
+    """Add embedded source, then the metadata that also counts its truncation."""
+    source = context.embedded_sources()
+    if source:
+        payload["source"] = source
+    payload["snapshot_meta"] = context.metadata()
+    return payload
 
 
 def _capture_frame(
@@ -275,17 +277,8 @@ def _capture_frame(
 
     def factory(minimal: bool) -> dict:
         context = SnapshotContext(settings, minimal=minimal)
-        traceback = context.from_frame(frame)
-        payload = {
-            "traceback": traceback,
-            "version": __version__,
-            "snapshot_meta": context.metadata(),
-        }
-        if not minimal:
-            source = _embedded_sources(context, settings)
-            if source:
-                payload["source"] = source
-        return payload
+        payload = {"traceback": context.from_frame(frame), "version": __version__}
+        return _complete_payload(context, payload)
 
     return _write_snapshot(filename, factory, settings)
 
@@ -310,39 +303,19 @@ def save_dumping(
     """Save an exception snapshot. By default errors warn instead of propagating."""
     try:
         settings = _options(options)
-        exc_type, exc_value, exc_tb = sys.exc_info() if exc_info is None else exc_info
-        if not isinstance(exc_value, BaseException) or not isinstance(
-            exc_tb, TracebackType
-        ):
-            raise ValueError(
-                "save_dumping requires an active exception with a traceback"
-            )
-        if not isinstance(exc_type, type) or not issubclass(exc_type, BaseException):
-            raise ValueError(
-                "exc_info must contain an exception type, value and traceback"
-            )
-        innermost = _innermost_traceback(exc_tb)
-        filename = (
-            filename
-            if filename is not None
-            else _default_filename(innermost.tb_frame, innermost.tb_lineno)
-        )
+        exc_type, exc_value, exc_tb = _exc_info(exc_info)
+        if filename is None:
+            innermost = _innermost_traceback(exc_tb)
+            filename = _default_filename(innermost.tb_frame, innermost.tb_lineno)
 
         def factory(minimal: bool) -> dict:
             context = SnapshotContext(settings, minimal=minimal)
-            traceback = context.from_traceback(exc_tb)
-            extra = context.exception(exc_value)
             payload = {
-                "traceback": traceback,
+                "traceback": context.from_traceback(exc_tb),
                 "version": __version__,
-                "exc_extra": extra,
-                "snapshot_meta": context.metadata(),
+                "exc_extra": context.exception(exc_value),
             }
-            if not minimal:
-                source = _embedded_sources(context, settings)
-                if source:
-                    payload["source"] = source
-            return payload
+            return _complete_payload(context, payload)
 
         _write_snapshot(filename, factory, settings)
     except Exception as error:

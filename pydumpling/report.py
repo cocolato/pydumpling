@@ -6,24 +6,28 @@ import json
 import linecache
 import os
 import sys
-from traceback import format_exception, format_tb
+from traceback import format_exception, format_exception_only, format_tb
 from typing import TextIO
 
+from .debug_dumpling import embedded_source
 from .pydumpling import DUMP_FILE_EXTENSION
+
+
+def _truncation_reasons(truncation) -> str:
+    """Nonzero truncation counts as sorted ``name=count`` pairs."""
+    return ", ".join(
+        f"{name}={count}" for name, count in sorted((truncation or {}).items()) if count
+    )
 
 
 def print_snapshot_notice(dumpling_result: dict, *, file: TextIO | None = None) -> None:
     metadata = dumpling_result.get("snapshot_meta") or {}
-    truncation = metadata.get("truncation") or {}
-    if truncation:
-        reasons = ", ".join(
-            f"{name}={count}" for name, count in sorted(truncation.items()) if count
+    reasons = _truncation_reasons(metadata.get("truncation"))
+    if reasons:
+        print(
+            f"Snapshot is incomplete ({reasons}).",
+            file=file if file is not None else sys.stderr,
         )
-        if reasons:
-            print(
-                f"Snapshot is incomplete ({reasons}).",
-                file=file if file is not None else sys.stderr,
-            )
 
 
 def print_traceback_and_except(
@@ -34,6 +38,8 @@ def print_traceback_and_except(
     The requested report is the command's product, so it goes to ``file``
     (standard output by default) and stays usable in a pipe or a redirect.
     The truncation notice remains a diagnostic and stays on standard error.
+    Source lines come from the dump's embedded source when the local file is
+    missing or changed, as in :func:`~pydumpling.debug_dumpling.embedded_source`.
     """
     try:
         print_snapshot_notice(dumpling_result)
@@ -43,13 +49,14 @@ def print_traceback_and_except(
     exc_tb = dumpling_result["traceback"]
     extra = dumpling_result.get("exc_extra") or {}
     formatted = extra.get("formatted")
-    if formatted:
-        text = "".join(formatted) if isinstance(formatted, list) else str(formatted)
-        lines = [*format_tb(exc_tb), text if text.endswith("\n") else text + "\n"]
-    elif extra.get("exc_type") is not None and extra.get("exc_value") is not None:
-        lines = format_exception(extra["exc_type"], extra["exc_value"], exc_tb)
-    else:
-        lines = format_tb(exc_tb)
+    with embedded_source(dumpling_result.get("source")):
+        if formatted:
+            text = "".join(formatted) if isinstance(formatted, list) else str(formatted)
+            lines = [*format_tb(exc_tb), text if text.endswith("\n") else text + "\n"]
+        elif extra.get("exc_type") is not None and extra.get("exc_value") is not None:
+            lines = format_exception(extra["exc_type"], extra["exc_value"], exc_tb)
+        else:
+            lines = format_tb(exc_tb)
     _write_report("".join(lines), file if file is not None else sys.stdout)
 
 
@@ -97,6 +104,48 @@ def _safe_repr(value):
         return "<repr error>"
 
 
+def _guarded(call, fallback=None):
+    try:
+        return call()
+    except Exception:
+        return fallback
+
+
+def _class_name(cls):
+    module = getattr(cls, "__module__", None)
+    name = getattr(cls, "__qualname__", None) or getattr(cls, "__name__", "?")
+    return name if module in (None, "builtins") else f"{module}.{name}"
+
+
+def _exception_view(extra):
+    """Type name, message, and formatted text of a stored exception, or None.
+
+    Unlimited captures and older snapshots can keep only the exception
+    objects, as :func:`print_traceback_and_except` handles; their missing
+    text is derived from those objects, every call guarded.
+    """
+    type_name = extra.get("type_name")
+    message = extra.get("message")
+    formatted = extra.get("formatted")
+    exc_type, exc_value = extra.get("exc_type"), extra.get("exc_value")
+    if exc_type is not None and exc_value is not None:
+        if type_name is None:
+            type_name = _guarded(lambda: _class_name(exc_type), "?")
+        if message is None:
+            message = _guarded(lambda: str(exc_value), "<str error>")
+        if not formatted:
+            formatted = _guarded(lambda: format_exception_only(exc_type, exc_value))
+    if type_name is None and not message and not formatted:
+        return None
+    if isinstance(formatted, list):
+        formatted = "".join(formatted)
+    return {
+        "type": type_name,
+        "message": message,
+        "formatted": str(formatted) if formatted else None,
+    }
+
+
 def _json_mapping(values):
     """A mapping of guarded reprs; JSON needs plain-string keys."""
     return {
@@ -132,16 +181,7 @@ def dump_to_dict(dumpling: dict, *, include_globals: bool = False) -> dict:
         frames.append(entry)
         index += 1
         node = node.tb_next
-    exception = None
-    formatted = extra.get("formatted")
-    if extra.get("type_name") is not None or extra.get("message") or formatted:
-        exception = {
-            "type": extra.get("type_name"),
-            "message": extra.get("message"),
-            "formatted": (
-                "".join(formatted) if isinstance(formatted, list) else str(formatted)
-            ),
-        }
+    exception = _exception_view(extra)
     return {
         "format_version": dumpling.get("format_version"),
         "pydumpling_version": dumpling.get("version"),
@@ -204,17 +244,8 @@ def print_info_report(dumpling: dict, *, file: TextIO | None = None) -> None:
             "effective limits: "
             + ", ".join(f"{name}={value}" for name, value in effective.items())
         )
-    truncation = {
-        name: count
-        for name, count in (metadata.get("truncation") or {}).items()
-        if count
-    }
     lines.append(
-        "truncation: "
-        + (
-            ", ".join(f"{name}={count}" for name, count in sorted(truncation.items()))
-            or "none"
-        )
+        "truncation: " + (_truncation_reasons(metadata.get("truncation")) or "none")
     )
     attempts = metadata.get("attempts")
     if attempts:
@@ -224,28 +255,20 @@ def print_info_report(dumpling: dict, *, file: TextIO | None = None) -> None:
     _write_report("\n".join(lines) + "\n", file if file is not None else sys.stdout)
 
 
-def _source_window(dumpling: dict, filename: str, lineno: int, span: int):
-    """Numbered lines around ``lineno``: embedded source first, then local.
+def _source_window(filename: str, lineno: int, span: int):
+    """Numbered lines around ``lineno``, reading only the requested lines.
 
-    Embedded source is the ground truth of what ran; the local file only
-    serves frames whose snapshot carried none.
+    Call it inside :func:`~pydumpling.debug_dumpling.embedded_source`, so a
+    dump's embedded lines serve files that are missing or changed. Lines such
+    a dump left out read as empty strings and are skipped.
     """
-    first = max(1, lineno - span)
-    last = lineno + span
-    entry = (dumpling.get("source") or {}).get(filename)
-    embedded = entry.get("lines") if isinstance(entry, dict) else None
-    if isinstance(embedded, dict) and embedded:
-        return [
-            (number, text)
-            for number in range(first, last + 1)
-            if type(text := embedded.get(number)) is str
-        ]
     if filename.startswith("<") and filename.endswith(">"):
         return []
     lines = linecache.getlines(filename)
     return [
-        (number, lines[number - 1])
-        for number in range(first, min(len(lines), last) + 1)
+        (number, text)
+        for number in range(max(1, lineno - span), min(len(lines), lineno + span) + 1)
+        if (text := lines[number - 1])
     ]
 
 
@@ -262,7 +285,7 @@ font-size:.9rem;white-space:pre-wrap}
 .frame-head b{color:#b06000}
 pre.source{margin:0;padding:.6rem .9rem;background:#fafafa;overflow-x:auto;
 font-size:.85rem;line-height:1.45}
-pre.source mark{background:#fff3cd;display:inline-block;width:100%}
+pre.source .mark{background:#fff3cd;display:inline-block;width:100%}
 table.locals{border-collapse:collapse;width:100%;font-size:.85rem}
 table.locals td{border-top:1px solid #eee;padding:.25rem .9rem;
 vertical-align:top;font-family:monospace}
@@ -282,7 +305,6 @@ def render_html(dumpling: dict, *, span: int = 3) -> str:
         f"captured by {data['thread_name'] or '?'}"
         + (f" (pid {data['pid']})" if data["pid"] is not None else ""),
     ]
-    truncation = data["truncation"]
     parts = [
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
         "<title>pydumpling snapshot</title>"
@@ -300,44 +322,53 @@ def render_html(dumpling: dict, *, span: int = 3) -> str:
             + html.escape(exception["formatted"].rstrip("\n"))
             + "</div>"
         )
-    if truncation:
-        reasons = ", ".join(
-            f"{name}={count}" for name, count in sorted(truncation.items()) if count
+    reasons = _truncation_reasons(data["truncation"])
+    if reasons:
+        parts.append(
+            f"<div class=notice>Snapshot is incomplete ({html.escape(reasons)}).</div>"
         )
-        if reasons:
-            parts.append(
-                f"<div class=notice>Snapshot is incomplete "
-                f"({html.escape(reasons)}).</div>"
-            )
     parts.append(f"<h2>Frames ({len(data['frames'])})</h2>")
-    for frame in data["frames"]:
-        parts.append("<section class=frame>")
-        location = html.escape(
-            f"{frame['filename']}:{frame['lineno']} in {frame['qualname']}"
-        )
-        parts.append(f"<div class=frame-head><b>#{frame['index']}</b> {location}</div>")
-        window = _source_window(dumpling, frame["filename"], frame["lineno"], span)
-        if window:
-            rendered = []
-            for number, text in window:
-                line = html.escape(text.rstrip("\n")) or "&nbsp;"
-                marker = " mark" if number == frame["lineno"] else ""
-                rendered.append(f"<span class=line{marker}>{number:4d} {line}</span>")
-            parts.append("<pre class=source>" + "\n".join(rendered) + "</pre>")
-        if frame["locals"]:
-            rows = "".join(
-                f"<tr><td>{html.escape(name)}</td><td>{html.escape(value)}</td></tr>"
-                for name, value in frame["locals"].items()
-            )
-            parts.append(f"<table class=locals>{rows}</table>")
-        parts.append("</section>")
+    with embedded_source(dumpling.get("source")):
+        parts.extend(_render_frame(frame, span) for frame in data["frames"])
     parts.append("</body></html>")
     return "".join(parts)
 
 
+def _render_frame(frame: dict, span: int) -> str:
+    location = html.escape(
+        f"{frame['filename']}:{frame['lineno']} in {frame['qualname']}"
+    )
+    parts = [
+        "<section class=frame>",
+        f"<div class=frame-head><b>#{frame['index']}</b> {location}</div>",
+    ]
+    window = _source_window(frame["filename"], frame["lineno"], span)
+    if window:
+        rendered = []
+        for number, text in window:
+            line = html.escape(text.rstrip("\n")) or "&nbsp;"
+            classes = "line mark" if number == frame["lineno"] else "line"
+            rendered.append(f'<span class="{classes}">{number:4d} {line}</span>')
+        parts.append("<pre class=source>" + "\n".join(rendered) + "</pre>")
+    if frame["locals"]:
+        rows = "".join(
+            f"<tr><td>{html.escape(name)}</td><td>{html.escape(value)}</td></tr>"
+            for name, value in frame["locals"].items()
+        )
+        parts.append(f"<table class=locals>{rows}</table>")
+    parts.append("</section>")
+    return "".join(parts)
+
+
 def write_html_report(dumpling: dict, filename: str, *, span: int = 3):
-    """Write the standalone HTML report and return its path."""
+    """Write the standalone HTML report and return its path.
+
+    The page is rendered and encoded before the file is opened, so a failure
+    leaves an existing report intact. Text UTF-8 cannot hold, such as a lone
+    surrogate from an undecodable file name, is escaped as text reports do.
+    """
     target = os.path.abspath(filename)
-    with open(target, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(render_html(dumpling, span=span))
+    page = render_html(dumpling, span=span).encode("utf-8", "backslashreplace")
+    with open(target, "wb") as handle:
+        handle.write(page)
     return target

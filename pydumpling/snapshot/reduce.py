@@ -2,7 +2,7 @@
 
 import copy
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 from ..options import DumpOptions
 from .context import SnapshotContext, _utf8_prefix
@@ -134,10 +134,9 @@ def _reduce_values(payload: dict, options: DumpOptions, *, minimal: bool) -> dic
             reduced["exc_extra"] = context.exception(extra["exc_value"])
     metadata = dict(payload["snapshot_meta"])
     truncation = Counter(metadata["truncation"])
-    reduced_metadata = context.metadata()
-    truncation.update(reduced_metadata["truncation"])
-    metadata.update(
-        truncation=dict(truncation), effective_limits=reduced_metadata["limits"]
-    )
+    # Only what the reduction itself cut: the process context in the original
+    # metadata, and anything its argv or cwd cut there, is already counted.
+    truncation.update(context._truncation)
+    metadata.update(truncation=dict(truncation), effective_limits=asdict(limits))
     reduced["snapshot_meta"] = metadata
     return reduced

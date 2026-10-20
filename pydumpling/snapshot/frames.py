@@ -2,6 +2,7 @@
 
 import builtins
 import itertools
+import linecache
 from collections import deque
 
 from ..fake_types import FakeCode, FakeFrame, FakeTraceback
@@ -175,6 +176,8 @@ class FramesMixin:
     def _build(self, entries):
         self._capturing_frames = True
         for original, lineno, lasti in entries:
+            if type(lineno) is int and lineno > 0:
+                self._frame_lines.setdefault(id(original), set()).add(lineno)
             if id(original) not in self.frames:
                 frame = object.__new__(FakeFrame)
                 self.frames[id(original)] = frame
@@ -237,3 +240,59 @@ class FramesMixin:
                 tail.tb_next = node
             tail = node
         return head
+
+    def embedded_sources(self):
+        """Read a window of source around every captured line, best effort.
+
+        ``embed_source_lines`` is zero (embed nothing), a window half-width,
+        or ``None`` for whole files. Each traceback entry contributes its own
+        line, so a frame listed twice gets both windows. Reading runs through
+        linecache and tolerates files that moved or vanished; each line is
+        bounded like code metadata and counted as ``source_lines`` when cut.
+        A cached copy is refreshed first, as traceback does before showing a
+        line, so a file edited and reloaded since it was cached embeds the
+        source that ran.
+        """
+        span = self.options.embed_source_lines
+        if self.minimal or span == 0:
+            return {}
+        wanted = {}
+        for identity, frame in self.frames.items():
+            filename = frame.f_code.co_filename
+            if filename.startswith("<") and filename.endswith(">"):
+                continue
+            wanted.setdefault(filename, set()).update(
+                self._frame_lines.get(identity, ())
+            )
+        sources = {}
+        for filename, linenos in wanted.items():
+            if span is not None and not linenos:
+                continue  # No valid line to center a window on.
+            linecache.checkcache(filename)
+            lines = linecache.getlines(filename)
+            if not lines:
+                continue
+            if span is None:
+                numbers = range(1, len(lines) + 1)
+            else:
+                numbers = sorted(
+                    {
+                        number
+                        for lineno in linenos
+                        for number in range(
+                            max(1, lineno - span), min(len(lines), lineno + span) + 1
+                        )
+                    }
+                )
+            if not numbers:
+                continue  # Every captured line lies past the file's current end.
+            sources[filename] = {
+                "lines": {
+                    number: self._bounded_text(
+                        lines[number - 1], self._code_text_limit, "source_lines"
+                    )
+                    for number in numbers
+                },
+                "total": len(lines),
+            }
+        return sources

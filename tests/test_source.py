@@ -1,7 +1,9 @@
 """Embedded source windows and their injection into linecache."""
 
+import io
 import linecache
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -178,7 +180,118 @@ def test_injection_fills_linecache_only_without_a_local_copy(tmp_path):
         assert "gone file" in "".join(linecache.getlines(str(module)))
     assert str(module) not in linecache.cache
 
-    # An existing local file keeps its own source; malformed entries are skipped.
-    with mock_inspect({THIS_FILE: {"lines": {1: "fabricated"}}, "bad": {"lines": 0}}):
+    # An unchanged local file keeps its whole text; malformed entries are
+    # skipped.
+    first = linecache.getlines(THIS_FILE)[0]
+    with mock_inspect({THIS_FILE: {"lines": {1: first}}, "bad": {"lines": 0}}):
         assert len(linecache.getlines(THIS_FILE)) > 5
         assert "bad" not in linecache.cache
+    # A changed one yields to the lines that ran, and comes back afterwards.
+    with mock_inspect({THIS_FILE: {"lines": {1: "fabricated\n"}}}):
+        assert linecache.getlines(THIS_FILE) == ["fabricated\n"]
+    assert len(linecache.getlines(THIS_FILE)) > 5
+
+
+def test_a_frame_listed_twice_embeds_both_windows(tmp_path):
+    module = tmp_path / "reraise.py"
+    module.write_text(
+        "def inner():\n"
+        "    raise KeyError('k')\n"
+        "def business():\n"
+        "    try:\n"
+        "        inner()\n"
+        "    except KeyError as error:\n"
+        + "        pass\n" * 20
+        + "        raise error\n"
+    )
+    namespace = {}
+    exec(compile(module.read_text(), str(module), "exec"), namespace)
+    try:
+        namespace["business"]()
+    except KeyError:
+        exc_info = sys.exc_info()
+    path = tmp_path / "reraise.dump"
+    save_dumping(path, exc_info, options=DumpOptions(embed_source_lines=1), strict=True)
+    lines = load_dumpling(path)["source"][str(module)]["lines"]
+    # The re-raise at line 27 and the original call at line 5 share a frame.
+    assert {4, 5, 6, 26, 27} <= set(lines)
+
+
+def test_cut_source_lines_are_counted_and_unlimited_keeps_them(tmp_path):
+    module = tmp_path / "longline.py"
+    long_line = "        raise ValueError('long')  # " + "u" * (_CODE_TEXT_LIMIT + 900)
+    module.write_text(
+        "import sys\n"
+        "def business():\n"
+        "    try:\n" + long_line + "\n"
+        "    except ValueError:\n"
+        "        return sys.exc_info()\n"
+    )
+    namespace = {}
+    exec(compile(module.read_text(), str(module), "exec"), namespace)
+    exc_info = namespace["business"]()
+
+    bounded = tmp_path / "bounded.dump"
+    save_dumping(
+        bounded, exc_info, options=DumpOptions(embed_source_lines=1), strict=True
+    )
+    result = load_dumpling(bounded)
+    assert len(result["source"][str(module)]["lines"][4]) < len(long_line)
+    assert result["snapshot_meta"]["truncation"]["source_lines"] == 1
+
+    whole = tmp_path / "whole.dump"
+    options = replace(DumpOptions.unlimited(), embed_source_lines=1)
+    save_dumping(whole, exc_info, options=options, strict=True)
+    result = load_dumpling(whole)
+    assert result["source"][str(module)]["lines"][4] == long_line + "\n"
+    assert "source_lines" not in result["snapshot_meta"]["truncation"]
+
+
+def test_print_reads_embedded_source_for_a_missing_file(tmp_path):
+    from pydumpling.report import print_traceback_and_except
+
+    module = tmp_path / "printed.py"
+    module.write_text("def business():\n    raise ValueError('printed source')\n")
+    namespace = {}
+    exec(compile(module.read_text(), str(module), "exec"), namespace)
+    try:
+        namespace["business"]()
+    except ValueError:
+        exc_info = sys.exc_info()
+    path = tmp_path / "printed.dump"
+    save_dumping(path, exc_info, options=DumpOptions(embed_source_lines=1), strict=True)
+    module.unlink()
+    linecache.checkcache(str(module))
+    output = io.StringIO()
+    print_traceback_and_except(load_dumpling(path), file=output)
+    assert "raise ValueError('printed source')" in output.getvalue()
+    assert str(module) not in linecache.cache
+
+
+def test_embedding_refreshes_a_stale_linecache_entry(tmp_path):
+    module = tmp_path / "reloaded.py"
+    template = (
+        "import sys\ndef business():\n    marker = {!r}\n    return sys._getframe()\n"
+    )
+    module.write_text(template.format("old"))
+    # Cached as a traceback or inspect call would, then edited and reloaded.
+    assert "'old'" in "".join(linecache.getlines(str(module)))
+    module.write_text(template.format("newer"))
+    frame = frame_for(str(module), module.read_text())
+    assert frame.f_locals["marker"] == "newer"
+    path = tmp_path / "reloaded.dump"
+    _capture_frame(frame, path, options=DumpOptions(embed_source_lines=1))
+    lines = load_dumpling(path)["source"][str(module)]["lines"]
+    assert lines[3] == "    marker = 'newer'\n"
+
+
+def test_embedding_skips_a_file_cut_short_before_its_captured_line(tmp_path):
+    module = tmp_path / "shrunk.py"
+    module.write_text(
+        "import sys\ndef business():\n    value = 1\n    return sys._getframe()\n"
+    )
+    frame = frame_for(str(module), module.read_text())
+    module.write_text("# emptied\n")
+    path = tmp_path / "shrunk.dump"
+    _capture_frame(frame, path, options=DumpOptions(embed_source_lines=1))
+    assert str(module) not in (load_dumpling(path).get("source") or {})

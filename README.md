@@ -76,17 +76,18 @@ except ValueError:
 ~~~
 
 `embed_source_lines` stores that many lines of context around each frame's
-current line inside the dump (`None` embeds whole files). `pydumpling --debug`
-then shows that source in `list` even on a machine without the checkout, while
-local files keep serving their own source. If the dump exceeds its byte budget,
-embedded source is dropped before captured variables are reduced.
+current line inside the dump (`None` embeds whole files). `--print`, `--debug`,
+`--rdebug`, and `--html` then show the source that ran wherever the local file
+is missing or no longer matches it; an unchanged local file keeps serving its
+full text. If the dump exceeds its byte budget, embedded source is dropped
+before captured variables are reduced.
 
 ~~~sh
 pydumpling --html report.html error.dump   # standalone HTML, no scripts
 ~~~
 
-The HTML report shows the exception, a source window per frame (embedded
-source preferred, falling back to local files), and the locals table.
+The HTML report shows the exception, a source window per frame (chosen the
+same way, with the current line highlighted), and the locals table.
 
 ## Save the current stack
 
@@ -107,10 +108,14 @@ calculate()
 Call `catch_any_exception()` once at application startup to capture unhandled
 main-thread exceptions. It installs `sys.excepthook` and retains the previous
 hook for normal exception reporting. Pass `include_threads=True` to also
-capture exceptions that end a `threading.Thread`, and
-`restore_exception_hooks()` to remove every installed hook again. For asyncio,
-call `install_asyncio_handler()` inside async code (or pass `loop=`) to capture
-exceptions the event loop reports.
+capture exceptions that end a `threading.Thread` (a thread's `SystemExit` is a
+normal exit and saves nothing), and `restore_exception_hooks()` to stop every
+installed hook again; a hook another package installed on top of ours stays,
+and ours below it only forwards. For asyncio, call `install_asyncio_handler()`
+inside async code (or pass `loop=`) to capture exceptions the event loop
+reports. Without a manager, every hook writes a new dump into the working
+directory and never deletes one, so long-running services should pass a
+`DumpManager`.
 
 ## Manage a dump directory
 
@@ -128,9 +133,12 @@ except ValueError:
 
 Every default file name now carries the source line, a UTC timestamp, the pid,
 and a per-process sequence, so repeated failures never overwrite an earlier
-snapshot. The manager prunes by file modification time, using names to break
-ties. Hooks accept the manager
-directly: `catch_any_exception(manager=manager, include_threads=True)`. Each
+snapshot. The manager prunes by file modification time; saves close enough
+for the filesystem to give them equal times keep their write order through the
+timestamp and sequence in the name. `target()` creates the managed directory
+and returns a fresh path. Hooks accept the manager directly:
+`catch_any_exception(manager=manager, include_threads=True)` and
+`install_asyncio_handler(manager=manager)`. Each
 saved snapshot records its creation time, duration, pid, host name, working
 directory, command line, and capturing thread in `snapshot_meta`.
 
@@ -172,8 +180,9 @@ The default readable snapshot mode is unaffected.
 `dump_current_traceback(filename=None, *, options=None, strict=False)` report
 capture/write failures as warnings by default. Use `strict=True` to raise them.
 `catch_any_exception(*, options=None, include_threads=False, manager=None)`
-accepts the same budgets, and `install_asyncio_handler(loop=None, *, options=None)`
-covers an event loop; both keep the previous hooks reporting.
+accepts the same budgets, and
+`install_asyncio_handler(loop=None, *, options=None, manager=None)` covers an
+event loop; both keep the previous hooks reporting.
 
 Loading and debugging default to at most 64 MiB of decompressed dump data.
 `load_dumpling(path, max_bytes=None)` or `debug_dumpling(path, max_bytes=None)`

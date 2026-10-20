@@ -114,38 +114,47 @@ Both writers accept paths, return ``None``, and report failures with
 An omitted filename uses an automatically generated name in the current
 directory: the source file, the failing line, a UTC timestamp in milliseconds,
 the pid, and a per-process sequence, so repeated failures never overwrite an
-earlier snapshot. An existing output file is
+earlier snapshot. A long source file name is shortened in the dump name so it
+and the writer's temporary name fit the 255-byte file name limit; the snapshot
+keeps the full path. An existing output file is
 replaced atomically after successful serialization.
 
 ``catch_any_exception(*, options=None, include_threads=False, manager=None)``
    Install a main-thread ``sys.excepthook`` that saves unhandled exceptions,
    then invokes the previous hook for normal reporting. Call it once at
    application startup. ``include_threads=True`` also hooks
-   ``threading.excepthook`` for exceptions that end a thread. ``manager`` is a
+   ``threading.excepthook`` for exceptions that end a thread; a thread's
+   ``SystemExit`` is a normal exit and saves nothing. ``manager`` is a
    ``DumpManager`` used to place and prune every saved dump; give capture
-   budgets to the manager instead of ``options``. Re-running updates budgets
-   without replacing installed hooks.
+   budgets to the manager instead of ``options``. Without a manager, every
+   hooked exception adds a dump to the working directory. Re-running applies
+   the new budgets and manager to every installed hook without replacing them.
 
-``install_asyncio_handler(loop=None, *, options=None)``
+``install_asyncio_handler(loop=None, *, options=None, manager=None)``
    Save snapshots for exceptions an asyncio event loop reports. Call it from
-   async code to hook the running loop, or pass ``loop`` explicitly. The
+   async code to hook the running loop, or pass ``loop`` explicitly.
+   ``options`` and ``manager`` work as for ``catch_any_exception``. The
    loop's previous handler, or its default, still reports each exception,
    even if saving fails.
 
 ``restore_exception_hooks()``
-   Remove every hook installed by the functions above, restoring the hooks
-   that were active at installation. Hooks another package installed on top
-   of ours stay installed.
+   Stop every hook installed by the functions above, restoring the hooks
+   that were active at installation. A hook another package installed on top
+   of ours stays installed; ours below it stops saving and only forwards, so
+   installing again never saves an exception twice.
 
 ``DumpManager(directory, *, retention=50, options=None)``
    Save into one directory with unique names and bounded retention.
    ``save_exception(exc_info=None, *, options=None, strict=False)`` and
    ``save_current(*, options=None, strict=False)`` mirror the writers and
    return the written path, or ``None`` when a non-strict save failed;
-   ``target()`` builds a fresh managed path, and ``prune()`` deletes the
+   ``target()`` creates the directory and builds a fresh managed path, and
+   ``prune()`` deletes the
    oldest dumps beyond ``retention`` and returns them (``retention=None``
    keeps everything). Per-call ``options`` override the manager's budgets.
-   Pruning follows file modification time, with names breaking ties.
+   Pruning follows file modification time. Equal times, which coarse
+   filesystem clocks give quick successive saves, fall back to the UTC
+   timestamp and sequence in generated names.
 
 Loading and debugging
 ---------------------
@@ -232,17 +241,18 @@ in another thread waits until the active session exits, and the connection
 this lock and can observe the temporary global state. Prefer debugging dumps in
 a separate process when the application must keep serving concurrent work.
 Inside a session, ``list`` and ``ll`` show source embedded with
-``embed_source_lines`` for files missing on this machine; files that still
-exist locally keep showing their local source, and the injection is removed
-when the session ends.
+``embed_source_lines`` for files that are missing on this machine or no longer
+match it; an unchanged local file keeps showing its full text, and the
+injection is removed when the session ends.
 
 Embedded source is stored as a ``source`` mapping of
-``{filename: {"lines": {lineno: text}, "total": file_lines}}``. Each line is
-bounded like code metadata. When the byte budget is exceeded, the ``source``
+``{filename: {"lines": {lineno: text}, "total": file_lines}}``, with a window
+around every traceback line. Each line is bounded like code metadata, reported
+as ``source_lines`` when cut; ``DumpOptions.unlimited()`` lifts that bound. When the byte budget is exceeded, the ``source``
 reduction stage drops the mapping (reported as ``source_omitted``) before any
 captured variables are reduced. The ``minimal`` fallback also omits source.
-The ``--html`` reporter prefers embedded source when drawing a frame's
-context and falls back to the local file.
+``--print`` and the ``--html`` reporter choose source the same way as a
+debugging session.
 
 .. warning::
 

@@ -116,3 +116,30 @@ def test_native_pid_capture_preserves_business_frame(tmp_path):
             os.kill(target_pid, signal.SIGTERM)
         target.terminate()
         target.communicate(timeout=10)
+
+
+@pytest.mark.parametrize(
+    "options, expected",
+    [(None, {}), (DumpOptions(max_frames=1), {"max_frames": 1})],
+)
+def test_request_sends_only_options_that_differ_from_defaults(
+    tmp_path, monkeypatch, options, expected
+):
+    import pydumpling.options as options_module
+
+    received = []
+
+    class TargetOptions(DumpOptions):
+        # An older target rejects fields it does not know, such as new ones.
+        def __init__(self, **kwargs):
+            received.append(kwargs)
+            super().__init__(**kwargs)
+
+    def remote(pid, script):
+        exec(compile(Path(script).read_text(), script, "exec"), {})
+
+    monkeypatch.setattr(options_module, "DumpOptions", TargetOptions)
+    monkeypatch.setattr(sys, "remote_exec", remote, raising=False)
+    output = capture_pid(1, tmp_path / "request.dump", options=options, timeout=10)
+    assert received == [expected]
+    assert load_dumpling(output)["traceback"] is not None

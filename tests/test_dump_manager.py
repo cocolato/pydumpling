@@ -6,7 +6,7 @@ from datetime import datetime
 
 import pytest
 
-from pydumpling import DumpManager, DumpOptions, load_dumpling
+from pydumpling import DumpManager, DumpOptions, load_dumpling, save_dumping
 
 
 def make_error(message):
@@ -143,7 +143,8 @@ def test_prune_skips_files_that_disappear_during_scan(tmp_path, monkeypatch):
     paths = [tmp_path / name for name in ("gone.dump", "old.dump", "new.dump")]
     for index, path in enumerate(paths, start=1):
         path.touch()
-        os.utime(path, ns=(index, index))
+        # Whole seconds: NTFS keeps 100 ns units, so 1, 2 and 3 ns would tie.
+        os.utime(path, (index, index))
     (tmp_path / "directory.dump").mkdir()
     original_stat = Path.stat
 
@@ -175,3 +176,46 @@ def test_same_millisecond_names_still_prune_oldest_first(tmp_path, monkeypatch):
         paths[2].name,
         paths[3].name,
     ]
+
+
+@pytest.mark.parametrize(
+    "locations", [(("z.py", 1), ("a.py", 1)), (("same.py", 99), ("same.py", 100))]
+)
+def test_equal_write_times_keep_the_newest_save(tmp_path, locations):
+    # Coarse filesystem clocks give quick successive saves the same mtime.
+    writer = DumpManager(tmp_path, retention=None, options=DumpOptions(max_frames=1))
+    paths = []
+    for filename, lineno in locations:
+        try:
+            exec(
+                compile(
+                    "\n" * (lineno - 1) + "raise ValueError('boom')", filename, "exec"
+                )
+            )
+        except ValueError:
+            paths.append(writer.save_exception(strict=True))
+    foreign = tmp_path / "manual.dump"
+    foreign.write_bytes(paths[0].read_bytes())
+    for path in (*paths, foreign):
+        os.utime(path, ns=(5, 5))
+    assert DumpManager(tmp_path, retention=1).prune() == [foreign, paths[0]]
+    assert paths[1].is_file()
+
+
+def test_save_exception_requires_an_exception_before_touching_disk(tmp_path):
+    manager = DumpManager(tmp_path / "dumps")
+    with pytest.raises(ValueError, match="active exception"):
+        manager.save_exception(strict=True)
+    with pytest.warns(RuntimeWarning, match="active exception"):
+        assert manager.save_exception() is None
+    assert not (tmp_path / "dumps").exists()
+
+
+def test_target_creates_the_directory_for_a_direct_save(tmp_path):
+    target = DumpManager(tmp_path / "new" / "dumps").target(stem="direct")
+    assert target.parent.is_dir()
+    try:
+        raise ValueError("direct")
+    except ValueError:
+        save_dumping(target, strict=True)
+    assert load_dumpling(target)["exc_extra"]["message"] == "direct"

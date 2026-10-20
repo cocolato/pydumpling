@@ -738,3 +738,93 @@ def test_saved_metadata_records_process_context(tmp_path):
     assert metadata["cwd"] == os.getcwd()
     if len(sys.argv) <= 256:
         assert metadata["argv"] == sys.argv
+
+
+def test_unwritable_target_fails_before_capturing(tmp_path, monkeypatch):
+    import pydumpling.pydumpling as writer
+
+    captures = []
+    capture = writer.SnapshotContext.from_frame
+
+    def record(context, frame):
+        captures.append(context.minimal)
+        return capture(context, frame)
+
+    monkeypatch.setattr(writer.SnapshotContext, "from_frame", record)
+    with pytest.raises(FileNotFoundError):
+        dump_current_traceback(tmp_path / "missing" / "x.dump", strict=True)
+    assert captures == []
+
+
+def test_commit_failure_is_not_retried_as_a_serialization_failure(
+    tmp_path, monkeypatch
+):
+    import pydumpling.pydumpling as writer
+
+    serializers = []
+    stream_dump = writer._stream_dump
+
+    def record(payload, output, serializer, limit):
+        serializers.append(serializer)
+        return stream_dump(payload, output, serializer, limit)
+
+    def refuse(source, target):
+        raise PermissionError("read-only target")
+
+    monkeypatch.setattr(writer, "_stream_dump", record)
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(PermissionError, match="read-only target"):
+        dump_current_traceback(
+            tmp_path / "x.dump", options=DumpOptions(max_frames=1), strict=True
+        )
+    assert serializers == ["pickle"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_reduction_counts_argv_entries_once(tmp_path, monkeypatch):
+    from pydumpling.snapshot.context import _ARGV_LIMIT
+
+    monkeypatch.setattr(sys, "argv", ["prog"] * (_ARGV_LIMIT + 5))
+
+    def business():
+        values = ["x" * 4096 + str(index) for index in range(64)]
+        return _capture_frame(
+            sys._getframe(),
+            tmp_path / "argv.dump",
+            options=DumpOptions(max_frames=1, max_dump_bytes=60000),
+        ), values
+
+    path, _ = business()
+    metadata = load_dumpling(path)["snapshot_meta"]
+    assert "effective_limits" in metadata  # A value reduction ran.
+    assert metadata["truncation"]["argv_entries"] == 5
+
+
+LONG_BASENAMES = ["a" * 217 + ".py", "é" * 118 + ".py"]
+
+
+@pytest.mark.parametrize("basename", LONG_BASENAMES, ids=["ascii", "multibyte"])
+def test_generated_names_leave_room_for_the_temporary_name(basename):
+    from pydumpling.pydumpling import _dump_target
+
+    for lineno in (None, 1, 10**9):
+        name = _dump_target(basename, lineno).name
+        # mkstemp adds "." before and ".XXXXXXXX" after the dump name.
+        assert len(name.encode("utf-8")) + len("..") + 8 <= 255
+        assert name.startswith(basename[:20])
+        name.encode("utf-8")  # Cut on a character boundary.
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="MAX_PATH also bounds the full temporary path"
+)
+@pytest.mark.parametrize("basename", LONG_BASENAMES, ids=["ascii", "multibyte"])
+def test_long_source_names_still_get_a_default_dump(tmp_path, monkeypatch, basename):
+    monkeypatch.chdir(tmp_path)
+    try:
+        exec(compile("raise ValueError('long name')", basename, "exec"))
+    except ValueError:
+        save_dumping(strict=True)
+    (path,) = tmp_path.glob("*.dump")
+    code = load_dumpling(path)["traceback"].tb_next.tb_frame.f_code
+    assert code.co_filename.endswith(basename)

@@ -75,15 +75,15 @@ except ValueError:
 ~~~
 
 `embed_source_lines` 会在 dump 内保存每帧当前行上下各 N 行源码
-（`None` 表示整个文件）。在没有源码的机器上 `pydumpling --debug` 的
-`list` 也能显示源码；本地仍存在的文件优先显示本地版本。
+（`None` 表示整个文件）。本地文件缺失或已与之不一致时，`--print`、`--debug`、
+`--rdebug` 和 `--html` 都显示运行时的源码；本地文件未改动时仍显示完整的本地版本。
 超出 dump 字节预算时，先舍弃内嵌源码，再缩减捕获的变量。
 
 ~~~sh
 pydumpling --html report.html error.dump   # 单文件 HTML，无脚本依赖
 ~~~
 
-HTML 报告展示异常、每帧的源码窗口（优先嵌入的源码，其次本地文件）
+HTML 报告展示异常、每帧的源码窗口（按同样规则选取，并高亮当前行）
 和 locals 表格。
 
 ## 保存当前调用栈
@@ -104,10 +104,12 @@ calculate()
 
 在应用启动阶段调用一次 `catch_any_exception()`，可以保存主线程的未处理异常。
 它安装 `sys.excepthook`，并保留之前的 hook 来正常打印异常。
-传入 `include_threads=True` 可同时捕获结束线程的异常，
-`restore_exception_hooks()` 可移除已安装的全部钩子。
+传入 `include_threads=True` 可同时捕获结束线程的异常（线程内的 `SystemExit`
+属于正常退出，不保存快照），`restore_exception_hooks()` 可停用已安装的全部钩子；
+其他库套在外层的钩子会保留，被套住的本库钩子只负责转发。
 asyncio 场景在异步代码内调用 `install_asyncio_handler()`（或显式传入 `loop=`），
-捕获事件循环上报的异常。
+捕获事件循环上报的异常。不使用管理器时，每个钩子都会在工作目录新建 dump 且从不清理，
+长期运行的服务应传入 `DumpManager`。
 
 ## 管理快照目录
 
@@ -124,9 +126,11 @@ except ValueError:
 ~~~
 
 默认文件名现在包含源码行号、UTC 时间戳、pid 和进程内序号，
-同一处反复出错也不会覆盖之前的快照。管理器按文件修改时间清理旧快照，
-时间相同时按文件名排序。
-钩子可直接接入管理器：`catch_any_exception(manager=manager, include_threads=True)`。
+同一处反复出错也不会覆盖之前的快照。管理器按文件修改时间清理旧快照；
+保存间隔短到文件系统给出相同时间时，按文件名里的时间戳和序号保持写入顺序。
+`target()` 会先创建管理目录，再返回新路径。
+钩子可直接接入管理器：`catch_any_exception(manager=manager, include_threads=True)`、
+`install_asyncio_handler(manager=manager)`。
 每份快照的 `snapshot_meta` 记录创建时间、耗时、pid、主机名、工作目录、
 命令行和捕获线程。
 
@@ -165,7 +169,7 @@ dump_current_traceback("unlimited.dump", options=DumpOptions.unlimited(), strict
 `dump_current_traceback(filename=None, *, options=None, strict=False)`
 默认通过 warning 报告捕获或写入失败；传入 `strict=True` 可直接抛出异常。
 `catch_any_exception(*, options=None, include_threads=False, manager=None)`
-支持相同的捕获预算，`install_asyncio_handler(loop=None, *, options=None)`
+支持相同的捕获预算，`install_asyncio_handler(loop=None, *, options=None, manager=None)`
 覆盖事件循环；两者都保留原有钩子的正常上报。
 
 加载和调试默认最多读取 64 MiB 解压后的 dump 数据。

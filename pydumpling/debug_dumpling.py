@@ -3,7 +3,6 @@
 import gzip
 import inspect
 import linecache
-import os
 import pdb
 import pickle
 import signal
@@ -165,42 +164,75 @@ def load_dumpling(
     return _validate_dumpling(dumpling)
 
 
-def _padded_source_lines(entry):
-    """A 1-based line list from a stored ``{lineno: text}`` mapping."""
-    if not isinstance(entry, dict) or not isinstance(entry.get("lines"), dict):
+def _embedded_lines(entry):
+    """The validated ``{lineno: text}`` mapping of one embedded file, or None."""
+    lines = entry.get("lines") if isinstance(entry, dict) else None
+    if not isinstance(lines, dict) or not lines:
         return None
-    numbers = {}
-    for number, text in entry["lines"].items():
+    for number, text in lines.items():
         if type(number) is not int or number < 1 or type(text) is not str:
             return None
-        numbers[number] = text
-    if not numbers:
-        return None
-    lines = [""] * max(numbers)
-    for number, text in numbers.items():
-        lines[number - 1] = text
     return lines
 
 
-def inject_sources(sources) -> list[str]:
-    """Fill ``linecache`` for embedded files without a readable local copy.
+def _matches_local(filename, lines, total) -> bool:
+    """Whether the file on this machine still holds every embedded line.
 
-    Local files win: an unchanged checkout shows its own source. Injected
-    entries use a ``None`` mtime, so ``linecache.checkcache`` keeps them.
-    Malformed entries from a hand-edited dump are skipped, not fatal.
+    linecache ends every full line with a newline, so an embedded line
+    without one was cut to its bound and only has to start the local line.
     """
-    injected = []
-    if not isinstance(sources, dict):
-        return injected
-    for filename, entry in sources.items():
-        if not isinstance(filename, str) or os.path.isfile(filename):
-            continue
-        lines = _padded_source_lines(entry)
-        if lines is None:
-            continue
-        linecache.cache[filename] = (sum(map(len, lines)), None, lines, filename)
-        injected.append(filename)
-    return injected
+    linecache.checkcache(filename)
+    local = linecache.getlines(filename)
+    if not local or (type(total) is int and total != len(local)):
+        return False
+    for number, text in lines.items():
+        if number > len(local):
+            return False
+        line = local[number - 1]
+        if line != text and (text.endswith("\n") or not line.startswith(text)):
+            return False
+    return True
+
+
+@contextmanager
+def embedded_source(sources):
+    """Serve a dump's embedded source through ``linecache`` while active.
+
+    Embedded lines are what ran, so they stand in for a local file that is
+    missing or no longer matches them; an unchanged local file keeps serving
+    its whole text. Lines the dump left out read as empty strings. Injected
+    entries use a ``None`` mtime, so ``linecache.checkcache`` keeps them, and
+    the entries they replaced return on exit. Malformed entries from a
+    hand-edited dump are skipped, not fatal.
+    """
+    with _COMPAT_LOCK:
+        replaced = {}
+        try:
+            for filename, entry in sources.items() if isinstance(sources, dict) else ():
+                lines = _embedded_lines(entry)
+                if (
+                    not isinstance(filename, str)
+                    or lines is None
+                    or _matches_local(filename, lines, entry.get("total"))
+                ):
+                    continue
+                replaced[filename] = linecache.cache.get(filename)
+                padded = [""] * max(lines)
+                for number, text in lines.items():
+                    padded[number - 1] = text
+                linecache.cache[filename] = (
+                    sum(map(len, padded)),
+                    None,
+                    padded,
+                    filename,
+                )
+            yield
+        finally:
+            for filename, previous in replaced.items():
+                if previous is None:
+                    linecache.cache.pop(filename, None)
+                else:
+                    linecache.cache[filename] = previous
 
 
 @contextmanager
@@ -208,9 +240,9 @@ def mock_inspect(sources=None):
     """Use with ``with mock_inspect():``; restore inspect/tracing state on exit.
 
     ``sources`` is a dump's embedded source mapping; while the context is
-    active, pdb's ``list`` shows it for files missing on this machine.
+    active, pdb's ``list`` shows it, as :func:`embedded_source` serves it.
     """
-    with _COMPAT_LOCK:
+    with _COMPAT_LOCK, embedded_source(sources):
         original = inspect.isframe, inspect.istraceback, inspect.iscode
         original_trace = sys.gettrace()
         main_thread = threading.current_thread() is threading.main_thread()
@@ -223,7 +255,6 @@ def mock_inspect(sources=None):
                 (frame, frame.f_trace, frame.f_trace_lines, frame.f_trace_opcodes)
             )
             frame = frame.f_back
-        injected = inject_sources(sources)
         inspect.isframe = lambda obj: isinstance(obj, (types.FrameType, FakeFrame))
         inspect.istraceback = lambda obj: isinstance(
             obj, (types.TracebackType, FakeTraceback)
@@ -232,8 +263,6 @@ def mock_inspect(sources=None):
         try:
             yield
         finally:
-            for filename in injected:
-                linecache.cache.pop(filename, None)
             inspect.isframe, inspect.istraceback, inspect.iscode = original
             # Older Bdb quit/continue stops the process-wide trace; continue
             # also deletes local trace hooks along the live caller stack.

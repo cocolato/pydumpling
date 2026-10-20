@@ -315,3 +315,141 @@ def test_asyncio_reports_original_exception_when_saving_fails(
         assert reported == [context]
     finally:
         loop.close()
+
+
+def make_error(message="example"):
+    try:
+        raise ValueError(message)
+    except ValueError as error:
+        return error
+
+
+@pytest.mark.parametrize("exit_type", [SystemExit, type("Stop", (SystemExit,), {})])
+def test_thread_exit_saves_no_dump(tmp_path, monkeypatch, clean_hooks, exit_type):
+    monkeypatch.chdir(tmp_path)
+    forwarded = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: forwarded.append(args))
+    catch_any_exception(include_threads=True)
+
+    def worker():
+        raise exit_type(0)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert list(tmp_path.glob("*.dump")) == []
+    assert [args.exc_type for args in forwarded] == [exit_type]
+
+
+def test_restore_disables_a_hook_wrapped_by_a_third_party(monkeypatch, clean_hooks):
+    import pydumpling.hooks as hooks
+
+    saved = []
+    monkeypatch.setattr(hooks, "save_dumping", lambda **kwargs: saved.append(kwargs))
+    reported = []
+    sys.excepthook = lambda *args: reported.append(args[1])
+    catch_any_exception()
+    ours = sys.excepthook
+
+    def third_party(*args):
+        ours(*args)
+
+    sys.excepthook = third_party
+    error = make_error()
+    restore_exception_hooks()
+    assert sys.excepthook is third_party
+    sys.excepthook(ValueError, error, error.__traceback__)
+    assert saved == [] and reported == [error]
+    # Installing again adds one active hook; the wrapped one keeps forwarding.
+    catch_any_exception()
+    sys.excepthook(ValueError, error, error.__traceback__)
+    assert len(saved) == 1 and reported == [error, error]
+
+
+def test_reinstall_without_wrapping_does_not_duplicate(monkeypatch, clean_hooks):
+    import pydumpling.hooks as hooks
+
+    saved = []
+    monkeypatch.setattr(hooks, "save_dumping", lambda **kwargs: saved.append(kwargs))
+    sys.excepthook = lambda *args: None
+    catch_any_exception()
+    ours = sys.excepthook
+    sys.excepthook = lambda *args: ours(*args)
+    catch_any_exception()
+    error = make_error()
+    sys.excepthook(ValueError, error, error.__traceback__)
+    assert len(saved) == 1
+
+
+def test_reinstall_updates_the_installed_thread_hook(tmp_path, clean_hooks):
+    first = DumpManager(tmp_path / "first")
+    second = DumpManager(tmp_path / "second")
+    catch_any_exception(include_threads=True, manager=first)
+    catch_any_exception(manager=second)
+    assert threading.excepthook._pydumpling_manager is second
+    assert sys.excepthook._pydumpling_manager is second
+
+
+def test_asyncio_handler_saves_through_a_manager(tmp_path, clean_hooks):
+    manager = DumpManager(tmp_path, retention=1)
+    with pytest.raises(ValueError, match="through the manager"):
+        install_asyncio_handler(manager=manager, options=DumpOptions())
+    loop = asyncio.new_event_loop()
+    try:
+        loop.set_exception_handler(lambda loop, context: None)
+        install_asyncio_handler(loop, manager=manager)
+        for message in ("first", "second"):
+            error = make_error(message)
+            loop.call_exception_handler({"message": message, "exception": error})
+        dumps = list(tmp_path.glob("*.dump"))
+        assert len(dumps) == 1
+        assert load_dumpling(dumps[0])["exc_extra"]["message"] == "second"
+    finally:
+        loop.close()
+
+
+def test_restore_keeps_a_functools_wraps_wrapper(monkeypatch, clean_hooks):
+    import functools
+
+    import pydumpling.hooks as hooks
+
+    saved = []
+    monkeypatch.setattr(hooks, "save_dumping", lambda **kwargs: saved.append(kwargs))
+    calls = []
+    sys.excepthook = lambda *args: calls.append("base")
+    catch_any_exception()
+    ours = sys.excepthook
+
+    # wraps copies our hook's attributes, markers included, onto the wrapper.
+    @functools.wraps(ours)
+    def wrapper(*args):
+        calls.append("wrapper")
+        ours(*args)
+
+    sys.excepthook = wrapper
+    restore_exception_hooks()
+    assert sys.excepthook is wrapper
+    error = make_error()
+    sys.excepthook(ValueError, error, error.__traceback__)
+    assert calls == ["wrapper", "base"] and saved == []
+    catch_any_exception()
+    assert sys.excepthook is not wrapper
+    sys.excepthook(ValueError, error, error.__traceback__)
+    assert len(saved) == 1
+
+
+def test_thread_hook_tolerates_a_hand_built_argument(monkeypatch, clean_hooks):
+    forwarded = []
+    monkeypatch.setattr(threading, "excepthook", forwarded.append)
+    catch_any_exception(include_threads=True)
+    error = make_error()
+    args = SimpleNamespace(
+        exc_type="not a type",
+        exc_value=error,
+        exc_traceback=error.__traceback__,
+        thread=None,
+    )
+    # The invalid triple is reported by save_dumping, never as a TypeError.
+    with pytest.warns(RuntimeWarning, match="exception type"):
+        threading.excepthook(args)
+    assert forwarded == [args]

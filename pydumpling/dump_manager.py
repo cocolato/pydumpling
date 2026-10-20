@@ -2,7 +2,6 @@
 
 import inspect
 import stat
-import sys
 from os import PathLike
 from pathlib import Path
 from types import FrameType, TracebackType
@@ -11,7 +10,9 @@ from .options import DumpOptions
 from .pydumpling import (
     DUMP_FILE_EXTENSION,
     _capture_frame,
+    _dump_order,
     _dump_target,
+    _exc_info,
     _innermost_traceback,
     _warn_or_raise,
     save_dumping,
@@ -43,7 +44,11 @@ class DumpManager:
         self.options = options
 
     def target(self, *, stem: str = "snapshot", lineno: int | None = None) -> Path:
-        """A fresh dump path in the managed directory; saving creates it."""
+        """A fresh dump path in the managed directory, which is created first.
+
+        An unwritable directory raises here, before any capture work.
+        """
+        self.directory.mkdir(parents=True, exist_ok=True)
         return _dump_target(stem, lineno, directory=self.directory)
 
     def save_exception(
@@ -59,20 +64,14 @@ class DumpManager:
         """
         self._check(options)
         try:
-            exc_type, exc_value, exc_tb = (
-                sys.exc_info() if exc_info is None else exc_info
-            )
-            innermost = _innermost_traceback(exc_tb)
-            self._prepare()
+            exc_info = _exc_info(exc_info)
+            innermost = _innermost_traceback(exc_info[2])
             filename = self.target(
                 stem=Path(innermost.tb_frame.f_code.co_filename).name,
                 lineno=innermost.tb_lineno,
             )
             save_dumping(
-                filename,
-                (exc_type, exc_value, exc_tb),
-                options=self._settings(options),
-                strict=True,
+                filename, exc_info, options=self._settings(options), strict=True
             )
         except Exception as error:
             _warn_or_raise(error, strict)
@@ -93,7 +92,6 @@ class DumpManager:
             caller = frame.f_back if frame is not None else None
             if not isinstance(caller, FrameType):
                 raise ValueError("No Python frame is available to capture")
-            self._prepare()
             filename = self.target(
                 stem=Path(caller.f_code.co_filename).name, lineno=caller.f_lineno
             )
@@ -109,7 +107,9 @@ class DumpManager:
     def prune(self) -> list[Path]:
         """Delete the oldest dumps beyond ``retention``; return removed paths.
 
-        Order by file modification time, with the name breaking ties.
+        Order by file modification time. Coarse filesystem clocks give quick
+        successive saves equal times; the UTC timestamp and sequence in
+        generated names then decide, never the source file or line.
         """
         if self.retention is None:
             return []
@@ -120,10 +120,10 @@ class DumpManager:
             except OSError:
                 continue  # Another saver may have pruned this file already.
             if stat.S_ISREG(info.st_mode):
-                dumps.append((info.st_mtime_ns, path))
+                dumps.append((info.st_mtime_ns, *_dump_order(path.name), path))
         dumps.sort()
         removed = []
-        for _, path in dumps[: max(0, len(dumps) - self.retention)]:
+        for *_, path in dumps[: max(0, len(dumps) - self.retention)]:
             try:
                 path.unlink()
                 removed.append(path)
@@ -134,10 +134,6 @@ class DumpManager:
     def _check(self, options: DumpOptions | None) -> None:
         if options is not None and not isinstance(options, DumpOptions):
             raise TypeError("options must be a DumpOptions instance or None")
-
-    def _prepare(self) -> None:
-        """Create the managed directory; an unwritable path reports a save error."""
-        self.directory.mkdir(parents=True, exist_ok=True)
 
     def _settings(self, options: DumpOptions | None) -> DumpOptions | None:
         return options if options is not None else self.options

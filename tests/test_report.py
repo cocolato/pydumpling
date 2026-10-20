@@ -2,11 +2,13 @@
 
 import io
 import json
+import re
 import sys
 
 import pytest
 
 from pydumpling import DumpOptions, dump_current_traceback, load_dumpling, save_dumping
+from pydumpling.debug_dumpling import embedded_source
 from pydumpling.report import (
     _json_mapping,
     _safe_repr,
@@ -14,6 +16,7 @@ from pydumpling.report import (
     dump_to_dict,
     print_info_report,
     print_json_report,
+    render_html,
 )
 
 
@@ -166,23 +169,116 @@ def test_source_window_reads_only_requested_local_lines(monkeypatch, lineno, exp
 
     lines = SourceLines([f"line {number}\n" for number in range(1, 6)])
     monkeypatch.setattr("pydumpling.report.linecache.getlines", lambda filename: lines)
-    assert _source_window({}, "source.py", lineno, 1) == [
+    assert _source_window("source.py", lineno, 1) == [
         (number, lines[number - 1]) for number in expected
     ]
 
 
-def test_source_window_looks_up_embedded_lines_without_scanning(monkeypatch):
-    class SourceLines(dict):
-        def items(self):
-            pytest.fail("source windows must not scan the whole mapping")
+def test_source_window_shows_embedded_lines_for_a_changed_file(tmp_path):
+    module = tmp_path / "source.py"
+    module.write_text("".join(f"local {number}\n" for number in range(1, 6)))
+    filename = str(module)
+    local = [(number, f"local {number}\n") for number in (2, 3, 4)]
+    changed = {filename: {"lines": {2: "saved 2\n", 3: "saved 3\n"}, "total": 5}}
+    with embedded_source(changed):
+        # Lines the dump left out are skipped instead of mixing in local ones.
+        assert _source_window(filename, 3, 1) == [(2, "saved 2\n"), (3, "saved 3\n")]
+    assert _source_window(filename, 3, 1) == local
+    unchanged = {filename: {"lines": {3: "local 3\n"}, "total": 5}}
+    with embedded_source(unchanged):
+        assert _source_window(filename, 3, 1) == local
+    assert _source_window("<string>", 1, 1) == []
 
-    def no_local_source(filename):
-        pytest.fail("embedded source must take precedence")
 
-    monkeypatch.setattr("pydumpling.report.linecache.getlines", no_local_source)
-    dumpling = {
-        "source": {"source.py": {"lines": SourceLines({2: "saved\n", 3: None})}}
+def test_html_marks_the_current_line(tmp_path):
+    path = tmp_path / "mark.dump"
+    try:
+        raise KeyError("marked")
+    except KeyError:
+        save_dumping(path, options=DumpOptions(embed_source_lines=1), strict=True)
+    page = render_html(load_dumpling(path))
+    marked = re.findall(r'<span class="line mark">([^<]*)</span>', page)
+    assert len(marked) == 1
+    assert "raise KeyError(&quot;marked&quot;)" in marked[0]
+    assert "pre.source .mark{" in page
+
+
+def test_reports_derive_text_from_exception_objects(tmp_path):
+    namespace = {}
+    exec(
+        compile(
+            "import sys\n"
+            "def business():\n"
+            "    try:\n"
+            "        raise ValueError('actual failure')\n"
+            "    except ValueError:\n"
+            "        return sys.exc_info()\n",
+            str(tmp_path / "unlimited.py"),
+            "exec",
+        ),
+        namespace,
+    )
+    path = tmp_path / "unlimited.dump"
+    save_dumping(path, namespace["business"](), options=DumpOptions.unlimited())
+    dumpling = load_dumpling(path)
+    # Unlimited capture keeps the exception object itself, not its text.
+    assert "message" not in dumpling["exc_extra"]
+    exception = dump_to_dict(dumpling)["exception"]
+    assert exception["type"] == "ValueError"
+    assert exception["message"] == "actual failure"
+    assert exception["formatted"] == "ValueError: actual failure\n"
+    assert "<h1>ValueError: actual failure</h1>" in render_html(dumpling)
+
+    # Older snapshots can carry only the exception type and value.
+    legacy = dict(
+        dumpling, exc_extra={"exc_type": KeyError, "exc_value": KeyError("k")}
+    )
+    exception = dump_to_dict(legacy)["exception"]
+    assert exception == {
+        "type": "KeyError",
+        "message": "'k'",
+        "formatted": "KeyError: 'k'\n",
     }
-    assert _source_window(dumpling, "source.py", 3, 1) == [(2, "saved\n")]
-    assert _source_window(dumpling, "source.py", 20, 1) == []
-    assert _source_window({}, "<string>", 1, 1) == []
+    assert "Stack snapshot" not in render_html(legacy)
+
+
+def test_html_export_escapes_lone_surrogates_and_keeps_old_report(
+    tmp_path, monkeypatch
+):
+    from pydumpling.cli import main
+
+    path = tmp_path / "surrogate.dump"
+    try:
+        # What os.fsdecode(b"\xff") yields for an undecodable POSIX file name.
+        raise FileNotFoundError("missing \udcff")
+    except FileNotFoundError:
+        save_dumping(path, strict=True)
+    target = tmp_path / "report.html"
+    target.write_text("previous report", encoding="utf-8")
+
+    def broken(dumpling, *, span):
+        raise RuntimeError("render failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("pydumpling.report.render_html", broken)
+        assert main(["--html", str(target), str(path)]) == 1
+    assert target.read_text(encoding="utf-8") == "previous report"
+
+    assert main(["--html", str(target), str(path)]) == 0
+    assert "missing \\udcff" in target.read_text(encoding="utf-8")
+
+
+def test_exception_view_falls_back_when_the_class_hides_its_name():
+    class Meta(type):
+        @property
+        def __module__(cls):
+            raise RuntimeError("no module")
+
+    class Hidden(Exception, metaclass=Meta):
+        pass
+
+    dumpling = {"exc_extra": {"exc_type": Hidden, "exc_value": Hidden("boom")}}
+    exception = dump_to_dict(dumpling)["exception"]
+    assert exception["type"] == "?"
+    assert exception["message"] == "boom"
+    assert "<h1>?: boom</h1>" in render_html(dumpling)
