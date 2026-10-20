@@ -3,7 +3,12 @@
 from ._version import __version__
 from .capture import CaptureInterruptedError, CaptureTimeoutError, capture_pid
 from .debug_dumpling import DumpFormatError, debug_dumpling, load_dumpling
-from .helpers import catch_any_exception
+from .dump_manager import DumpManager
+from .hooks import (
+    catch_any_exception,
+    install_asyncio_handler,
+    restore_exception_hooks,
+)
 from .options import DumpOptions
 from .pydumpling import dump_current_traceback, save_dumping
 from .rpdb import r_post_mortem
@@ -14,6 +19,7 @@ __all__ = [
     "CaptureTimeoutError",
     "DumpFormatError",
     "DumpOptions",
+    "DumpManager",
     "capture_pid",
     "debug_dumpling",
     "load_dumpling",
@@ -21,4 +27,6 @@ __all__ = [
     "dump_current_traceback",
     "r_post_mortem",
     "catch_any_exception",
+    "install_asyncio_handler",
+    "restore_exception_hooks",
 ]

@@ -14,6 +14,8 @@ from pathlib import Path
 from .options import DumpOptions
 from .pydumpling import Pathish, _options
 
+_DEFAULTS = DumpOptions()
+
 
 class CaptureTimeoutError(TimeoutError):
     """The request is still pending; its script must remain available."""
@@ -113,7 +115,13 @@ def capture_pid(
         "request_id": request_id,
         "output": str(target),
         "status": str(status_path),
-        "options": asdict(settings),
+        # Only settings that differ from the defaults, so a target running an
+        # older pydumpling without a newer, unused field still accepts them.
+        "options": {
+            name: value
+            for name, value in asdict(settings).items()
+            if value != getattr(_DEFAULTS, name)
+        },
     }
     try:
         fd = os.open(script_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)

@@ -4,6 +4,48 @@
 
 ### Runtime and capture
 
+- Add `DumpOptions(embed_source_lines=N)`: store N lines of source context on
+  each side of every captured traceback line (`None` embeds whole files).
+  `--print`, `--debug`, `--rdebug`, and `--html` show the embedded lines for
+  files that are missing on the viewing machine or no longer match them; an
+  unchanged local file keeps serving its full text. Lines cut to the code
+  metadata bound are reported as `source_lines`. When the byte budget is
+  exceeded, source is omitted before reducing captured variables, and
+  reported as `source_omitted`.
+- Add `pydumpling --html FILE dump`: a standalone, script-free HTML report
+  with the exception, a source window per frame with the current line
+  highlighted, and locals tables.
+- Stream every serialization attempt through gzip directly into one temporary
+  dump file instead of building the full pickled snapshot in memory first. On
+  a string-heavy workload the writer's peak drops by about 40 percent. An
+  output path that cannot be created fails before capture, a commit failure is
+  not retried as a serialization failure, and a failed attempt still leaves
+  any previous dump untouched.
+- Look up the value memo once per captured value instead of twice.
+- Record the creation time, capture duration, pid, host name, working
+  directory, command line, and capturing thread in `snapshot_meta`; every
+  field degrades to `None` when the environment cannot provide it.
+- Give automatically generated dump names the source line, a UTC timestamp,
+  the pid, and a per-process sequence, so repeated failures never overwrite an
+  earlier snapshot. A long source file name is shortened to keep the name
+  within the 255-byte file name limit. Without a `DumpManager`, such dumps
+  accumulate in the working directory.
+- Add `DumpManager(directory, *, retention=50, options=None)` with
+  `save_exception()`, `save_current()`, `target()`, and `prune()`: unique
+  names in one directory, oldest dumps by file modification time removed
+  beyond `retention` (`retention=None` keeps everything). Equal modification
+  times keep write order through the timestamp and sequence in the name, and
+  `target()` creates the directory.
+- `catch_any_exception(*, options=None, include_threads=False, manager=None)`
+  can also hook `threading.excepthook` (a thread's `SystemExit` saves
+  nothing) and save through a `DumpManager`; re-running it applies new
+  settings to every installed hook. Add
+  `install_asyncio_handler(loop=None, *, options=None, manager=None)` for
+  event loops and `restore_exception_hooks()` to stop every installed hook:
+  a later third-party hook stays installed, ours below it only forwards, and
+  installing again never saves an exception twice.
+- PID capture sends the target only the options that differ from the
+  defaults, so a target with an older Pydumpling accepts default captures.
 - Keep the value, type name, and attributes of `str`, `bytes`, `int`, and
   `float` subclass instances, such as `IntEnum` and `StrEnum` members, under
   the budgets of plain values instead of an empty placeholder.
@@ -13,6 +55,23 @@
   `__getstate__`, no longer makes a snapshot unsavable.
 - Write snapshot format 2, which adds the scalar subclass copies. Format 1
   dumps still load; Pydumpling 0.2.0 cannot read format 2.
+
+### Development and documentation
+
+- Add `pydumpling --json` for an
+  indented JSON report of a dump: capture metadata, exception details, frames
+  with guarded `repr` locals (plus globals behind `--globals`), and truncation
+  reasons. `pydumpling --info` prints the stored metadata as a human-readable
+  summary. Both keep the quiet 141 pipe semantics of `--print`.
+- Add `benchmarks/bench_capture.py`, a fixed-workload script comparing capture,
+  write, load, and report timings between revisions.
+- Split the internal `pydumpling.snapshot` module into a package
+  (`snapshot.context`, `snapshot.values`, `snapshot.frames`,
+  `snapshot.exceptions`, `snapshot.reduce`, `snapshot.identity`) and moved
+  hooks to `pydumpling.hooks` and report formatting to `pydumpling.report`.
+  `pydumpling.snapshot` and `pydumpling.helpers` keep re-exporting their
+  public names; private helpers such as `_CODE_TEXT_LIMIT` now live in the
+  submodule that uses them.
 
 ## 0.2.0 — 2026-10-18
 

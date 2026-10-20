@@ -161,12 +161,12 @@ def r_post_mortem(
     max_bytes: int | None = DEFAULT_MAX_BYTES,
 ) -> None:
     dumpling = load_dumpling(dump_file, max_bytes=max_bytes)
-    from .helpers import print_snapshot_notice
+    from .report import print_snapshot_notice
 
     # Accept neither holds the compatibility lock nor changes process stdio.
     debugger = Rpdb(addr=addr, port=port, timeout=timeout)
     try:
-        with mock_inspect():
+        with mock_inspect(dumpling.get("source")):
             print_snapshot_notice(dumpling, file=debugger.stdout)
             debugger.reset()
             debugger.interaction(None, dumpling["traceback"])
