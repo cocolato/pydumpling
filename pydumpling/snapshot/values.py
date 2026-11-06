@@ -2,6 +2,8 @@
 
 import builtins
 import itertools
+import os
+import sys
 import types
 from collections import OrderedDict
 
@@ -18,7 +20,24 @@ from ..fake_types import (
     FakeTuple,
     TruncatedValue,
 )
+from ..options import DumpOptions
+from . import identity as _identity
 from .identity import _CLASS_DICT, _derives, _type_mro
+
+_native = None
+if sys.version_info >= (3, 12) and os.environ.get("PYDUMPLING_NATIVE") != "0":
+    # The optional native walker; this module stays the reference walk.  On
+    # Python 3.11, C calls count toward the recursion limit, so a call the
+    # walker hands back here could overflow where this walk alone would not.
+    # ``PYDUMPLING_NATIVE=0`` at import leaves the module out entirely.
+    try:
+        from .. import _native
+    except ImportError:
+        pass
+
+# The reason of an immutable container's placeholder.  One shared object, so
+# the native walker's placeholders pickle to the same bytes as these.
+_RECURSIVE_IMMUTABLE = "recursive immutable reference"
 
 # Each builtin container base maps to the copy type of its exact instances and
 # the snapshot subclass for instances of its subclasses.
@@ -83,9 +102,93 @@ def _scalar_copy_type(value):
 # The value memo legitimately stores None; only this sentinel means "new".
 _UNMEMOIZED = object()
 
+# The context methods the native walker carries out itself.  A context class
+# that overrides any of them captures in Python, which calls the override.
+_NATIVE_WALK = (
+    "value",
+    "_mapping",
+    "_attribute_mapping",
+    "_root_value",
+    "_fill_copy",
+    "_filled_slot",
+    "_scalar",
+    "_layout",
+    "_attributes",
+    "_remember",
+    "_has_nodes",
+    "_omit",
+    "_type_name",
+    "_bounded_text",
+    "_bounded_bytes",
+    "_text",
+    "_code_text",
+)
+
+
+# How the walker reads and writes the context's own state.
+_STATE_ACCESS = ("__getattribute__", "__setattr__", "__delattr__")
+
+
+def _walk_methods(cls):
+    """The methods of ``cls`` the native walker stands in for or relies on."""
+    return tuple(getattr(cls, name, None) for name in _NATIVE_WALK + _STATE_ACCESS)
+
+
+def _headroom(frames):
+    """Recurse ``frames`` calls deep.
+
+    The native walker calls this to learn whether this walk would have room
+    for its recursion: the interpreter counts these frames exactly as it
+    counts the walk's own.
+    """
+    if frames:
+        _headroom(frames - 1)
+
 
 class ValuesMixin:
     """Value capture shared by the composed :class:`SnapshotContext`."""
+
+    # The native walker capturing for this context, if any.
+    _walker = None
+    # The walk methods of the composed context class, which records them.
+    _stock_walk = None
+
+    def _start_walker(self):
+        """Capture through the native walker when it is built.
+
+        The walker mirrors this module step for step; ``PYDUMPLING_NATIVE=0``
+        keeps the Python walk.  Unlimited snapshots stay in Python, where
+        probing each original with the serializer dominates the cost, and so
+        do options subclasses and context subclasses that override a walk
+        method or attribute access.  The walker itself hands a context back
+        to Python for good when its state stops being one it mirrors, such
+        as a walk method set on the context.
+        """
+        if (
+            _native is None
+            or self._unlimited
+            or type(self.options) is not DumpOptions
+            or os.environ.get("PYDUMPLING_NATIVE") == "0"
+        ):
+            return
+        stock = self._stock_walk
+        if stock is None or any(
+            method is not original
+            for method, original in zip(_walk_methods(type(self)), stock)
+        ):
+            return
+        self._walker = _native.Walker(_STATICS)
+
+    def __getstate__(self):
+        # A copy captures in Python, sharing the memo as a copy of a context
+        # that captures in Python does, once the walker has written its own
+        # copies into it.
+        walker = self.__dict__.get("_walker")
+        if walker is not None:
+            walker.flush(self)
+        state = self.__dict__.copy()
+        state.pop("_walker", None)
+        return state
 
     def _layout(self, value):
         """Member descriptors and named tuple fields of ``type(value)``, cached."""
@@ -246,9 +349,7 @@ class ValuesMixin:
                 value,
                 captured
                 if mutable
-                else TruncatedValue(
-                    "recursive immutable reference", self._type_name(value)
-                ),
+                else TruncatedValue(_RECURSIVE_IMMUTABLE, self._type_name(value)),
             )
             count = 0
             # Iterate through the base type: a subclass ``__iter__`` must be
@@ -401,7 +502,9 @@ class ValuesMixin:
             # One extra key lets the loop below report truncation.
             chosen = dict.fromkeys(
                 id(key)
-                for key in itertools.islice(keys, None if limit is None else limit + 1)
+                for key in itertools.islice(
+                    keys, None if limit is None else min(limit + 1, sys.maxsize)
+                )
             )
             remaining = len(chosen)
             for key, item in view:
@@ -456,3 +559,16 @@ class ValuesMixin:
             for identity in list(itertools.islice(self.objects, mark, None)):
                 del self.objects[identity]
             return self._remember(item, self._omit("recursion", item))
+
+
+if _native is not None:
+    # The walker's table of this module's classes and helpers, so a reloaded
+    # or vendored copy of the package has its own.
+    _STATICS = _native.Statics(globals(), _identity)
+    # A native descriptor sends each call to the context's walker, or to the
+    # method below when it has none, without adding a Python frame: the
+    # Python walk then overflows its recursion limit exactly where it would.
+    ValuesMixin.value = _native.Dispatch(ValuesMixin.value, owner=ValuesMixin)
+    ValuesMixin._mapping = _native.Dispatch(
+        ValuesMixin._mapping, mapping=True, owner=ValuesMixin
+    )

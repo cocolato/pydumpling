@@ -1,0 +1,1432 @@
+{
+ "meta": {
+  "impl": "legacy",
+  "argv": [
+   "rust/bench/bench_walk.py",
+   "--impl",
+   "legacy",
+   "--legacy-root",
+   "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg",
+   "--tmpdir",
+   "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/bench",
+   "--rounds",
+   "3",
+   "--json",
+   "rust/bench/results/legacy_baseline.json"
+  ],
+  "started": "2026-11-06T05:33:53+0000",
+  "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "cpu": "Apple M5 Pro",
+  "cpu_count": 15,
+  "loadavg_start": [
+   4.91845703125,
+   4.4775390625,
+   4.26708984375
+  ],
+  "root": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg",
+  "hash_seed": 0,
+  "min_runs": 15,
+  "min_time_s": 0.5,
+  "warmup_runs": 3,
+  "warmup_time_s": 0.1,
+  "rounds": 3,
+  "rss_unit": "MB = 2**20 bytes, from ru_maxrss",
+  "loadavg_end": [
+   4.80908203125,
+   4.48095703125,
+   4.27294921875
+  ],
+  "python": "3.13.18",
+  "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+  "package_digest": "f135b4d4f3cf"
+ },
+ "suite": {
+  "save_ms": 96.3706675247522,
+  "capture_ms": 73.22000099520665,
+  "max_peak_rss_mb": 73.84375,
+  "save_geomean_ms": 4.615958025189321,
+  "capture_geomean_ms": 2.8147851314627776,
+  "save_ms_per_round": [
+   94.39843700965866,
+   102.64564701355994,
+   97.65775053529069
+  ],
+  "save_spread_pct": 8.44501328230059
+ },
+ "workloads": {
+  "a_typical": {
+   "save_median_ms": 0.6339579995255917,
+   "save_round_medians_ms": [
+    0.6566660013049841,
+    0.6261044909479097,
+    0.6339579995255917
+   ],
+   "save_round_spread_pct": 4.820746860193335,
+   "save_iqr_pct": 5.76828227249873,
+   "save_runs": [
+    743,
+    784,
+    778
+   ],
+   "capture_median_ms": 0.3207294939784333,
+   "capture_round_medians_ms": [
+    0.31912498525343835,
+    0.3207294939784333,
+    0.32391701824963093
+   ],
+   "capture_round_spread_pct": 1.4941042486459954,
+   "capture_iqr_pct": 4.138822518928548,
+   "capture_runs": [
+    1575,
+    1568,
+    1537
+   ],
+   "peak_rss_mb": 32.828125,
+   "rss_after_setup_mb": 31.71875,
+   "description": "4 frames, ~12 small locals, realistic module globals; defaults",
+   "options": {},
+   "dump_bytes": 4282,
+   "capture_pickle_bytes": 9547,
+   "capture_pickle_sha256": "2fcbd1751ae09e3d",
+   "nodes": 216,
+   "frames": 4,
+   "truncation": [
+    [
+     "unsupported_type",
+     16
+    ],
+    [
+     "max_depth",
+     4
+    ]
+   ],
+   "walker": "absent (no _walker attribute)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "a_typical",
+     "description": "4 frames, ~12 small locals, realistic module globals; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 743,
+      "sampled_s": 0.5005,
+      "median_ms": 0.6566660013049841,
+      "min_ms": 0.6002080044709146,
+      "mean_ms": 0.673671875095426,
+      "p25_ms": 0.6327915034489706,
+      "p75_ms": 0.6906459893798456,
+      "iqr_pct": 8.810336733727869,
+      "stdev_ms": 0.07252024599794116,
+      "warmup_runs": 147
+     },
+     "capture": {
+      "runs": 1575,
+      "sampled_s": 0.5002,
+      "median_ms": 0.31912498525343835,
+      "min_ms": 0.29837500187568367,
+      "mean_ms": 0.3176038340658009,
+      "p25_ms": 0.30958300339989364,
+      "p75_ms": 0.32279102015309036,
+      "iqr_pct": 4.138822518928548,
+      "stdev_ms": 0.011464848199236538,
+      "warmup_runs": 314
+     },
+     "dump_bytes": 4282,
+     "capture_pickle_bytes": 9547,
+     "capture_pickle_sha256": "2fcbd1751ae09e3d",
+     "nodes": 216,
+     "frames": 4,
+     "truncation": [
+      [
+       "unsupported_type",
+       16
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 31.546875,
+     "peak_rss_mb": 32.671875
+    },
+    {
+     "workload": "a_typical",
+     "description": "4 frames, ~12 small locals, realistic module globals; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 784,
+      "sampled_s": 0.5006,
+      "median_ms": 0.6261044909479097,
+      "min_ms": 0.5901249824091792,
+      "mean_ms": 0.6384673782363557,
+      "p25_ms": 0.61262451345101,
+      "p75_ms": 0.6487399878096767,
+      "iqr_pct": 5.76828227249873,
+      "stdev_ms": 0.039951482620068875,
+      "warmup_runs": 151
+     },
+     "capture": {
+      "runs": 1568,
+      "sampled_s": 0.5002,
+      "median_ms": 0.3207294939784333,
+      "min_ms": 0.2995830145664513,
+      "mean_ms": 0.3190031675330829,
+      "p25_ms": 0.310083749354817,
+      "p75_ms": 0.3244589897803962,
+      "iqr_pct": 4.482045055247048,
+      "stdev_ms": 0.011763440568624472,
+      "warmup_runs": 314
+     },
+     "dump_bytes": 4282,
+     "capture_pickle_bytes": 9547,
+     "capture_pickle_sha256": "2fcbd1751ae09e3d",
+     "nodes": 216,
+     "frames": 4,
+     "truncation": [
+      [
+       "unsupported_type",
+       16
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 31.515625,
+     "peak_rss_mb": 32.640625
+    },
+    {
+     "workload": "a_typical",
+     "description": "4 frames, ~12 small locals, realistic module globals; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 778,
+      "sampled_s": 0.5002,
+      "median_ms": 0.6339579995255917,
+      "min_ms": 0.5998339911457151,
+      "mean_ms": 0.6428911378873502,
+      "p25_ms": 0.6195000023581088,
+      "p75_ms": 0.6557294909725897,
+      "iqr_pct": 5.7148089686686605,
+      "stdev_ms": 0.033059031414798615,
+      "warmup_runs": 150
+     },
+     "capture": {
+      "runs": 1537,
+      "sampled_s": 0.5002,
+      "median_ms": 0.32391701824963093,
+      "min_ms": 0.3004999889526516,
+      "mean_ms": 0.3254604221570985,
+      "p25_ms": 0.32116699730977416,
+      "p75_ms": 0.32804100192151964,
+      "iqr_pct": 2.122149879278011,
+      "stdev_ms": 0.012960532284117353,
+      "warmup_runs": 307
+     },
+     "dump_bytes": 4283,
+     "capture_pickle_bytes": 9547,
+     "capture_pickle_sha256": "2fcbd1751ae09e3d",
+     "nodes": 216,
+     "frames": 4,
+     "truncation": [
+      [
+       "unsupported_type",
+       16
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 31.71875,
+     "peak_rss_mb": 32.828125
+    }
+   ]
+  },
+  "b_heavy_default": {
+   "save_median_ms": 4.264333998435177,
+   "save_round_medians_ms": [
+    4.2457919917069376,
+    4.264333998435177,
+    4.267042007995769
+   ],
+   "save_round_spread_pct": 0.49831969767447043,
+   "save_iqr_pct": 1.4998685634301783,
+   "save_runs": [
+    117,
+    118,
+    117
+   ],
+   "capture_median_ms": 3.745104491827078,
+   "capture_round_medians_ms": [
+    3.70400000247173,
+    3.745104491827078,
+    3.7709999887738377
+   ],
+   "capture_round_spread_pct": 1.7890017874887414,
+   "capture_iqr_pct": 1.965489944481222,
+   "capture_runs": [
+    136,
+    134,
+    133
+   ],
+   "peak_rss_mb": 40.359375,
+   "rss_after_setup_mb": 39.203125,
+   "description": "50k-int list, 20k str->list dict, nested dict, 100 KB str; defaults",
+   "options": {},
+   "dump_bytes": 5383,
+   "capture_pickle_bytes": 49183,
+   "capture_pickle_sha256": "7bfb906a56af0540",
+   "nodes": 3698,
+   "frames": 3,
+   "truncation": [
+    [
+     "max_items",
+     3
+    ],
+    [
+     "max_string_bytes",
+     1
+    ],
+    [
+     "unsupported_type",
+     14
+    ],
+    [
+     "max_depth",
+     4
+    ]
+   ],
+   "walker": "absent (no _walker attribute)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "b_heavy_default",
+     "description": "50k-int list, 20k str->list dict, nested dict, 100 KB str; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 117,
+      "sampled_s": 0.5,
+      "median_ms": 4.2457919917069376,
+      "min_ms": 4.088540998054668,
+      "mean_ms": 4.273613581023951,
+      "p25_ms": 4.2118749988731,
+      "p75_ms": 4.305792012019083,
+      "iqr_pct": 2.212002220773555,
+      "stdev_ms": 0.1024052693064233,
+      "warmup_runs": 23
+     },
+     "capture": {
+      "runs": 136,
+      "sampled_s": 0.502,
+      "median_ms": 3.70400000247173,
+      "min_ms": 3.520458994898945,
+      "mean_ms": 3.691415455464534,
+      "p25_ms": 3.656656001112424,
+      "p75_ms": 3.72945774870459,
+      "iqr_pct": 1.965489944481222,
+      "stdev_ms": 0.06549144588273867,
+      "warmup_runs": 27
+     },
+     "dump_bytes": 5383,
+     "capture_pickle_bytes": 49183,
+     "capture_pickle_sha256": "7bfb906a56af0540",
+     "nodes": 3698,
+     "frames": 3,
+     "truncation": [
+      [
+       "max_items",
+       3
+      ],
+      [
+       "max_string_bytes",
+       1
+      ],
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 39.03125,
+     "peak_rss_mb": 40.203125
+    },
+    {
+     "workload": "b_heavy_default",
+     "description": "50k-int list, 20k str->list dict, nested dict, 100 KB str; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 118,
+      "sampled_s": 0.5037,
+      "median_ms": 4.264333998435177,
+      "min_ms": 4.08716601668857,
+      "mean_ms": 4.268890202846536,
+      "p25_ms": 4.2295832390664145,
+      "p75_ms": 4.293218262318987,
+      "iqr_pct": 1.4922617054837666,
+      "stdev_ms": 0.06914338332358641,
+      "warmup_runs": 24
+     },
+     "capture": {
+      "runs": 134,
+      "sampled_s": 0.5004,
+      "median_ms": 3.745104491827078,
+      "min_ms": 3.54925001738593,
+      "mean_ms": 3.734007118740675,
+      "p25_ms": 3.7075519940117374,
+      "p75_ms": 3.766583489777986,
+      "iqr_pct": 1.5762309408208148,
+      "stdev_ms": 0.057884233303906366,
+      "warmup_runs": 27
+     },
+     "dump_bytes": 5384,
+     "capture_pickle_bytes": 49183,
+     "capture_pickle_sha256": "7bfb906a56af0540",
+     "nodes": 3698,
+     "frames": 3,
+     "truncation": [
+      [
+       "max_items",
+       3
+      ],
+      [
+       "max_string_bytes",
+       1
+      ],
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 39.078125,
+     "peak_rss_mb": 40.234375
+    },
+    {
+     "workload": "b_heavy_default",
+     "description": "50k-int list, 20k str->list dict, nested dict, 100 KB str; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 117,
+      "sampled_s": 0.5008,
+      "median_ms": 4.267042007995769,
+      "min_ms": 4.164250014582649,
+      "mean_ms": 4.280353676424259,
+      "p25_ms": 4.242750001139939,
+      "p75_ms": 4.306750022806227,
+      "iqr_pct": 1.4998685634301783,
+      "stdev_ms": 0.07210100042807054,
+      "warmup_runs": 23
+     },
+     "capture": {
+      "runs": 133,
+      "sampled_s": 0.5021,
+      "median_ms": 3.7709999887738377,
+      "min_ms": 3.617500013206154,
+      "mean_ms": 3.775101421353638,
+      "p25_ms": 3.7317919777706265,
+      "p75_ms": 3.8114580092951655,
+      "iqr_pct": 2.1125969706099856,
+      "stdev_ms": 0.06922187098188161,
+      "warmup_runs": 27
+     },
+     "dump_bytes": 5383,
+     "capture_pickle_bytes": 49183,
+     "capture_pickle_sha256": "7bfb906a56af0540",
+     "nodes": 3698,
+     "frames": 3,
+     "truncation": [
+      [
+       "max_items",
+       3
+      ],
+      [
+       "max_string_bytes",
+       1
+      ],
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 39.203125,
+     "peak_rss_mb": 40.359375
+    }
+   ]
+  },
+  "b2_heavy_nolimits": {
+   "save_median_ms": 76.71995900454931,
+   "save_round_medians_ms": [
+    75.0189580139704,
+    83.00279200193472,
+    76.71995900454931
+   ],
+   "save_round_spread_pct": 10.406462792154118,
+   "save_iqr_pct": 1.7470192994715723,
+   "save_runs": [
+    15,
+    15,
+    15
+   ],
+   "capture_median_ms": 60.332875000312924,
+   "capture_round_medians_ms": [
+    58.53829102125019,
+    60.332875000312924,
+    61.3982499926351
+   ],
+   "capture_round_spread_pct": 4.740299499021187,
+   "capture_iqr_pct": 1.9075934809706427,
+   "capture_runs": [
+    15,
+    15,
+    15
+   ],
+   "peak_rss_mb": 73.84375,
+   "rss_after_setup_mb": 39.203125,
+   "description": "same locals; max_items/max_nodes/max_depth/max_string_bytes=None",
+   "options": {
+    "max_items": null,
+    "max_nodes": null,
+    "max_depth": null,
+    "max_string_bytes": null
+   },
+   "dump_bytes": 228942,
+   "capture_pickle_bytes": 793365,
+   "capture_pickle_sha256": "01714d09559e3de6",
+   "nodes": 152643,
+   "frames": 3,
+   "truncation": [
+    [
+     "unsupported_type",
+     15
+    ]
+   ],
+   "walker": "absent (no _walker attribute)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "b2_heavy_nolimits",
+     "description": "same locals; max_items/max_nodes/max_depth/max_string_bytes=None",
+     "impl": "legacy",
+     "options": {
+      "max_items": null,
+      "max_nodes": null,
+      "max_depth": null,
+      "max_string_bytes": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 15,
+      "sampled_s": 1.1375,
+      "median_ms": 75.0189580139704,
+      "min_ms": 74.00512500316836,
+      "mean_ms": 75.83380000044902,
+      "p25_ms": 74.69291651796084,
+      "p75_ms": 75.5596460076049,
+      "iqr_pct": 1.1553472783275014,
+      "stdev_ms": 2.112582555624724,
+      "warmup_runs": 3
+     },
+     "capture": {
+      "runs": 15,
+      "sampled_s": 0.8889,
+      "median_ms": 58.53829102125019,
+      "min_ms": 57.479499984765425,
+      "mean_ms": 59.25945546478033,
+      "p25_ms": 58.26839598012157,
+      "p75_ms": 58.85160400066525,
+      "iqr_pct": 0.9962846717407026,
+      "stdev_ms": 2.2450169920775296,
+      "warmup_runs": 3
+     },
+     "dump_bytes": 228942,
+     "capture_pickle_bytes": 793365,
+     "capture_pickle_sha256": "01714d09559e3de6",
+     "nodes": 152643,
+     "frames": 3,
+     "truncation": [
+      [
+       "unsupported_type",
+       15
+      ]
+     ],
+     "rss_after_setup_mb": 39.203125,
+     "peak_rss_mb": 72.234375
+    },
+    {
+     "workload": "b2_heavy_nolimits",
+     "description": "same locals; max_items/max_nodes/max_depth/max_string_bytes=None",
+     "impl": "legacy",
+     "options": {
+      "max_items": null,
+      "max_nodes": null,
+      "max_depth": null,
+      "max_string_bytes": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 15,
+      "sampled_s": 1.2802,
+      "median_ms": 83.00279200193472,
+      "min_ms": 77.5816660025157,
+      "mean_ms": 85.34375546344866,
+      "p25_ms": 79.40745798987336,
+      "p75_ms": 87.19254199240822,
+      "iqr_pct": 9.379303773725342,
+      "stdev_ms": 8.525245343056987,
+      "warmup_runs": 3
+     },
+     "capture": {
+      "runs": 15,
+      "sampled_s": 0.9152,
+      "median_ms": 60.332875000312924,
+      "min_ms": 58.68149999878369,
+      "mean_ms": 61.01473333740917,
+      "p25_ms": 59.47983349324204,
+      "p75_ms": 61.40481200418435,
+      "iqr_pct": 3.1905963555231307,
+      "stdev_ms": 2.4694986216296484,
+      "warmup_runs": 3
+     },
+     "dump_bytes": 228942,
+     "capture_pickle_bytes": 793365,
+     "capture_pickle_sha256": "01714d09559e3de6",
+     "nodes": 152643,
+     "frames": 3,
+     "truncation": [
+      [
+       "unsupported_type",
+       15
+      ]
+     ],
+     "rss_after_setup_mb": 39.109375,
+     "peak_rss_mb": 73.84375
+    },
+    {
+     "workload": "b2_heavy_nolimits",
+     "description": "same locals; max_items/max_nodes/max_depth/max_string_bytes=None",
+     "impl": "legacy",
+     "options": {
+      "max_items": null,
+      "max_nodes": null,
+      "max_depth": null,
+      "max_string_bytes": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 15,
+      "sampled_s": 1.1579,
+      "median_ms": 76.71995900454931,
+      "min_ms": 75.0460829876829,
+      "mean_ms": 77.19604173131908,
+      "p25_ms": 75.76822901319247,
+      "p75_ms": 77.10854150354862,
+      "iqr_pct": 1.7470192994715723,
+      "stdev_ms": 2.3923463346112674,
+      "warmup_runs": 3
+     },
+     "capture": {
+      "runs": 15,
+      "sampled_s": 0.9363,
+      "median_ms": 61.3982499926351,
+      "min_ms": 59.8875000141561,
+      "mean_ms": 62.418258403583124,
+      "p25_ms": 60.97004149341956,
+      "p75_ms": 62.14127050770912,
+      "iqr_pct": 1.9075934809706427,
+      "stdev_ms": 2.6276384956225503,
+      "warmup_runs": 3
+     },
+     "dump_bytes": 228943,
+     "capture_pickle_bytes": 793365,
+     "capture_pickle_sha256": "01714d09559e3de6",
+     "nodes": 152643,
+     "frames": 3,
+     "truncation": [
+      [
+       "unsupported_type",
+       15
+      ]
+     ],
+     "rss_after_setup_mb": 39.15625,
+     "peak_rss_mb": 72.484375
+    }
+   ]
+  },
+  "c_deep": {
+   "save_median_ms": 1.0176454961765558,
+   "save_round_medians_ms": [
+    1.0142080136574805,
+    1.0176454961765558,
+    1.19983300101012
+   ],
+   "save_round_spread_pct": 18.24063370299971,
+   "save_iqr_pct": 5.3572319175875105,
+   "save_runs": [
+    487,
+    488,
+    381
+   ],
+   "capture_median_ms": 0.671646514092572,
+   "capture_round_medians_ms": [
+    0.6621250067837536,
+    0.671646514092572,
+    0.6910204974701628
+   ],
+   "capture_round_spread_pct": 4.302187248816206,
+   "capture_iqr_pct": 4.356424911370219,
+   "capture_runs": [
+    759,
+    726,
+    690
+   ],
+   "peak_rss_mb": 32.828125,
+   "rss_after_setup_mb": 31.6875,
+   "description": "62 frames, 3-4 small locals each; defaults",
+   "options": {},
+   "dump_bytes": 4140,
+   "capture_pickle_bytes": 13990,
+   "capture_pickle_sha256": "2f3f7f649e99f814",
+   "nodes": 467,
+   "frames": 62,
+   "truncation": [
+    [
+     "unsupported_type",
+     14
+    ],
+    [
+     "max_depth",
+     4
+    ]
+   ],
+   "walker": "absent (no _walker attribute)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "c_deep",
+     "description": "62 frames, 3-4 small locals each; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 487,
+      "sampled_s": 0.5004,
+      "median_ms": 1.0142080136574805,
+      "min_ms": 0.9549589885864407,
+      "mean_ms": 1.027592743072349,
+      "p25_ms": 0.9935415000654757,
+      "p75_ms": 1.0478749754838645,
+      "iqr_pct": 5.3572319175875105,
+      "stdev_ms": 0.04950100914788546,
+      "warmup_runs": 96
+     },
+     "capture": {
+      "runs": 759,
+      "sampled_s": 0.5006,
+      "median_ms": 0.6621250067837536,
+      "min_ms": 0.6190419953782111,
+      "mean_ms": 0.6595906234092946,
+      "p25_ms": 0.6437914998969063,
+      "p75_ms": 0.6713125039823353,
+      "iqr_pct": 4.156466498540995,
+      "stdev_ms": 0.0206114228536457,
+      "warmup_runs": 151
+     },
+     "dump_bytes": 4140,
+     "capture_pickle_bytes": 13990,
+     "capture_pickle_sha256": "2f3f7f649e99f814",
+     "nodes": 467,
+     "frames": 62,
+     "truncation": [
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 31.6875,
+     "peak_rss_mb": 32.703125
+    },
+    {
+     "workload": "c_deep",
+     "description": "62 frames, 3-4 small locals each; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 488,
+      "sampled_s": 0.5003,
+      "median_ms": 1.0176454961765558,
+      "min_ms": 0.9541669860482216,
+      "mean_ms": 1.0251932745617165,
+      "p25_ms": 1.0034580118372105,
+      "p75_ms": 1.0407809895696118,
+      "iqr_pct": 3.6675814782878002,
+      "stdev_ms": 0.037138448787942015,
+      "warmup_runs": 96
+     },
+     "capture": {
+      "runs": 726,
+      "sampled_s": 0.5001,
+      "median_ms": 0.671646514092572,
+      "min_ms": 0.619291007751599,
+      "mean_ms": 0.6888195619833098,
+      "p25_ms": 0.664208986563608,
+      "p75_ms": 0.6934687626198865,
+      "iqr_pct": 4.356424911370219,
+      "stdev_ms": 0.055313189771180105,
+      "warmup_runs": 151
+     },
+     "dump_bytes": 4140,
+     "capture_pickle_bytes": 13990,
+     "capture_pickle_sha256": "2f3f7f649e99f814",
+     "nodes": 467,
+     "frames": 62,
+     "truncation": [
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 31.59375,
+     "peak_rss_mb": 32.59375
+    },
+    {
+     "workload": "c_deep",
+     "description": "62 frames, 3-4 small locals each; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 381,
+      "sampled_s": 0.5003,
+      "median_ms": 1.19983300101012,
+      "min_ms": 1.0320419969502836,
+      "mean_ms": 1.3131535483867645,
+      "p25_ms": 1.1262079933658242,
+      "p75_ms": 1.3288750196807086,
+      "iqr_pct": 16.891269547033826,
+      "stdev_ms": 0.4560296353788096,
+      "warmup_runs": 76
+     },
+     "capture": {
+      "runs": 690,
+      "sampled_s": 0.5002,
+      "median_ms": 0.6910204974701628,
+      "min_ms": 0.6353750068228692,
+      "mean_ms": 0.7249609462619907,
+      "p25_ms": 0.6784375073038973,
+      "p75_ms": 0.7310210057767108,
+      "iqr_pct": 7.609542504936186,
+      "stdev_ms": 0.09113116656836907,
+      "warmup_runs": 144
+     },
+     "dump_bytes": 4139,
+     "capture_pickle_bytes": 13990,
+     "capture_pickle_sha256": "2f3f7f649e99f814",
+     "nodes": 467,
+     "frames": 62,
+     "truncation": [
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 31.453125,
+     "peak_rss_mb": 32.828125
+    }
+   ]
+  },
+  "d_stdlib_embedall": {
+   "save_median_ms": 5.7139165146509185,
+   "save_round_medians_ms": [
+    5.653812986565754,
+    5.7139165146509185,
+    6.377959012752399
+   ],
+   "save_round_spread_pct": 12.673374284168823,
+   "save_iqr_pct": 2.7639057099231246,
+   "save_runs": [
+    88,
+    88,
+    77
+   ],
+   "capture_median_ms": 1.5477705164812505,
+   "capture_round_medians_ms": [
+    1.5433340158779174,
+    1.5477705164812505,
+    1.5995829890016466
+   ],
+   "capture_round_spread_pct": 3.634193346156211,
+   "capture_iqr_pct": 2.3866500751019926,
+   "capture_runs": [
+    325,
+    322,
+    308
+   ],
+   "peak_rss_mb": 35.53125,
+   "rss_after_setup_mb": 31.703125,
+   "description": "14 frames through argparse.py and json/*.py; embed_source_lines=None",
+   "options": {
+    "embed_source_lines": null
+   },
+   "dump_bytes": 65142,
+   "capture_pickle_bytes": 217801,
+   "capture_pickle_sha256": "3426db2bea690920",
+   "nodes": 493,
+   "frames": 14,
+   "truncation": [
+    [
+     "max_items",
+     9
+    ],
+    [
+     "max_depth",
+     21
+    ],
+    [
+     "unsupported_type",
+     55
+    ]
+   ],
+   "walker": "absent (no _walker attribute)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "d_stdlib_embedall",
+     "description": "14 frames through argparse.py and json/*.py; embed_source_lines=None",
+     "impl": "legacy",
+     "options": {
+      "embed_source_lines": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 88,
+      "sampled_s": 0.5049,
+      "median_ms": 5.653812986565754,
+      "min_ms": 5.443166999612004,
+      "mean_ms": 5.7373490344616584,
+      "p25_ms": 5.594177491730079,
+      "p75_ms": 5.750135496782605,
+      "iqr_pct": 2.7584570876876096,
+      "stdev_ms": 0.33081462179070975,
+      "warmup_runs": 18
+     },
+     "capture": {
+      "runs": 325,
+      "sampled_s": 0.5015,
+      "median_ms": 1.5433340158779174,
+      "min_ms": 1.4448750007431954,
+      "mean_ms": 1.5431842520438994,
+      "p25_ms": 1.5229580167215317,
+      "p75_ms": 1.5597919991705567,
+      "iqr_pct": 2.3866500751019926,
+      "stdev_ms": 0.040926720202704124,
+      "warmup_runs": 65
+     },
+     "dump_bytes": 65142,
+     "capture_pickle_bytes": 217801,
+     "capture_pickle_sha256": "3426db2bea690920",
+     "nodes": 493,
+     "frames": 14,
+     "truncation": [
+      [
+       "max_items",
+       9
+      ],
+      [
+       "max_depth",
+       21
+      ],
+      [
+       "unsupported_type",
+       55
+      ]
+     ],
+     "rss_after_setup_mb": 31.65625,
+     "peak_rss_mb": 35.5
+    },
+    {
+     "workload": "d_stdlib_embedall",
+     "description": "14 frames through argparse.py and json/*.py; embed_source_lines=None",
+     "impl": "legacy",
+     "options": {
+      "embed_source_lines": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 88,
+      "sampled_s": 0.5055,
+      "median_ms": 5.7139165146509185,
+      "min_ms": 5.507666995981708,
+      "mean_ms": 5.744173760996835,
+      "p25_ms": 5.6565937484265305,
+      "p75_ms": 5.814521013235208,
+      "iqr_pct": 2.7639057099231246,
+      "stdev_ms": 0.11506578898039986,
+      "warmup_runs": 17
+     },
+     "capture": {
+      "runs": 322,
+      "sampled_s": 0.5004,
+      "median_ms": 1.5477705164812505,
+      "min_ms": 1.4505000144708902,
+      "mean_ms": 1.5541433762709802,
+      "p25_ms": 1.5339579913415946,
+      "p75_ms": 1.5681145087000914,
+      "iqr_pct": 2.2068205198887796,
+      "stdev_ms": 0.03988225763461742,
+      "warmup_runs": 64
+     },
+     "dump_bytes": 65141,
+     "capture_pickle_bytes": 217801,
+     "capture_pickle_sha256": "3426db2bea690920",
+     "nodes": 493,
+     "frames": 14,
+     "truncation": [
+      [
+       "max_items",
+       9
+      ],
+      [
+       "max_depth",
+       21
+      ],
+      [
+       "unsupported_type",
+       55
+      ]
+     ],
+     "rss_after_setup_mb": 31.53125,
+     "peak_rss_mb": 35.25
+    },
+    {
+     "workload": "d_stdlib_embedall",
+     "description": "14 frames through argparse.py and json/*.py; embed_source_lines=None",
+     "impl": "legacy",
+     "options": {
+      "embed_source_lines": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 77,
+      "sampled_s": 0.5007,
+      "median_ms": 6.377959012752399,
+      "min_ms": 5.7547499891370535,
+      "mean_ms": 6.502515689678514,
+      "p25_ms": 6.079624989069998,
+      "p75_ms": 6.706624990329146,
+      "iqr_pct": 9.830731116419752,
+      "stdev_ms": 0.6050528820593698,
+      "warmup_runs": 16
+     },
+     "capture": {
+      "runs": 308,
+      "sampled_s": 0.501,
+      "median_ms": 1.5995829890016466,
+      "min_ms": 1.4780409983359277,
+      "mean_ms": 1.626697915467107,
+      "p25_ms": 1.5595102595398203,
+      "p75_ms": 1.6581150121055543,
+      "iqr_pct": 6.164403675440223,
+      "stdev_ms": 0.0994868394974062,
+      "warmup_runs": 57
+     },
+     "dump_bytes": 65141,
+     "capture_pickle_bytes": 217801,
+     "capture_pickle_sha256": "3426db2bea690920",
+     "nodes": 493,
+     "frames": 14,
+     "truncation": [
+      [
+       "max_items",
+       9
+      ],
+      [
+       "max_depth",
+       21
+      ],
+      [
+       "unsupported_type",
+       55
+      ]
+     ],
+     "rss_after_setup_mb": 31.703125,
+     "peak_rss_mb": 35.53125
+    }
+   ]
+  },
+  "e_namespace_heavy": {
+   "save_median_ms": 8.020854511414655,
+   "save_round_medians_ms": [
+    7.809000002453104,
+    8.020854511414655,
+    8.458999509457499
+   ],
+   "save_round_spread_pct": 8.103868560131174,
+   "save_iqr_pct": 2.6086872119210307,
+   "save_runs": [
+    64,
+    62,
+    58
+   ],
+   "capture_median_ms": 6.601874978514388,
+   "capture_round_medians_ms": [
+    6.482875003712252,
+    6.605416972888634,
+    6.601874978514388
+   ],
+   "capture_round_spread_pct": 1.8561691879229936,
+   "capture_iqr_pct": 2.1578417019385365,
+   "capture_runs": [
+    77,
+    75,
+    75
+   ],
+   "peak_rss_mb": 47.96875,
+   "rss_after_setup_mb": 45.078125,
+   "description": "21 frames, 20 modules of ~300 functions/classes/modules each; defaults",
+   "options": {},
+   "dump_bytes": 9062,
+   "capture_pickle_bytes": 131766,
+   "capture_pickle_sha256": "035d91a40c9ee778",
+   "nodes": 3352,
+   "frames": 21,
+   "truncation": [
+    [
+     "max_items",
+     41
+    ],
+    [
+     "unsupported_type",
+     360
+    ],
+    [
+     "max_depth",
+     44
+    ]
+   ],
+   "walker": "absent (no _walker attribute)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "e_namespace_heavy",
+     "description": "21 frames, 20 modules of ~300 functions/classes/modules each; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 64,
+      "sampled_s": 0.5009,
+      "median_ms": 7.809000002453104,
+      "min_ms": 7.608999992953613,
+      "mean_ms": 7.826875686987478,
+      "p25_ms": 7.735125487670302,
+      "p75_ms": 7.867093489039689,
+      "iqr_pct": 1.6899475134835542,
+      "stdev_ms": 0.14079898900265347,
+      "warmup_runs": 13
+     },
+     "capture": {
+      "runs": 77,
+      "sampled_s": 0.5041,
+      "median_ms": 6.482875003712252,
+      "min_ms": 6.263290997594595,
+      "mean_ms": 6.546798195045852,
+      "p25_ms": 6.411208014469594,
+      "p75_ms": 6.546833988977596,
+      "iqr_pct": 2.0920652400414887,
+      "stdev_ms": 0.5131185827324594,
+      "warmup_runs": 15
+     },
+     "dump_bytes": 9062,
+     "capture_pickle_bytes": 131766,
+     "capture_pickle_sha256": "035d91a40c9ee778",
+     "nodes": 3352,
+     "frames": 21,
+     "truncation": [
+      [
+       "max_items",
+       41
+      ],
+      [
+       "unsupported_type",
+       360
+      ],
+      [
+       "max_depth",
+       44
+      ]
+     ],
+     "rss_after_setup_mb": 45.0625,
+     "peak_rss_mb": 47.421875
+    },
+    {
+     "workload": "e_namespace_heavy",
+     "description": "21 frames, 20 modules of ~300 functions/classes/modules each; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 62,
+      "sampled_s": 0.5031,
+      "median_ms": 8.020854511414655,
+      "min_ms": 7.751249999273568,
+      "mean_ms": 8.114788949774999,
+      "p25_ms": 7.908583742391784,
+      "p75_ms": 8.117822748317849,
+      "iqr_pct": 2.6086872119210307,
+      "stdev_ms": 0.37961856080738443,
+      "warmup_runs": 13
+     },
+     "capture": {
+      "runs": 75,
+      "sampled_s": 0.5028,
+      "median_ms": 6.605416972888634,
+      "min_ms": 6.472958019003272,
+      "mean_ms": 6.704250025019671,
+      "p25_ms": 6.542833492858335,
+      "p75_ms": 6.745833496097475,
+      "iqr_pct": 3.073235256340909,
+      "stdev_ms": 0.5298494539475053,
+      "warmup_runs": 14
+     },
+     "dump_bytes": 9062,
+     "capture_pickle_bytes": 131766,
+     "capture_pickle_sha256": "035d91a40c9ee778",
+     "nodes": 3352,
+     "frames": 21,
+     "truncation": [
+      [
+       "max_items",
+       41
+      ],
+      [
+       "unsupported_type",
+       360
+      ],
+      [
+       "max_depth",
+       44
+      ]
+     ],
+     "rss_after_setup_mb": 45.078125,
+     "peak_rss_mb": 47.9375
+    },
+    {
+     "workload": "e_namespace_heavy",
+     "description": "21 frames, 20 modules of ~300 functions/classes/modules each; defaults",
+     "impl": "legacy",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/legacy_pkg/pydumpling/__init__.py",
+     "package_digest": "f135b4d4f3cf",
+     "native_hook": false,
+     "native_file": null,
+     "walker": "absent (no _walker attribute)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 58,
+      "sampled_s": 0.5065,
+      "median_ms": 8.458999509457499,
+      "min_ms": 8.114500000374392,
+      "mean_ms": 8.73245606961628,
+      "p25_ms": 8.265593241958413,
+      "p75_ms": 8.912927252822556,
+      "iqr_pct": 7.652607263310479,
+      "stdev_ms": 0.7358682628782671,
+      "warmup_runs": 12
+     },
+     "capture": {
+      "runs": 75,
+      "sampled_s": 0.5011,
+      "median_ms": 6.601874978514388,
+      "min_ms": 6.4428749901708215,
+      "mean_ms": 6.681515534486,
+      "p25_ms": 6.543062496348284,
+      "p75_ms": 6.6855205077445135,
+      "iqr_pct": 2.1578417019385365,
+      "stdev_ms": 0.48618892353981463,
+      "warmup_runs": 15
+     },
+     "dump_bytes": 9060,
+     "capture_pickle_bytes": 131766,
+     "capture_pickle_sha256": "035d91a40c9ee778",
+     "nodes": 3352,
+     "frames": 21,
+     "truncation": [
+      [
+       "max_items",
+       41
+      ],
+      [
+       "unsupported_type",
+       360
+      ],
+      [
+       "max_depth",
+       44
+      ]
+     ],
+     "rss_after_setup_mb": 44.9375,
+     "peak_rss_mb": 47.96875
+    }
+   ]
+  }
+ }
+}

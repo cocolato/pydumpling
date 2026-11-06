@@ -1,0 +1,1430 @@
+{
+ "meta": {
+  "impl": "native",
+  "argv": [
+   "rust/bench/bench_walk.py",
+   "--impl",
+   "native",
+   "--tmpdir",
+   "/private/tmp/claude-501/-Users-loyd-codefiles-pydumpling/c5baec2a-4985-4af2-b96b-7f8f37ee71d2/scratchpad/bench",
+   "--rounds",
+   "3",
+   "--json",
+   "rust/bench/results/pgo_lto.json"
+  ],
+  "started": "2026-11-06T05:38:11+0000",
+  "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "cpu": "Apple M5 Pro",
+  "cpu_count": 15,
+  "loadavg_start": [
+   5.06689453125,
+   4.5283203125,
+   4.3095703125
+  ],
+  "root": "/Users/loyd/codefiles/pydumpling",
+  "hash_seed": 0,
+  "min_runs": 15,
+  "min_time_s": 0.5,
+  "warmup_runs": 3,
+  "warmup_time_s": 0.1,
+  "rounds": 3,
+  "rss_unit": "MB = 2**20 bytes, from ru_maxrss",
+  "loadavg_end": [
+   4.95947265625,
+   4.541015625,
+   4.31884765625
+  ],
+  "python": "3.13.18",
+  "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+  "package_digest": "b6e29d3d2316"
+ },
+ "suite": {
+  "save_ms": 33.070958001189865,
+  "capture_ms": 9.290729474741966,
+  "max_peak_rss_mb": 61.9375,
+  "save_geomean_ms": 2.1612889852587513,
+  "capture_geomean_ms": 0.7143979854155361,
+  "save_ms_per_round": [
+   33.266833517700434,
+   33.34056148014497,
+   32.848665985511616
+  ],
+  "save_spread_pct": 1.4786363552504305
+ },
+ "workloads": {
+  "a_typical": {
+   "save_median_ms": 0.44291699305176735,
+   "save_round_medians_ms": [
+    0.43650000588968396,
+    0.47354097478091717,
+    0.44291699305176735
+   ],
+   "save_round_spread_pct": 8.362959532443119,
+   "save_iqr_pct": 13.48074634366356,
+   "save_runs": [
+    1104,
+    1003,
+    1071
+   ],
+   "capture_median_ms": 0.11449999874457717,
+   "capture_round_medians_ms": [
+    0.11449999874457717,
+    0.11691701365634799,
+    0.11333401198498905
+   ],
+   "capture_round_spread_pct": 3.129259135933953,
+   "capture_iqr_pct": 3.6393005930064386,
+   "capture_runs": [
+    4297,
+    4125,
+    4352
+   ],
+   "peak_rss_mb": 35.359375,
+   "rss_after_setup_mb": 32.15625,
+   "description": "4 frames, ~12 small locals, realistic module globals; defaults",
+   "options": {},
+   "dump_bytes": 4261,
+   "capture_pickle_bytes": 9547,
+   "capture_pickle_sha256": "2fcbd1751ae09e3d",
+   "nodes": 216,
+   "frames": 4,
+   "truncation": [
+    [
+     "unsupported_type",
+     16
+    ],
+    [
+     "max_depth",
+     4
+    ]
+   ],
+   "walker": "set (Walker)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "a_typical",
+     "description": "4 frames, ~12 small locals, realistic module globals; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 1104,
+      "sampled_s": 0.5002,
+      "median_ms": 0.43650000588968396,
+      "min_ms": 0.3989999822806567,
+      "mean_ms": 0.45312054778375,
+      "p25_ms": 0.42745874816318974,
+      "p75_ms": 0.45875048817833886,
+      "iqr_pct": 7.168783411897006,
+      "stdev_ms": 0.11564669708895654,
+      "warmup_runs": 219
+     },
+     "capture": {
+      "runs": 4297,
+      "sampled_s": 0.5001,
+      "median_ms": 0.11449999874457717,
+      "min_ms": 0.10320800356566906,
+      "mean_ms": 0.11638658744647573,
+      "p25_ms": 0.11283298954367638,
+      "p75_ms": 0.11699998867698014,
+      "iqr_pct": 3.6393005930064386,
+      "stdev_ms": 0.009901562135530298,
+      "warmup_runs": 870
+     },
+     "dump_bytes": 4261,
+     "capture_pickle_bytes": 9547,
+     "capture_pickle_sha256": "2fcbd1751ae09e3d",
+     "nodes": 216,
+     "frames": 4,
+     "truncation": [
+      [
+       "unsupported_type",
+       16
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 32.0625,
+     "peak_rss_mb": 35.15625
+    },
+    {
+     "workload": "a_typical",
+     "description": "4 frames, ~12 small locals, realistic module globals; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 1003,
+      "sampled_s": 0.5005,
+      "median_ms": 0.47354097478091717,
+      "min_ms": 0.4125419945921749,
+      "mean_ms": 0.4989859784543812,
+      "p25_ms": 0.449937506346032,
+      "p75_ms": 0.5183744942769408,
+      "iqr_pct": 14.4521787079927,
+      "stdev_ms": 0.09748900662965872,
+      "warmup_runs": 213
+     },
+     "capture": {
+      "runs": 4125,
+      "sampled_s": 0.5001,
+      "median_ms": 0.11691701365634799,
+      "min_ms": 0.10545799159444869,
+      "mean_ms": 0.12123859965129559,
+      "p25_ms": 0.11441699462011456,
+      "p75_ms": 0.12045798939652741,
+      "iqr_pct": 5.166908209073,
+      "stdev_ms": 0.019714194663220594,
+      "warmup_runs": 787
+     },
+     "dump_bytes": 4262,
+     "capture_pickle_bytes": 9547,
+     "capture_pickle_sha256": "2fcbd1751ae09e3d",
+     "nodes": 216,
+     "frames": 4,
+     "truncation": [
+      [
+       "unsupported_type",
+       16
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 32.03125,
+     "peak_rss_mb": 35.359375
+    },
+    {
+     "workload": "a_typical",
+     "description": "4 frames, ~12 small locals, realistic module globals; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 1071,
+      "sampled_s": 0.5002,
+      "median_ms": 0.44291699305176735,
+      "min_ms": 0.4047499969601631,
+      "mean_ms": 0.4669941010822765,
+      "p25_ms": 0.43045799247920513,
+      "p75_ms": 0.49016650882549584,
+      "iqr_pct": 13.48074634366356,
+      "stdev_ms": 0.05528805806339574,
+      "warmup_runs": 203
+     },
+     "capture": {
+      "runs": 4352,
+      "sampled_s": 0.5001,
+      "median_ms": 0.11333401198498905,
+      "min_ms": 0.10883397771976888,
+      "mean_ms": 0.11490691445835503,
+      "p25_ms": 0.11220801388844848,
+      "p75_ms": 0.11462499969638884,
+      "iqr_pct": 2.1326217660595046,
+      "stdev_ms": 0.009612796036673385,
+      "warmup_runs": 867
+     },
+     "dump_bytes": 4261,
+     "capture_pickle_bytes": 9547,
+     "capture_pickle_sha256": "2fcbd1751ae09e3d",
+     "nodes": 216,
+     "frames": 4,
+     "truncation": [
+      [
+       "unsupported_type",
+       16
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 32.15625,
+     "peak_rss_mb": 35.234375
+    }
+   ]
+  },
+  "b_heavy_default": {
+   "save_median_ms": 0.9496659913565964,
+   "save_round_medians_ms": [
+    0.9701459930511191,
+    0.9437920234631747,
+    0.9496659913565964
+   ],
+   "save_round_spread_pct": 2.7750777460502554,
+   "save_iqr_pct": 6.207158089891053,
+   "save_runs": [
+    508,
+    523,
+    515
+   ],
+   "capture_median_ms": 0.43583399383351207,
+   "capture_round_medians_ms": [
+    0.4469590203370899,
+    0.433833003626205,
+    0.43583399383351207
+   ],
+   "capture_round_spread_pct": 3.01170099088209,
+   "capture_iqr_pct": 3.495994351683508,
+   "capture_runs": [
+    1091,
+    1136,
+    1141
+   ],
+   "peak_rss_mb": 42.21875,
+   "rss_after_setup_mb": 39.65625,
+   "description": "50k-int list, 20k str->list dict, nested dict, 100 KB str; defaults",
+   "options": {},
+   "dump_bytes": 5363,
+   "capture_pickle_bytes": 49183,
+   "capture_pickle_sha256": "7bfb906a56af0540",
+   "nodes": 3698,
+   "frames": 3,
+   "truncation": [
+    [
+     "max_items",
+     3
+    ],
+    [
+     "max_string_bytes",
+     1
+    ],
+    [
+     "unsupported_type",
+     14
+    ],
+    [
+     "max_depth",
+     4
+    ]
+   ],
+   "walker": "set (Walker)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "b_heavy_default",
+     "description": "50k-int list, 20k str->list dict, nested dict, 100 KB str; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 508,
+      "sampled_s": 0.5,
+      "median_ms": 0.9701459930511191,
+      "min_ms": 0.9107909863814712,
+      "mean_ms": 0.9842679551005085,
+      "p25_ms": 0.9474482430960052,
+      "p75_ms": 1.0076667385874316,
+      "iqr_pct": 6.207158089891053,
+      "stdev_ms": 0.053944000781427456,
+      "warmup_runs": 91
+     },
+     "capture": {
+      "runs": 1091,
+      "sampled_s": 0.5004,
+      "median_ms": 0.4469590203370899,
+      "min_ms": 0.4244169977027923,
+      "mean_ms": 0.45868637115271177,
+      "p25_ms": 0.4395419964566827,
+      "p75_ms": 0.4627705056918785,
+      "iqr_pct": 5.197010951401588,
+      "stdev_ms": 0.03497057549072457,
+      "warmup_runs": 225
+     },
+     "dump_bytes": 5363,
+     "capture_pickle_bytes": 49183,
+     "capture_pickle_sha256": "7bfb906a56af0540",
+     "nodes": 3698,
+     "frames": 3,
+     "truncation": [
+      [
+       "max_items",
+       3
+      ],
+      [
+       "max_string_bytes",
+       1
+      ],
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 39.640625,
+     "peak_rss_mb": 42.21875
+    },
+    {
+     "workload": "b_heavy_default",
+     "description": "50k-int list, 20k str->list dict, nested dict, 100 KB str; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 523,
+      "sampled_s": 0.5005,
+      "median_ms": 0.9437920234631747,
+      "min_ms": 0.8927909948397428,
+      "mean_ms": 0.9569492594300667,
+      "p25_ms": 0.923917003092356,
+      "p75_ms": 0.9751460020197555,
+      "iqr_pct": 5.427996598171969,
+      "stdev_ms": 0.04815769761483598,
+      "warmup_runs": 100
+     },
+     "capture": {
+      "runs": 1136,
+      "sampled_s": 0.5001,
+      "median_ms": 0.433833003626205,
+      "min_ms": 0.4173749766778201,
+      "mean_ms": 0.4401945690761737,
+      "p25_ms": 0.42703148938016966,
+      "p75_ms": 0.4421982666826807,
+      "iqr_pct": 3.495994351683508,
+      "stdev_ms": 0.023355400154180698,
+      "warmup_runs": 231
+     },
+     "dump_bytes": 5364,
+     "capture_pickle_bytes": 49183,
+     "capture_pickle_sha256": "7bfb906a56af0540",
+     "nodes": 3698,
+     "frames": 3,
+     "truncation": [
+      [
+       "max_items",
+       3
+      ],
+      [
+       "max_string_bytes",
+       1
+      ],
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 39.65625,
+     "peak_rss_mb": 42.03125
+    },
+    {
+     "workload": "b_heavy_default",
+     "description": "50k-int list, 20k str->list dict, nested dict, 100 KB str; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 515,
+      "sampled_s": 0.5001,
+      "median_ms": 0.9496659913565964,
+      "min_ms": 0.8999580168165267,
+      "mean_ms": 0.9710337378952688,
+      "p25_ms": 0.9282289975089952,
+      "p75_ms": 0.991604509181343,
+      "iqr_pct": 6.673452798053342,
+      "stdev_ms": 0.06187913638551412,
+      "warmup_runs": 100
+     },
+     "capture": {
+      "runs": 1141,
+      "sampled_s": 0.5004,
+      "median_ms": 0.43583399383351207,
+      "min_ms": 0.42141700396314263,
+      "mean_ms": 0.43855885457570726,
+      "p25_ms": 0.43133299914188683,
+      "p75_ms": 0.44054200407117605,
+      "iqr_pct": 2.1129615999634592,
+      "stdev_ms": 0.012164327235218472,
+      "warmup_runs": 229
+     },
+     "dump_bytes": 5365,
+     "capture_pickle_bytes": 49183,
+     "capture_pickle_sha256": "7bfb906a56af0540",
+     "nodes": 3698,
+     "frames": 3,
+     "truncation": [
+      [
+       "max_items",
+       3
+      ],
+      [
+       "max_string_bytes",
+       1
+      ],
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 39.5625,
+     "peak_rss_mb": 41.9375
+    }
+   ]
+  },
+  "b2_heavy_nolimits": {
+   "save_median_ms": 22.464708497864194,
+   "save_round_medians_ms": [
+    22.70806250453461,
+    22.44777099986095,
+    22.464708497864194
+   ],
+   "save_round_spread_pct": 1.1586685164350417,
+   "save_iqr_pct": 2.491545766811295,
+   "save_runs": [
+    22,
+    22,
+    22
+   ],
+   "capture_median_ms": 5.803374981041998,
+   "capture_round_medians_ms": [
+    5.721062509110197,
+    6.2819169979775324,
+    5.803374981041998
+   ],
+   "capture_round_spread_pct": 9.664281400038593,
+   "capture_iqr_pct": 7.146341625117277,
+   "capture_runs": [
+    86,
+    78,
+    83
+   ],
+   "peak_rss_mb": 61.9375,
+   "rss_after_setup_mb": 39.609375,
+   "description": "same locals; max_items/max_nodes/max_depth/max_string_bytes=None",
+   "options": {
+    "max_items": null,
+    "max_nodes": null,
+    "max_depth": null,
+    "max_string_bytes": null
+   },
+   "dump_bytes": 228915,
+   "capture_pickle_bytes": 793365,
+   "capture_pickle_sha256": "01714d09559e3de6",
+   "nodes": 152643,
+   "frames": 3,
+   "truncation": [
+    [
+     "unsupported_type",
+     15
+    ]
+   ],
+   "walker": "set (Walker)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "b2_heavy_nolimits",
+     "description": "same locals; max_items/max_nodes/max_depth/max_string_bytes=None",
+     "impl": "native",
+     "options": {
+      "max_items": null,
+      "max_nodes": null,
+      "max_depth": null,
+      "max_string_bytes": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 22,
+      "sampled_s": 0.5064,
+      "median_ms": 22.70806250453461,
+      "min_ms": 22.167791990796104,
+      "mean_ms": 23.01903976926538,
+      "p25_ms": 22.481728738057427,
+      "p75_ms": 23.27572924696142,
+      "iqr_pct": 3.496557703879123,
+      "stdev_ms": 0.9265231453168259,
+      "warmup_runs": 5
+     },
+     "capture": {
+      "runs": 86,
+      "sampled_s": 0.5059,
+      "median_ms": 5.721062509110197,
+      "min_ms": 5.423124996013939,
+      "mean_ms": 5.882028092326986,
+      "p25_ms": 5.586364488408435,
+      "p75_ms": 5.861583260411862,
+      "iqr_pct": 4.81062340369765,
+      "stdev_ms": 0.6953410276762212,
+      "warmup_runs": 17
+     },
+     "dump_bytes": 228915,
+     "capture_pickle_bytes": 793365,
+     "capture_pickle_sha256": "01714d09559e3de6",
+     "nodes": 152643,
+     "frames": 3,
+     "truncation": [
+      [
+       "unsupported_type",
+       15
+      ]
+     ],
+     "rss_after_setup_mb": 39.53125,
+     "peak_rss_mb": 61.109375
+    },
+    {
+     "workload": "b2_heavy_nolimits",
+     "description": "same locals; max_items/max_nodes/max_depth/max_string_bytes=None",
+     "impl": "native",
+     "options": {
+      "max_items": null,
+      "max_nodes": null,
+      "max_depth": null,
+      "max_string_bytes": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 22,
+      "sampled_s": 0.5028,
+      "median_ms": 22.44777099986095,
+      "min_ms": 21.975542011205107,
+      "mean_ms": 22.853587136275813,
+      "p25_ms": 22.364572498190682,
+      "p75_ms": 22.87986500596162,
+      "iqr_pct": 2.295517482667339,
+      "stdev_ms": 0.9594287296751253,
+      "warmup_runs": 5
+     },
+     "capture": {
+      "runs": 78,
+      "sampled_s": 0.5032,
+      "median_ms": 6.2819169979775324,
+      "min_ms": 5.696999985957518,
+      "mean_ms": 6.4512718821881725,
+      "p25_ms": 6.001031237246934,
+      "p75_ms": 6.515322995255701,
+      "iqr_pct": 8.186860128434418,
+      "stdev_ms": 0.860501668438326,
+      "warmup_runs": 17
+     },
+     "dump_bytes": 228913,
+     "capture_pickle_bytes": 793365,
+     "capture_pickle_sha256": "01714d09559e3de6",
+     "nodes": 152643,
+     "frames": 3,
+     "truncation": [
+      [
+       "unsupported_type",
+       15
+      ]
+     ],
+     "rss_after_setup_mb": 39.609375,
+     "peak_rss_mb": 61.9375
+    },
+    {
+     "workload": "b2_heavy_nolimits",
+     "description": "same locals; max_items/max_nodes/max_depth/max_string_bytes=None",
+     "impl": "native",
+     "options": {
+      "max_items": null,
+      "max_nodes": null,
+      "max_depth": null,
+      "max_string_bytes": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 22,
+      "sampled_s": 0.5037,
+      "median_ms": 22.464708497864194,
+      "min_ms": 22.131915990030393,
+      "mean_ms": 22.895259408290837,
+      "p25_ms": 22.322395750961732,
+      "p75_ms": 22.882114244566765,
+      "iqr_pct": 2.491545766811295,
+      "stdev_ms": 1.174219634268264,
+      "warmup_runs": 5
+     },
+     "capture": {
+      "runs": 83,
+      "sampled_s": 0.5008,
+      "median_ms": 5.803374981041998,
+      "min_ms": 5.442124995170161,
+      "mean_ms": 6.0338548781541,
+      "p25_ms": 5.638145987177268,
+      "p75_ms": 6.052874989109114,
+      "iqr_pct": 7.146341625117277,
+      "stdev_ms": 0.7539696091524247,
+      "warmup_runs": 17
+     },
+     "dump_bytes": 228916,
+     "capture_pickle_bytes": 793365,
+     "capture_pickle_sha256": "01714d09559e3de6",
+     "nodes": 152643,
+     "frames": 3,
+     "truncation": [
+      [
+       "unsupported_type",
+       15
+      ]
+     ],
+     "rss_after_setup_mb": 39.578125,
+     "peak_rss_mb": 61.765625
+    }
+   ]
+  },
+  "c_deep": {
+   "save_median_ms": 0.6481455056928098,
+   "save_round_medians_ms": [
+    0.6530829996336251,
+    0.6481455056928098,
+    0.6382499996107072
+   ],
+   "save_round_spread_pct": 2.2885293337123165,
+   "save_iqr_pct": 5.607380250928262,
+   "save_runs": [
+    755,
+    756,
+    757
+   ],
+   "capture_median_ms": 0.26960449758917093,
+   "capture_round_medians_ms": [
+    0.2702919882722199,
+    0.26960449758917093,
+    0.2619589795358479
+   ],
+   "capture_round_spread_pct": 3.090827048838781,
+   "capture_iqr_pct": 3.1180790496937454,
+   "capture_runs": [
+    1819,
+    1786,
+    1895
+   ],
+   "peak_rss_mb": 35.171875,
+   "rss_after_setup_mb": 31.984375,
+   "description": "62 frames, 3-4 small locals each; defaults",
+   "options": {},
+   "dump_bytes": 4116,
+   "capture_pickle_bytes": 13990,
+   "capture_pickle_sha256": "2f3f7f649e99f814",
+   "nodes": 467,
+   "frames": 62,
+   "truncation": [
+    [
+     "unsupported_type",
+     14
+    ],
+    [
+     "max_depth",
+     4
+    ]
+   ],
+   "walker": "set (Walker)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "c_deep",
+     "description": "62 frames, 3-4 small locals each; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 755,
+      "sampled_s": 0.5,
+      "median_ms": 0.6530829996336251,
+      "min_ms": 0.6139159959275275,
+      "mean_ms": 0.6623029113293853,
+      "p25_ms": 0.6413335067918524,
+      "p75_ms": 0.6724584964103997,
+      "iqr_pct": 4.765855126531873,
+      "stdev_ms": 0.050685869695574634,
+      "warmup_runs": 147
+     },
+     "capture": {
+      "runs": 1819,
+      "sampled_s": 0.5001,
+      "median_ms": 0.2702919882722199,
+      "min_ms": 0.2538750122766942,
+      "mean_ms": 0.2749180107475005,
+      "p25_ms": 0.2667084918357432,
+      "p75_ms": 0.2758330083452165,
+      "iqr_pct": 3.3757998406833,
+      "stdev_ms": 0.016794146765513784,
+      "warmup_runs": 373
+     },
+     "dump_bytes": 4116,
+     "capture_pickle_bytes": 13990,
+     "capture_pickle_sha256": "2f3f7f649e99f814",
+     "nodes": 467,
+     "frames": 62,
+     "truncation": [
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 31.9375,
+     "peak_rss_mb": 35.015625
+    },
+    {
+     "workload": "c_deep",
+     "description": "62 frames, 3-4 small locals each; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 756,
+      "sampled_s": 0.5004,
+      "median_ms": 0.6481455056928098,
+      "min_ms": 0.6067079957574606,
+      "mean_ms": 0.6618700870257314,
+      "p25_ms": 0.6348017559503205,
+      "p75_ms": 0.6711457390338182,
+      "iqr_pct": 5.607380250928262,
+      "stdev_ms": 0.06295593986531357,
+      "warmup_runs": 145
+     },
+     "capture": {
+      "runs": 1786,
+      "sampled_s": 0.5002,
+      "median_ms": 0.26960449758917093,
+      "min_ms": 0.2566250041127205,
+      "mean_ms": 0.2800453022945764,
+      "p25_ms": 0.26583326689433306,
+      "p75_ms": 0.2742397482506931,
+      "iqr_pct": 3.1180790496937454,
+      "stdev_ms": 0.03846103498709514,
+      "warmup_runs": 373
+     },
+     "dump_bytes": 4116,
+     "capture_pickle_bytes": 13990,
+     "capture_pickle_sha256": "2f3f7f649e99f814",
+     "nodes": 467,
+     "frames": 62,
+     "truncation": [
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 31.984375,
+     "peak_rss_mb": 35.171875
+    },
+    {
+     "workload": "c_deep",
+     "description": "62 frames, 3-4 small locals each; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 757,
+      "sampled_s": 0.5001,
+      "median_ms": 0.6382499996107072,
+      "min_ms": 0.6060419837012887,
+      "mean_ms": 0.6606324483647259,
+      "p25_ms": 0.6293329934123904,
+      "p75_ms": 0.6664170068688691,
+      "iqr_pct": 5.810264548233084,
+      "stdev_ms": 0.05663769564839943,
+      "warmup_runs": 151
+     },
+     "capture": {
+      "runs": 1895,
+      "sampled_s": 0.5,
+      "median_ms": 0.2619589795358479,
+      "min_ms": 0.2552499936427921,
+      "mean_ms": 0.2638621434525127,
+      "p25_ms": 0.26020800578407943,
+      "p75_ms": 0.2648954978212714,
+      "iqr_pct": 1.789399258424934,
+      "stdev_ms": 0.0075548549475013115,
+      "warmup_runs": 379
+     },
+     "dump_bytes": 4116,
+     "capture_pickle_bytes": 13990,
+     "capture_pickle_sha256": "2f3f7f649e99f814",
+     "nodes": 467,
+     "frames": 62,
+     "truncation": [
+      [
+       "unsupported_type",
+       14
+      ],
+      [
+       "max_depth",
+       4
+      ]
+     ],
+     "rss_after_setup_mb": 31.9375,
+     "peak_rss_mb": 35.046875
+    }
+   ]
+  },
+  "d_stdlib_embedall": {
+   "save_median_ms": 5.586542014498264,
+   "save_round_medians_ms": [
+    5.586542014498264,
+    5.848332977620885,
+    5.355416491511278
+   ],
+   "save_round_spread_pct": 8.823284329203716,
+   "save_iqr_pct": 4.109427934227754,
+   "save_runs": [
+    89,
+    85,
+    94
+   ],
+   "capture_median_ms": 1.0576659988146275,
+   "capture_round_medians_ms": [
+    1.0321664885850623,
+    1.0725215106504038,
+    1.0576659988146275
+   ],
+   "capture_round_spread_pct": 3.815478809999481,
+   "capture_iqr_pct": 4.648632663483442,
+   "capture_runs": [
+    480,
+    458,
+    467
+   ],
+   "peak_rss_mb": 38.46875,
+   "rss_after_setup_mb": 32.453125,
+   "description": "14 frames through argparse.py and json/*.py; embed_source_lines=None",
+   "options": {
+    "embed_source_lines": null
+   },
+   "dump_bytes": 65121,
+   "capture_pickle_bytes": 217801,
+   "capture_pickle_sha256": "3426db2bea690920",
+   "nodes": 493,
+   "frames": 14,
+   "truncation": [
+    [
+     "max_items",
+     9
+    ],
+    [
+     "max_depth",
+     21
+    ],
+    [
+     "unsupported_type",
+     55
+    ]
+   ],
+   "walker": "set (Walker)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "d_stdlib_embedall",
+     "description": "14 frames through argparse.py and json/*.py; embed_source_lines=None",
+     "impl": "native",
+     "options": {
+      "embed_source_lines": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 89,
+      "sampled_s": 0.5013,
+      "median_ms": 5.586542014498264,
+      "min_ms": 5.329416977474466,
+      "mean_ms": 5.632974304196038,
+      "p25_ms": 5.459834006614983,
+      "p75_ms": 5.710124998586252,
+      "iqr_pct": 4.48024898625502,
+      "stdev_ms": 0.2331082399306688,
+      "warmup_runs": 17
+     },
+     "capture": {
+      "runs": 480,
+      "sampled_s": 0.5001,
+      "median_ms": 1.0321664885850623,
+      "min_ms": 0.9976249712053686,
+      "mean_ms": 1.0418914832674393,
+      "p25_ms": 1.0211670014541596,
+      "p75_ms": 1.0518545022932813,
+      "iqr_pct": 2.973115401294356,
+      "stdev_ms": 0.032723004618916016,
+      "warmup_runs": 95
+     },
+     "dump_bytes": 65121,
+     "capture_pickle_bytes": 217801,
+     "capture_pickle_sha256": "3426db2bea690920",
+     "nodes": 493,
+     "frames": 14,
+     "truncation": [
+      [
+       "max_items",
+       9
+      ],
+      [
+       "max_depth",
+       21
+      ],
+      [
+       "unsupported_type",
+       55
+      ]
+     ],
+     "rss_after_setup_mb": 31.9375,
+     "peak_rss_mb": 37.046875
+    },
+    {
+     "workload": "d_stdlib_embedall",
+     "description": "14 frames through argparse.py and json/*.py; embed_source_lines=None",
+     "impl": "native",
+     "options": {
+      "embed_source_lines": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 85,
+      "sampled_s": 0.502,
+      "median_ms": 5.848332977620885,
+      "min_ms": 5.600374977802858,
+      "mean_ms": 5.9059495185091,
+      "p25_ms": 5.762207991210744,
+      "p75_ms": 6.00254102027975,
+      "iqr_pct": 4.109427934227754,
+      "stdev_ms": 0.2345096584177261,
+      "warmup_runs": 16
+     },
+     "capture": {
+      "runs": 458,
+      "sampled_s": 0.5001,
+      "median_ms": 1.0725215106504038,
+      "min_ms": 1.01495799026452,
+      "mean_ms": 1.091941319343504,
+      "p25_ms": 1.0473859947524033,
+      "p75_ms": 1.115687504352536,
+      "iqr_pct": 6.368311397196403,
+      "stdev_ms": 0.07016019201690872,
+      "warmup_runs": 82
+     },
+     "dump_bytes": 65119,
+     "capture_pickle_bytes": 217801,
+     "capture_pickle_sha256": "3426db2bea690920",
+     "nodes": 493,
+     "frames": 14,
+     "truncation": [
+      [
+       "max_items",
+       9
+      ],
+      [
+       "max_depth",
+       21
+      ],
+      [
+       "unsupported_type",
+       55
+      ]
+     ],
+     "rss_after_setup_mb": 32.453125,
+     "peak_rss_mb": 38.46875
+    },
+    {
+     "workload": "d_stdlib_embedall",
+     "description": "14 frames through argparse.py and json/*.py; embed_source_lines=None",
+     "impl": "native",
+     "options": {
+      "embed_source_lines": null
+     },
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 94,
+      "sampled_s": 0.5042,
+      "median_ms": 5.355416491511278,
+      "min_ms": 5.135665996931493,
+      "mean_ms": 5.363560264974714,
+      "p25_ms": 5.301781493471935,
+      "p75_ms": 5.413489241618663,
+      "iqr_pct": 2.0858834849500973,
+      "stdev_ms": 0.09701870116331818,
+      "warmup_runs": 18
+     },
+     "capture": {
+      "runs": 467,
+      "sampled_s": 0.5001,
+      "median_ms": 1.0576659988146275,
+      "min_ms": 1.0137089993804693,
+      "mean_ms": 1.0709676014586518,
+      "p25_ms": 1.0389579983893782,
+      "p75_ms": 1.0881250054808334,
+      "iqr_pct": 4.648632663483442,
+      "stdev_ms": 0.04636084931508506,
+      "warmup_runs": 96
+     },
+     "dump_bytes": 65118,
+     "capture_pickle_bytes": 217801,
+     "capture_pickle_sha256": "3426db2bea690920",
+     "nodes": 493,
+     "frames": 14,
+     "truncation": [
+      [
+       "max_items",
+       9
+      ],
+      [
+       "max_depth",
+       21
+      ],
+      [
+       "unsupported_type",
+       55
+      ]
+     ],
+     "rss_after_setup_mb": 32.046875,
+     "peak_rss_mb": 36.96875
+    }
+   ]
+  },
+  "e_namespace_heavy": {
+   "save_median_ms": 2.978978998726234,
+   "save_round_medians_ms": [
+    2.9125000000931323,
+    2.978978998726234,
+    2.997708012117073
+   ],
+   "save_round_spread_pct": 2.8603092556333674,
+   "save_iqr_pct": 5.154500321663585,
+   "save_runs": [
+    169,
+    164,
+    162
+   ],
+   "capture_median_ms": 1.6097500047180802,
+   "capture_round_medians_ms": [
+    1.7094580107368529,
+    1.607354512088932,
+    1.6097500047180802
+   ],
+   "capture_round_spread_pct": 6.342817105057406,
+   "capture_iqr_pct": 4.292737305120336,
+   "capture_runs": [
+    281,
+    296,
+    297
+   ],
+   "peak_rss_mb": 48.046875,
+   "rss_after_setup_mb": 45.484375,
+   "description": "21 frames, 20 modules of ~300 functions/classes/modules each; defaults",
+   "options": {},
+   "dump_bytes": 9042,
+   "capture_pickle_bytes": 131766,
+   "capture_pickle_sha256": "035d91a40c9ee778",
+   "nodes": 3352,
+   "frames": 21,
+   "truncation": [
+    [
+     "max_items",
+     41
+    ],
+    [
+     "unsupported_type",
+     360
+    ],
+    [
+     "max_depth",
+     44
+    ]
+   ],
+   "walker": "set (Walker)",
+   "capture_pickle_stable": true,
+   "rounds": [
+    {
+     "workload": "e_namespace_heavy",
+     "description": "21 frames, 20 modules of ~300 functions/classes/modules each; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 169,
+      "sampled_s": 0.5019,
+      "median_ms": 2.9125000000931323,
+      "min_ms": 2.7145000058226287,
+      "mean_ms": 2.9700044676876414,
+      "p25_ms": 2.859459025785327,
+      "p75_ms": 2.9737920267507434,
+      "iqr_pct": 3.9255965995454227,
+      "stdev_ms": 0.4706516754091543,
+      "warmup_runs": 32
+     },
+     "capture": {
+      "runs": 281,
+      "sampled_s": 0.5009,
+      "median_ms": 1.7094580107368529,
+      "min_ms": 1.5702499949838966,
+      "mean_ms": 1.7826828214479113,
+      "p25_ms": 1.6390839882660657,
+      "p75_ms": 1.795666990801692,
+      "iqr_pct": 9.159803958456518,
+      "stdev_ms": 0.5588787526799961,
+      "warmup_runs": 59
+     },
+     "dump_bytes": 9042,
+     "capture_pickle_bytes": 131766,
+     "capture_pickle_sha256": "035d91a40c9ee778",
+     "nodes": 3352,
+     "frames": 21,
+     "truncation": [
+      [
+       "max_items",
+       41
+      ],
+      [
+       "unsupported_type",
+       360
+      ],
+      [
+       "max_depth",
+       44
+      ]
+     ],
+     "rss_after_setup_mb": 45.453125,
+     "peak_rss_mb": 47.828125
+    },
+    {
+     "workload": "e_namespace_heavy",
+     "description": "21 frames, 20 modules of ~300 functions/classes/modules each; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 164,
+      "sampled_s": 0.5026,
+      "median_ms": 2.978978998726234,
+      "min_ms": 2.7736250194720924,
+      "mean_ms": 3.0649372869137133,
+      "p25_ms": 2.9030005098320544,
+      "p75_ms": 3.0565519919036888,
+      "iqr_pct": 5.154500321663585,
+      "stdev_ms": 0.6005074847502824,
+      "warmup_runs": 33
+     },
+     "capture": {
+      "runs": 296,
+      "sampled_s": 0.5009,
+      "median_ms": 1.607354512088932,
+      "min_ms": 1.5677920018788427,
+      "mean_ms": 1.6923094093775994,
+      "p25_ms": 1.5901669976301491,
+      "p75_ms": 1.6591665043961257,
+      "iqr_pct": 4.292737305120336,
+      "stdev_ms": 0.5351738417240618,
+      "warmup_runs": 59
+     },
+     "dump_bytes": 9041,
+     "capture_pickle_bytes": 131766,
+     "capture_pickle_sha256": "035d91a40c9ee778",
+     "nodes": 3352,
+     "frames": 21,
+     "truncation": [
+      [
+       "max_items",
+       41
+      ],
+      [
+       "unsupported_type",
+       360
+      ],
+      [
+       "max_depth",
+       44
+      ]
+     ],
+     "rss_after_setup_mb": 45.34375,
+     "peak_rss_mb": 47.765625
+    },
+    {
+     "workload": "e_namespace_heavy",
+     "description": "21 frames, 20 modules of ~300 functions/classes/modules each; defaults",
+     "impl": "native",
+     "options": {},
+     "python": "3.13.18",
+     "executable": "/Users/loyd/codefiles/pydumpling/.venv/bin/python",
+     "pydumpling_file": "/Users/loyd/codefiles/pydumpling/pydumpling/__init__.py",
+     "package_digest": "b6e29d3d2316",
+     "native_hook": true,
+     "native_file": "/Users/loyd/codefiles/pydumpling/pydumpling/_native.abi3.so",
+     "walker": "set (Walker)",
+     "hash_seed": "0",
+     "save": {
+      "runs": 162,
+      "sampled_s": 0.5012,
+      "median_ms": 2.997708012117073,
+      "min_ms": 2.768707985524088,
+      "mean_ms": 3.0939886614142766,
+      "p25_ms": 2.898780738178175,
+      "p75_ms": 3.1544899829896167,
+      "iqr_pct": 8.53015850035548,
+      "stdev_ms": 0.5873417307166398,
+      "warmup_runs": 32
+     },
+     "capture": {
+      "runs": 297,
+      "sampled_s": 0.5011,
+      "median_ms": 1.6097500047180802,
+      "min_ms": 1.5575419820379466,
+      "mean_ms": 1.6873248848673708,
+      "p25_ms": 1.5940829762257636,
+      "p75_ms": 1.6569170111324638,
+      "iqr_pct": 3.903341184813635,
+      "stdev_ms": 0.5082159669306254,
+      "warmup_runs": 58
+     },
+     "dump_bytes": 9044,
+     "capture_pickle_bytes": 131766,
+     "capture_pickle_sha256": "035d91a40c9ee778",
+     "nodes": 3352,
+     "frames": 21,
+     "truncation": [
+      [
+       "max_items",
+       41
+      ],
+      [
+       "unsupported_type",
+       360
+      ],
+      [
+       "max_depth",
+       44
+      ]
+     ],
+     "rss_after_setup_mb": 45.484375,
+     "peak_rss_mb": 48.046875
+    }
+   ]
+  }
+ }
+}

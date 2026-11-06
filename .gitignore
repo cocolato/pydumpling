@@ -26,3 +26,11 @@ docs/build/
 *.lock
 !uv.lock
 .python-version
+
+# Optional native walker, built in place by rust/build_native.py
+/pydumpling/_native*.so
+/pydumpling/_native*.pyd
+/rust/target/
+!/rust/Cargo.lock
+# Coverage profiles an instrumented build writes where it runs
+*.profraw
