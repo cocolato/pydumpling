@@ -6,7 +6,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
 
-use crate::statics::{address, type_address};
+use crate::statics::{address, type_address, Statics};
 use crate::walker::{Entry, Halt, Slot, State, Walk};
 
 /// Whether `chars` code points surely fit in `limit` UTF-8 bytes: each takes
@@ -14,6 +14,39 @@ use crate::walker::{Entry, Halt, Slot, State, Walk};
 /// value itself.
 fn surely_fits(chars: usize, limit: u64) -> bool {
     (chars as u128) * 4 <= u128::from(limit)
+}
+
+/// Whether the exact str `value` fits in `limit` UTF-8 bytes, so that
+/// `SnapshotContext._bounded_text` returns it and counts nothing: one that
+/// surely fits, or an ASCII one, a byte per code point, no longer than the
+/// limit. `str.isascii` is C.
+fn fits(py: Python<'_>, value: &Bound<'_, PyAny>, limit: u64) -> PyResult<bool> {
+    let chars = value.len()?;
+    if surely_fits(chars, limit) {
+        return Ok(true);
+    }
+    Ok(chars as u64 <= limit && value.call_method0(intern!(py, "isascii"))?.is_truthy()?)
+}
+
+/// Reads a budget as `DumpOptions` validates it: `Some(None)` for `None`,
+/// `Some(Some(limit))` for a positive exact int, saturated to `u64`, and
+/// `None` for anything the Python walk alone compares as it would.
+pub(crate) fn budget(s: &Statics, value: &Bound<'_, PyAny>) -> Option<Option<u64>> {
+    if value.is_none() {
+        return Some(None);
+    }
+    if type_address(value) != s.int {
+        return None;
+    }
+    match value.extract::<u64>() {
+        Ok(0) => None,
+        Ok(limit) => Some(Some(limit)),
+        // Too big for u64, or negative.
+        Err(_) => match value.gt(0) {
+            Ok(true) => Some(Some(u64::MAX)),
+            _ => None,
+        },
+    }
 }
 
 impl State {
@@ -28,15 +61,33 @@ impl State {
             .is_some_and(|limit| i128::from(depth) >= i128::from(limit))
     }
 
+    /// `self._truncation[reason]`, which counting adds one to. An exact
+    /// int is read without running code; another tally the Python walk
+    /// adds to with its own `__add__`, so the call goes to it.
+    fn tally(&self, py: Python<'_>, reason: &Bound<'_, PyString>) -> Walk<i64> {
+        match self.truncation.bind(py).get_item(reason)? {
+            None => Ok(0),
+            Some(count) if type_address(&count) == self.s.int => match count.extract::<i64>() {
+                Ok(count) if count < i64::MAX => Ok(count),
+                _ => Err(Halt::Bail),
+            },
+            Some(_) => Err(Halt::Bail),
+        }
+    }
+
     /// `self._truncation[reason] += 1`.
     pub(crate) fn count(&self, py: Python<'_>, reason: &Bound<'_, PyString>) -> Walk<()> {
-        let truncation = self.truncation.bind(py);
-        let current: i64 = match truncation.get_item(reason)? {
-            Some(count) => count.extract()?,
-            None => 0,
-        };
-        truncation.set_item(reason, current + 1)?;
+        let current = self.tally(py, reason)?;
+        self.truncation.bind(py).set_item(reason, current + 1)?;
         Ok(())
+    }
+
+    /// Hands the call back before a Python helper that may count `reason`
+    /// runs Python code: a hook or the tally's own `__add__` must run in
+    /// the Python walk alone, not once here and again after a hand-back.
+    fn before_helper(&self, py: Python<'_>, reason: &Bound<'_, PyString>) -> Walk<()> {
+        self.tally(py, reason)?;
+        self.before_python(py)
     }
 
     /// `SnapshotContext._remember`.
@@ -53,13 +104,22 @@ impl State {
             slot: Slot::Value(captured.clone().unbind()),
             original: original.clone().unbind(),
         };
+        let at = self.memo.len();
         if self
             .memo
             .insert(key, entry)
             .is_some_and(|slot| slot < self.mirrored)
         {
-            // `ctx.objects` still holds the copy this one replaces.
-            self.dirty.push(key);
+            // `ctx.objects` still holds the copy this one replaces; the
+            // Python walk writes the original over `_sources`' entry, if it
+            // has one. A lookup that fails, in a key's own `__eq__`, writes
+            // it as for a `_sources` without one.
+            let py = original.py();
+            let held = self
+                .mirror
+                .as_ref()
+                .is_some_and(|(_, sources)| sources.bind(py).contains(key).unwrap_or(false));
+            self.dirty.push((key, at, held));
         }
         captured
     }
@@ -71,7 +131,8 @@ impl State {
         value: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
         match self.max_string_bytes {
-            Some(limit) if !surely_fits(value.len()?, limit) => {
+            Some(limit) if !fits(py, value, limit)? => {
+                self.before_helper(py, intern!(py, "max_string_bytes"))?;
                 Ok(self.ctx(py)?.call_method1(intern!(py, "_text"), (value,))?)
             }
             _ => Ok(value.clone()),
@@ -85,9 +146,12 @@ impl State {
         value: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
         match self.code_text_limit {
-            Some(limit) if !surely_fits(value.len()?, limit) => Ok(self
-                .ctx(py)?
-                .call_method1(intern!(py, "_code_text"), (value,))?),
+            Some(limit) if !fits(py, value, limit)? => {
+                self.before_helper(py, intern!(py, "code_metadata"))?;
+                Ok(self
+                    .ctx(py)?
+                    .call_method1(intern!(py, "_code_text"), (value,))?)
+            }
             _ => Ok(value.clone()),
         }
     }
@@ -112,6 +176,7 @@ impl State {
             return Ok(value.clone());
         }
         let reason = intern!(py, "max_string_bytes");
+        self.before_helper(py, reason)?;
         let args = (value, self.string_limit.bind(py), reason);
         Ok(self
             .ctx(py)?

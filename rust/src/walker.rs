@@ -5,15 +5,21 @@
 //! [`crate::transaction`] runs each call, and [`crate::mirror`] keeps the
 //! walker's memo and the context's `objects` in step.
 
-use pyo3::exceptions::{PyRecursionError, PyReferenceError};
+use std::sync::atomic::AtomicBool;
+
+use pyo3::exceptions::PyRecursionError;
 use pyo3::gc::PyVisit;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySet, PyString, PyTuple, PyType};
 use pyo3::PyTraverseError;
 
+use crate::flush::Owed;
 use crate::memo::{AddressMap, Memo};
+use crate::release::{refcount, Owner};
+use crate::shadow::{unshadowed, ContextType};
 use crate::statics::{type_address, Statics, StaticsHandle};
+use crate::text::budget;
 use crate::types::TypeInfo;
 
 /// Why the walk stopped early.
@@ -27,8 +33,7 @@ pub(crate) enum Halt {
 
 impl From<PyErr> for Halt {
     fn from(err: PyErr) -> Self {
-        // A recursion overflow depends on the Python stack, which the native
-        // walk does not reproduce; only the Python walk can say what happens.
+        // Only the Python walk has the Python stack an overflow depends on.
         if Python::attach(|py| err.is_instance_of::<PyRecursionError>(py)) {
             Halt::Bail
         } else {
@@ -57,9 +62,14 @@ pub(crate) struct Entry {
 /// reread from the context at the start of every call.
 pub(crate) struct State {
     pub s: &'static Statics,
-    /// The context of the call in progress. The walker holds it only during
-    /// a call, so a context and its walker never form a reference cycle.
+    /// The context of the call in progress, which the walker holds only
+    /// during a call. Originals the memo keeps can still hold the context,
+    /// as a captured object that refers back to it does: see
+    /// [`crate::release`].
     pub(crate) ctx: Option<Py<PyAny>>,
+    /// The context's instance dict during a call, where the walker reads
+    /// and writes its state as stock attribute access does.
+    pub(crate) attributes: Option<Py<PyDict>>,
     pub max_items: Option<u64>,
     pub max_nodes: Option<u64>,
     pub max_depth: Option<u64>,
@@ -82,6 +92,9 @@ pub(crate) struct State {
     /// much native stack the call may use below it.
     pub(crate) origin: usize,
     pub(crate) stack_budget: usize,
+    /// Whether this call found no `sys.monitoring` tool id in use when it
+    /// first ran Python code (atomic as a Python class must be `Sync`).
+    pub(crate) toolless: AtomicBool,
     /// Namespace ids added in the current call, undone on a hand-back.
     pub added_namespaces: Vec<usize>,
     /// Calls handed back to the Python walk so far.
@@ -90,16 +103,39 @@ pub(crate) struct State {
     pub(crate) mirror: Option<(Py<PyDict>, Py<PyDict>)>,
     /// How many memo entries, oldest first, `ctx.objects` holds.
     pub(crate) mirrored: usize,
-    /// Keys of mirrored entries the walk replaced in place since.
-    pub(crate) dirty: Vec<usize>,
+    /// How many entries `ctx._sources` held when the walker last had no
+    /// unwritten copies, and the newest: Python code added any after it.
+    pub(crate) sources_mirrored: usize,
+    pub(crate) sources_last: Option<Py<PyAny>>,
+    /// Whether each call writes its copies to `ctx.objects` when it ends,
+    /// as once a copy of the context may share that dict.
+    pub(crate) eager: bool,
+    /// Keys of mirrored entries the walk replaced in place since, with the
+    /// memo length then and whether `ctx._sources` then held the key.
+    pub(crate) dirty: Vec<(usize, usize, bool)>,
+    /// Ids `ctx._sources` held without a memo entry when last read, as the
+    /// builtin exceptions `exception()` keeps: the Python walk writes an
+    /// original copied later in place, which Python code may then remove.
+    pub(crate) sources_only: AddressMap<()>,
+    /// Whether `ctx.objects` holds a key that is not an id, or `_sources`
+    /// one not of a plain kind: only the Python walk looks them up as it would.
+    pub(crate) foreign: bool,
     /// Keys whose copy is a placeholder the Python walk may replace in
     /// place: a mapping omitted by depth that a later call captures.
     pub(crate) truncated: Vec<usize>,
-    /// The context's type and its instance dict getter, if it has one.
-    pub(crate) ctx_type: Option<(Py<PyType>, Option<Py<PyAny>>)>,
-    /// The size of the context's instance dict when it was last found to
-    /// set no walk method.
-    pub(crate) instance_len: usize,
+    /// The walk methods of the stock context class, `_stock_walk`.
+    pub(crate) stock: Py<PyTuple>,
+    /// What the context's type held when last checked.
+    pub(crate) ctx_type: Option<ContextType>,
+    /// The context of the walker's latest call, where a dict the collector
+    /// leaves untracked needs it: see [`crate::release`].
+    pub(crate) owner: Option<Owner>,
+    /// The writes into `ctx._sources` a release that wrote only
+    /// `ctx.objects` left out, in the Python walk's order, which the next
+    /// flush makes in front of anything newer: see [`crate::release`].
+    pub(crate) owed: Vec<Owed>,
+    /// While such a release writes, the writes it so leaves out.
+    pub(crate) owing: Option<Vec<Owed>>,
 }
 
 /// A call from the Python walk's callers, as they made it.
@@ -116,32 +152,12 @@ pub(crate) struct Call<'a, 'py> {
 /// `frozenset`, as an exact tuple's or frozenset's.
 const PLACEHOLDER_NAME: u64 = "frozenset".len() as u64;
 
-/// Reads a budget as `DumpOptions` validates it: `Some(None)` for `None`,
-/// `Some(Some(limit))` for a positive exact int, saturated to `u64`, and
-/// `None` for anything the Python walk alone compares as it would.
-fn budget(s: &Statics, value: &Bound<'_, PyAny>) -> Option<Option<u64>> {
-    if value.is_none() {
-        return Some(None);
-    }
-    if type_address(value) != s.int {
-        return None;
-    }
-    match value.extract::<u64>() {
-        Ok(0) => None,
-        Ok(limit) => Some(Some(limit)),
-        // Too big for u64, or negative.
-        Err(_) => match value.gt(0) {
-            Ok(true) => Some(Some(u64::MAX)),
-            _ => None,
-        },
-    }
-}
-
 impl State {
-    fn new(py: Python<'_>, s: &'static Statics) -> PyResult<Self> {
+    fn new(py: Python<'_>, s: &'static Statics, stock: Py<PyTuple>) -> PyResult<Self> {
         Ok(Self {
             s,
             ctx: None,
+            attributes: None,
             max_items: None,
             max_nodes: None,
             max_depth: None,
@@ -158,31 +174,73 @@ impl State {
             headroom: 0,
             origin: 0,
             stack_budget: 0,
+            toolless: AtomicBool::new(false),
             added_namespaces: Vec::new(),
             handbacks: 0,
             mirror: None,
             mirrored: 0,
+            sources_mirrored: 0,
+            sources_last: None,
+            eager: false,
             dirty: Vec::new(),
+            sources_only: AddressMap::default(),
+            foreign: false,
             truncated: Vec::new(),
+            stock,
             ctx_type: None,
-            instance_len: usize::MAX,
+            owner: None,
+            owed: Vec::new(),
+            owing: None,
         })
     }
 
     /// Rereads the context's budgets and state, which Python code may have
-    /// changed or replaced since the last call, and syncs the memo with
-    /// `ctx.objects`.
+    /// changed since the last call, and syncs the memo with `ctx.objects`.
     ///
     /// `false` if only the Python walk reproduces what this state does: an
-    /// options object or budget other than `DumpOptions` validates, a tally
-    /// or memo container whose own methods it would run, or a walk method
-    /// set on the context itself.
-    pub(crate) fn refresh(&mut self, py: Python<'_>) -> PyResult<bool> {
+    /// options object or budget other than `DumpOptions` validates, a tally,
+    /// tally key or memo container whose own methods it would run, a memo
+    /// key that is not an id, a state attribute missing, a context class
+    /// the shadow check refuses, or one dict as `objects` and `_sources`.
+    pub(crate) fn refresh<'py>(&mut self, py: Python<'py>) -> PyResult<bool> {
         // Every attribute name is interned: CPython's type cache keeps the
         // names it sees, and a fresh string kept there pins a memory arena.
         let s = self.s;
         let ctx = self.ctx(py)?;
-        let options = ctx.getattr(intern!(py, "options"))?;
+        // First: nothing reads the context before its classes are checked,
+        // and then only its instance dict, whose keys are exact strs.
+        let stock = self.stock.bind(py).clone();
+        let Some(attributes) = unshadowed(py, s, &mut self.ctx_type, &ctx, &stock)? else {
+            return Ok(false);
+        };
+        let get = |name: &Bound<'py, PyString>| attributes.get_item(name);
+        let (
+            Some(options),
+            Some(code_limit),
+            Some(unlimited),
+            Some(truncation),
+            Some(namespaces),
+            Some(objects),
+            Some(sources),
+            Some(count),
+            Some(node_marker),
+            Some(layouts),
+        ) = (
+            get(intern!(py, "options"))?,
+            get(intern!(py, "_code_text_limit"))?,
+            get(intern!(py, "_unlimited"))?,
+            get(intern!(py, "_truncation"))?,
+            get(intern!(py, "_namespaces"))?,
+            get(intern!(py, "objects"))?,
+            get(intern!(py, "_sources"))?,
+            get(intern!(py, "_nodes"))?,
+            get(intern!(py, "_node_marker"))?,
+            get(intern!(py, "_layouts"))?,
+        )
+        else {
+            // Raised by the Python walk, if and where it reads it.
+            return Ok(false);
+        };
         if type_address(&options) != s.dump_options {
             return Ok(false);
         }
@@ -192,7 +250,7 @@ impl State {
             budget(s, &options.getattr(intern!(py, "max_nodes"))?),
             budget(s, &options.getattr(intern!(py, "max_depth"))?),
             budget(s, &string_limit),
-            budget(s, &ctx.getattr(intern!(py, "_code_text_limit"))?),
+            budget(s, &code_limit),
         );
         let (Some(items), Some(nodes), Some(depth), Some(string), Some(code)) = budgets else {
             return Ok(false);
@@ -202,12 +260,6 @@ impl State {
             // placeholder it builds; the walker builds them only when used.
             return Ok(false);
         }
-        let unlimited = ctx.getattr(intern!(py, "_unlimited"))?;
-        let truncation = ctx.getattr(intern!(py, "_truncation"))?;
-        let namespaces = ctx.getattr(intern!(py, "_namespaces"))?;
-        let objects = ctx.getattr(intern!(py, "objects"))?;
-        let sources = ctx.getattr(intern!(py, "_sources"))?;
-        let count = ctx.getattr(intern!(py, "_nodes"))?;
         let count = match type_address(&count) == s.int {
             true => count.extract::<u64>().ok(),
             false => None,
@@ -222,82 +274,47 @@ impl State {
         if !unlimited.is(s.false_.bind(py))
             || type_address(&truncation) != s.counter
             || type_address(&namespaces) != s.set
-            || !self.unshadowed(py, &ctx)?
+            // `_layout` looks types up in it with its own `get`.
+            || type_address(&layouts) != s.dict
+            // The Python walk writes every original over its own copy.
+            || objects.is(&sources)
         {
             return Ok(false);
         }
         (self.max_items, self.max_nodes, self.max_depth) = (items, nodes, depth);
         (self.max_string_bytes, self.code_text_limit) = (string, code);
         self.string_limit = string_limit.unbind();
-        self.truncation = truncation.cast_into::<PyDict>()?.unbind();
+        let truncation = truncation.cast_into::<PyDict>()?;
+        // Reading a tally, as before a helper, may run no key's `__eq__`.
+        if !s.plain_dict(&truncation) {
+            return Ok(false);
+        }
+        self.truncation = truncation.unbind();
         self.namespaces = namespaces.cast_into::<PySet>()?.unbind();
-        self.node_marker = ctx.getattr(intern!(py, "_node_marker"))?.unbind();
+        self.node_marker = node_marker.unbind();
         self.nodes = count;
+        self.attributes = Some(attributes.unbind());
         // A class may have changed since the last call; within a call the
         // walk runs no application code, so it cannot.
         self.types.clear();
-        self.sync(py, objects, sources, false)?;
-        Ok(true)
-    }
-
-    /// Whether the context leaves every walk method to its class: an
-    /// instance attribute of that name is what the Python walk would call.
-    /// Its instance dict is rescanned only when its size changed.
-    fn unshadowed(&mut self, py: Python<'_>, ctx: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let ty = ctx.get_type();
-        if !self
-            .ctx_type
-            .as_ref()
-            .is_some_and(|(known, _)| known.bind(py).is(&ty))
-        {
-            let info = TypeInfo::compute(py, self.s, &ty)?;
-            let getter = info.dict_get.filter(|_| !info.hostile);
-            self.ctx_type = Some((ty.clone().unbind(), getter));
-            self.instance_len = usize::MAX;
-        }
-        let Some((_, Some(getter))) = &self.ctx_type else {
-            return Ok(false);
-        };
-        let attributes = getter.bind(py).call1((ctx, &ty))?;
-        let Ok(attributes) = attributes.cast_exact::<PyDict>() else {
-            return Ok(false);
-        };
-        if attributes.len() == self.instance_len {
-            return Ok(true);
-        }
-        for key in attributes.keys() {
-            // Comparing any other key may run its own `__eq__`.
-            if type_address(&key) != self.s.str_ {
-                return Ok(false);
-            }
-            let key = key.cast::<PyString>().map_err(PyErr::from)?;
-            // A lone surrogate never spells a method name.
-            if let Ok(name) = key.to_str() {
-                if self.s.walk_names.iter().any(|walk| walk == name) {
-                    return Ok(false);
-                }
-            }
-        }
-        self.instance_len = attributes.len();
-        Ok(true)
-    }
-
-    /// The snapshot context of the call in progress.
-    pub(crate) fn ctx<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        match &self.ctx {
-            Some(ctx) => Ok(ctx.bind(py).clone()),
-            None => Err(PyReferenceError::new_err("the walker is not capturing")),
-        }
+        // A copy of the context shares these dicts, and its Python walk
+        // may replace a depth placeholder in place, as a hand-back may.
+        self.sync(py, objects, sources, self.eager)?;
+        Ok(!self.foreign)
     }
 }
 
-/// The native walk behind a `SnapshotContext`.
-///
-/// `Walker(statics)` captures for the context that keeps it in `_walker`;
-/// [`crate::dispatch::Dispatch`] sends the context's `value` and `_mapping`
-/// calls to it. `statics` is the table of the `values` module that made it.
-/// The walker holds no reference to its context between calls.
-#[pyclass(module = "pydumpling._native")]
+/// The native walk behind a `SnapshotContext`: `Walker(statics, stock)`
+/// captures for the context that keeps it in `_walker`, whose `value` and
+/// `_mapping` calls [`crate::dispatch::Dispatch`] sends to it. `statics` is
+/// the `values` module's table, `stock` the walk methods it mirrors.
+/// Between calls the walker refers to its context only through what its
+/// memo keeps, or what it owes `_sources`, the context itself once a walk
+/// captured it, and, where its release needs one (see `release.rs`), a
+/// weak reference. `values` makes walkers of a subclass whose `__del__` is
+/// `Walker.release`; one of this class itself has no finalizer, and so
+/// writes nothing as it is freed.
+#[pyclass(module = "pydumpling._native", subclass)]
 pub struct Walker {
     pub(crate) state: State,
 }
@@ -305,9 +322,13 @@ pub struct Walker {
 #[pymethods]
 impl Walker {
     #[new]
-    fn new(py: Python<'_>, statics: PyRef<'_, StaticsHandle>) -> PyResult<Self> {
+    fn new(
+        py: Python<'_>,
+        statics: PyRef<'_, StaticsHandle>,
+        stock: Bound<'_, PyTuple>,
+    ) -> PyResult<Self> {
         Ok(Self {
-            state: State::new(py, statics.table)?,
+            state: State::new(py, statics.table, stock.unbind())?,
         })
     }
 
@@ -318,62 +339,48 @@ impl Walker {
         self.state.handbacks
     }
 
-    /// Writes every copy the walker memoized into `ctx.objects` and
-    /// `ctx._sources`, where the Python walk keeps them, as before the
-    /// context is copied. Called from within a capture of this walker, as
-    /// from a signal handler, it leaves them as they are.
-    fn flush(slf: &Bound<'_, Self>, ctx: &Bound<'_, PyAny>) -> PyResult<()> {
-        let py = slf.py();
+    /// Writes every copy the walker memoized into the dicts it last synced
+    /// with, as before the context is copied; from then on each call writes
+    /// its copies when it ends, so a shallow copy, which shares those dicts,
+    /// sees them. A copy made during a native call raises `RuntimeError`.
+    fn flush(slf: &Bound<'_, Self>) -> PyResult<()> {
         let Ok(mut walker) = slf.try_borrow_mut() else {
-            return Ok(());
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "this SnapshotContext is already capturing: cannot copy a native transaction",
+            ));
         };
         let state = &mut walker.state;
-        state.ctx = Some(ctx.clone().unbind());
-        let flushed = state.resync(py, ctx).and_then(|synced| match synced {
-            true => state.flush(py),
-            false => Ok(()),
-        });
-        state.ctx = None;
-        flushed
+        state.eager = true;
+        state.flush(slf.py(), false)
+    }
+
+    /// Writes the walker's copies into a dict it mirrors that outlives it:
+    /// see [`crate::release`]. `values` makes it its walkers' `__del__`,
+    /// which then pushes no Python frame: the Python recursion limit, a
+    /// signal or a tracer cannot stop it, though a spent C stack can, on
+    /// every version. Raises nothing.
+    fn release(slf: &Bound<'_, Self>) {
+        let freed = refcount(slf) <= 1;
+        if let Ok(mut walker) = slf.try_borrow_mut() {
+            walker.state.release(slf.py(), freed);
+        }
+    }
+
+    /// Pickles and copies as `None`, which a context that captures in
+    /// Python holds, after a [`Walker::flush`].
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyType>, Bound<'py, PyTuple>)> {
+        Self::flush(slf)?;
+        let py = slf.py();
+        Ok((py.None().into_bound(py).get_type(), PyTuple::empty(py)))
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        let state = &self.state;
-        if let Some(ctx) = &state.ctx {
-            visit.call(ctx)?;
-        }
-        visit.call(&state.string_limit)?;
-        visit.call(&state.truncation)?;
-        visit.call(&state.namespaces)?;
-        visit.call(&state.node_marker)?;
-        for (_, entry) in state.memo.iter() {
-            if let Slot::Value(captured) = &entry.slot {
-                visit.call(captured)?;
-            }
-            visit.call(&entry.original)?;
-        }
-        for info in state.types.values() {
-            info.traverse(&visit)?;
-        }
-        if let Some((objects, sources)) = &state.mirror {
-            visit.call(objects)?;
-            visit.call(sources)?;
-        }
-        if let Some((ty, getter)) = &state.ctx_type {
-            visit.call(ty)?;
-            if let Some(getter) = getter {
-                visit.call(getter)?;
-            }
-        }
-        Ok(())
+        self.state.traverse(&visit)
     }
 
     fn __clear__(&mut self) {
-        let state = &mut self.state;
-        state.memo.clear();
-        state.types.clear();
-        state.mirror = None;
-        state.mirrored = 0;
-        state.ctx_type = None;
+        self.state.clear();
     }
 }

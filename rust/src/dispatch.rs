@@ -4,8 +4,9 @@
 //! whose `_walker` is a [`Walker`], it returns itself bound to the context
 //! as a method; on any other context, the Python method bound as usual; on
 //! the class, the descriptor itself, which routes
-//! `SnapshotContext.value(ctx, ...)` the same way: the Python function must
-//! not run on a context whose walker holds copies `objects` lacks. No Python
+//! `SnapshotContext.value(ctx, ...)` and `SnapshotContext.value(self=ctx,
+//! ...)` the same way: the Python function must not run on a context whose
+//! walker holds copies `objects` lacks. No Python
 //! frame is added, so the Python walk overflows its recursion limit exactly
 //! where it would without the walker.
 //!
@@ -67,6 +68,9 @@ pub struct Dispatch {
     owner: Option<Py<PyAny>>,
     /// `types.MethodType`, which binds it to a context.
     method: Py<PyAny>,
+    /// `object.__getattribute__`, which reads `_walker` as stock attribute
+    /// access does, without the context class's hooks.
+    getattribute: Py<PyAny>,
 }
 
 #[pymethods]
@@ -81,11 +85,17 @@ impl Dispatch {
         owner: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let method = py.import("types")?.getattr("MethodType")?.unbind();
+        let getattribute = py
+            .import("builtins")?
+            .getattr("object")?
+            .getattr("__getattribute__")?
+            .unbind();
         Ok(Self {
             pure,
             mapping,
             owner,
             method,
+            getattribute,
         })
     }
 
@@ -128,6 +138,7 @@ impl Dispatch {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.pure)?;
         visit.call(&self.method)?;
+        visit.call(&self.getattribute)?;
         if let Some(owner) = &self.owner {
             visit.call(owner)?;
         }
@@ -143,7 +154,7 @@ impl Dispatch {
         let Some(instance) = instance.filter(|instance| !instance.is_none()) else {
             return Ok(slf.clone().into_any());
         };
-        if walker_of(instance)?.is_none() {
+        if slf.get().walker_of(instance)?.is_none() {
             let pure = slf.get().pure.bind(py);
             return pure.call_method1(intern!(py, "__get__"), (instance, owner));
         }
@@ -161,8 +172,15 @@ impl Dispatch {
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if args.is_empty() {
-            // No context to route by, as with `self=` passed by name: the
-            // function takes the call as it was made.
+            // The Python function also accepts its receiver by keyword. Route
+            // that form through the same walker, without passing `self` twice.
+            if let Some(kwargs) = kwargs {
+                if let Some(ctx) = kwargs.get_item(intern!(py, "self"))? {
+                    let rest = kwargs.copy()?;
+                    rest.del_item(intern!(py, "self"))?;
+                    return self.route(&ctx, args, Some(&rest));
+                }
+            }
             return self.pure.bind(py).call(args, kwargs);
         }
         let rest = args.get_slice(1, args.len());
@@ -179,16 +197,19 @@ impl Dispatch {
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = ctx.py();
         let pure = self.pure.bind(py);
-        let Some(walker) = walker_of(ctx)? else {
+        let Some(walker) = self.walker_of(ctx)? else {
             return pure.call(prepend(ctx, args)?, kwargs);
         };
         let id = address(walker.as_any());
         let Ok(mut walker) = walker.try_borrow_mut() else {
             if Running::here(id) {
-                // Re-entered on this thread, by a signal handler or a
-                // finalizer the walk let run: the Python walk takes the
-                // call, from the state the walker last published.
-                return pure.call(prepend(ctx, args)?, kwargs);
+                // A finalizer, collection callback, audit hook or signal
+                // handler run while this walker captures: the copies of the
+                // call in progress are in no state the Python walk can share.
+                return Err(PyRuntimeError::new_err(
+                    "this SnapshotContext is already capturing: \
+                     reentrant capture on the same native context is unsupported",
+                ));
             }
             return Err(PyRuntimeError::new_err(
                 "this SnapshotContext is already capturing: \
@@ -204,15 +225,22 @@ impl Dispatch {
         };
         walker.state.run(py, ctx, &call)
     }
-}
 
-/// The context's walker, if it captures natively.
-fn walker_of<'py>(ctx: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, Walker>>> {
-    let py = ctx.py();
-    match ctx.getattr(intern!(py, "_walker")) {
-        Ok(walker) => Ok(walker.cast_into::<Walker>().ok()),
-        Err(err) if err.is_instance_of::<PyAttributeError>(py) => Ok(None),
-        Err(err) => Err(err),
+    /// The context's walker, if it captures natively, read from its
+    /// instance dict or slot as stock attribute access reads it: a class
+    /// that overrides `__getattribute__` sees no read the Python walk
+    /// would not make.
+    fn walker_of<'py>(&self, ctx: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, Walker>>> {
+        let py = ctx.py();
+        let read = self
+            .getattribute
+            .bind(py)
+            .call1((ctx, intern!(py, "_walker")));
+        match read {
+            Ok(walker) => Ok(walker.cast_into::<Walker>().ok()),
+            Err(err) if err.is_instance_of::<PyAttributeError>(py) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 }
 

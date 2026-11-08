@@ -20,9 +20,9 @@ from ..fake_types import (
     FakeTuple,
     TruncatedValue,
 )
-from ..options import DumpOptions
+from ..options import DumpOptions  # noqa: F401  # the native walker's table reads it
 from . import identity as _identity
-from .identity import _CLASS_DICT, _derives, _type_mro
+from .identity import _CLASS_DICT, _CLASS_MRO, _derives, _type_mro
 
 _native = None
 if sys.version_info >= (3, 12) and os.environ.get("PYDUMPLING_NATIVE") != "0":
@@ -34,6 +34,26 @@ if sys.version_info >= (3, 12) and os.environ.get("PYDUMPLING_NATIVE") != "0":
         from .. import _native
     except ImportError:
         pass
+
+if _native is not None:
+
+    class _Walker(_native.Walker):
+        """A native walker that writes its copies before it is freed.
+
+        The walker holds copies ``objects`` and ``_sources`` may still lack.
+        CPython runs ``__del__`` before it frees an object, and, for objects
+        in a reference cycle, such as a context and a captured object that
+        refers back to it, before it clears any of them, so the copies reach
+        a dict that outlives the context, as the Python walk put them there.
+        ``release`` is a native method: the finalizer pushes no Python frame,
+        so neither the Python recursion limit nor a signal or tracer can stop
+        it, though a spent C stack can, and its copies are then lost.
+        """
+
+        __slots__ = ()
+
+        __del__ = _native.Walker.release
+
 
 # The reason of an immutable container's placeholder.  One shared object, so
 # the native walker's placeholders pickle to the same bytes as these.
@@ -125,13 +145,84 @@ _NATIVE_WALK = (
 )
 
 
-# How the walker reads and writes the context's own state.
+# How the Python walk reads and writes the context's own state.
 _STATE_ACCESS = ("__getattribute__", "__setattr__", "__delattr__")
+
+# The context state the native walker, and the helpers it calls, read or
+# write.  The walker reads it from the instance dict; a class attribute of
+# one of these names, such as a property, is what the Python walk reads
+# instead, so the context then captures in Python.
+_NATIVE_STATE = (
+    "options",
+    "_code_text_limit",
+    "_unlimited",
+    "_truncation",
+    "_namespaces",
+    "objects",
+    "_sources",
+    "_nodes",
+    "_node_marker",
+    "_layouts",
+    "_walker",
+)
+
+
+# How a copy or pickle of the context reads it.  A context class with one of
+# these of its own may build a state from the instance dict, where the walker
+# comes after ``objects``, or give a shallow copy the walker itself, so the
+# context captures in Python, whose memo a copy always reads complete.
+# ``object.__reduce_ex__`` reads ``__getnewargs_ex__`` or ``__getnewargs__``
+# before the state, ``copy.replace`` (3.13+) calls the ``__replace__``,
+# which ``@dataclass`` adds, of the class ``__class__`` names, which a class
+# attribute of that name can answer, and a ``__getattr__`` can answer
+# ``__deepcopy__`` for an instance.  The walker also refuses an instance
+# attribute of one of these names, and a metaclass ``__copy__``,
+# ``__replace__``, ``__getattr__`` or ``__getattribute__``, which can answer
+# the class lookups of ``copy.copy`` and ``copy.replace``.
+_COPY_PROTOCOL = (
+    "__reduce_ex__",
+    "__reduce__",
+    "__getstate__",
+    "__copy__",
+    "__deepcopy__",
+    "__getnewargs_ex__",
+    "__getnewargs__",
+    "__replace__",
+    "__class__",
+    "__getattr__",
+)
 
 
 def _walk_methods(cls):
-    """The methods of ``cls`` the native walker stands in for or relies on."""
-    return tuple(getattr(cls, name, None) for name in _NATIVE_WALK + _STATE_ACCESS)
+    """The class attributes of ``cls`` the native walker relies on.
+
+    For each walk method, attribute access hook, state name and copy hook,
+    the class attribute an instance of ``cls`` finds, or None, read from the
+    class dicts along the MRO without calling its ``__get__`` or any
+    metaclass hook, as the native walker reads them before every call.
+    """
+    namespaces = [
+        _CLASS_DICT.__get__(base, type(base))
+        for base in _CLASS_MRO.__get__(cls, type(cls))
+    ]
+    return tuple(
+        next((namespace[name] for namespace in namespaces if name in namespace), None)
+        for name in _NATIVE_WALK + _STATE_ACCESS + _NATIVE_STATE + _COPY_PROTOCOL
+    )
+
+
+def _frame_locals_type():
+    """A function's locals type, if the runtime permits frame inspection."""
+    try:
+        frame = sys._getframe()
+    except Exception:
+        # Audit policies can forbid frame access. Only the locals-proxy fast
+        # path needs this type; other values can still be captured natively.
+        return None
+    try:
+        return type(frame.f_locals)
+    finally:
+        del frame
 
 
 def _headroom(frames):
@@ -143,6 +234,15 @@ def _headroom(frames):
     """
     if frames:
         _headroom(frames - 1)
+
+
+def _detached(state):
+    """The default state ``object.__getstate__`` builds, without the live
+    instance dict in it, which gets a native walker back after a copy."""
+    if isinstance(state, tuple):
+        namespace, slots = state
+        return (None if namespace is None else namespace.copy(), slots)
+    return None if state is None else state.copy()
 
 
 class ValuesMixin:
@@ -157,38 +257,45 @@ class ValuesMixin:
         """Capture through the native walker when it is built.
 
         The walker mirrors this module step for step; ``PYDUMPLING_NATIVE=0``
-        keeps the Python walk.  Unlimited snapshots stay in Python, where
-        probing each original with the serializer dominates the cost, and so
-        do options subclasses and context subclasses that override a walk
-        method or attribute access.  The walker itself hands a context back
-        to Python for good when its state stops being one it mirrors, such
-        as a walk method set on the context.
+        keeps the Python walk.  Before every call the walker checks, without
+        running application code, that this context's state is one it
+        mirrors and its class runs the stock walk; otherwise, as for an
+        unlimited snapshot, where probing each original with the serializer
+        dominates the cost, an options subclass, or a context class that
+        overrides a walk method, attribute access, a state attribute or a
+        copy hook, it hands the context to the Python walk for good.  Nothing here reads
+        the context through its class's hooks, which the Python walk would
+        not run.
         """
-        if (
-            _native is None
-            or self._unlimited
-            or type(self.options) is not DumpOptions
-            or os.environ.get("PYDUMPLING_NATIVE") == "0"
-        ):
+        if _native is None or os.environ.get("PYDUMPLING_NATIVE") == "0":
             return
-        stock = self._stock_walk
-        if stock is None or any(
-            method is not original
-            for method, original in zip(_walk_methods(type(self)), stock)
-        ):
-            return
-        self._walker = _native.Walker(_STATICS)
+        stock = object.__getattribute__(self, "_stock_walk")
+        if stock is not None:
+            object.__setattr__(self, "_walker", _Walker(_STATICS, stock))
 
     def __getstate__(self):
         # A copy captures in Python, sharing the memo as a copy of a context
         # that captures in Python does, once the walker has written its own
-        # copies into it.
-        walker = self.__dict__.get("_walker")
+        # copies into it; from then on the walker writes each call's copies
+        # at once, so a shallow copy, which shares the memo, sees them.
+        # The walker is read, left out and put back without the class's
+        # attribute hooks, so the default state is built as for a context
+        # that never had one, running the hooks that one would run.
+        try:
+            walker = object.__getattribute__(self, "_walker")
+        except AttributeError:
+            return _detached(object.__getstate__(self))
         if walker is not None:
-            walker.flush(self)
-        state = self.__dict__.copy()
-        state.pop("_walker", None)
-        return state
+            walker.flush()
+        try:
+            object.__delattr__(self, "_walker")
+        except AttributeError:
+            # Only the class's own default: a context built without one.
+            return _detached(object.__getstate__(self))
+        try:
+            return _detached(object.__getstate__(self))
+        finally:
+            object.__setattr__(self, "_walker", walker)
 
     def _layout(self, value):
         """Member descriptors and named tuple fields of ``type(value)``, cached."""

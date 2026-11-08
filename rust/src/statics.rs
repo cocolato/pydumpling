@@ -8,9 +8,8 @@
 //! it, never by importing `pydumpling` by name, so each import of the
 //! package, a reloaded one or a vendored copy, gets its own classes.
 
-use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyString, PyTuple};
 
 use crate::types::{Base, Scalar};
 
@@ -83,6 +82,7 @@ pub(crate) struct Statics {
     /// Bound `__get__` of `type.__dict__["__dict__"]` and its siblings.
     pub class_dict: Py<PyAny>,
     pub class_mro: Py<PyAny>,
+    pub class_flags: Py<PyAny>,
     pub class_module: Py<PyAny>,
     pub class_qualname: Py<PyAny>,
     /// The reason of an immutable container's placeholder: the very object
@@ -91,16 +91,41 @@ pub(crate) struct Statics {
     /// `sys.getrecursionlimit` and `sys._getframe`.
     pub recursion_limit: Py<PyAny>,
     pub get_frame: Py<PyAny>,
+    /// `sys.monitoring._all_events`, where the interpreter has it, else
+    /// `sys.getprofile` and `sys.gettrace`, and `sys.monitoring.get_tool`:
+    /// whether running Python code would also run a tracing hook.
+    pub all_events: Option<Py<PyAny>>,
+    pub get_profile: Py<PyAny>,
+    pub get_trace: Py<PyAny>,
+    pub get_tool: Py<PyAny>,
+    /// `object.__getattribute__` and `object.__setattr__`: attribute
+    /// access as a stock context's, without its class's hooks.
+    pub object_getattribute: Py<PyAny>,
+    pub object_setattr: Py<PyAny>,
+    /// Whether the collector leaves a dict untracked while it holds nothing
+    /// it tracks, as before CPython 3.14: see [`crate::release`].
+    pub untracked_dicts: bool,
     /// `values._headroom`, which recurses as deep as it is asked to.
     pub headroom: Py<PyAny>,
     /// `DumpOptions` and `collections.Counter`, the only options and
     /// truncation tally types the walker mirrors.
     pub dump_options: usize,
     pub counter: usize,
-    /// `values._NATIVE_WALK`: the context methods the walker stands in for.
-    pub walk_names: Vec<String>,
+    /// `values._NATIVE_WALK`, the context methods the walker stands in
+    /// for, then `values._STATE_ACCESS`, `values._NATIVE_STATE` and
+    /// `values._COPY_PROTOCOL`, the class attributes the context must hold
+    /// as the stock class does, interned.
+    pub walk_keys: Vec<Py<PyString>>,
+    /// How many of [`Statics::walk_keys`] are `_NATIVE_WALK`, and where
+    /// `_COPY_PROTOCOL` starts: the names an instance attribute may shadow.
+    pub walk_count: usize,
+    pub copy_from: usize,
+    /// The names a metaclass may answer the class lookups of `copy.copy`
+    /// and `copy.replace` with; `type` holds none of its own.
+    pub meta_keys: Vec<Py<PyString>>,
     /// The type of a function frame's `f_locals`: `FrameLocalsProxy` on
-    /// Python 3.13+, whose `items()` runs no application code.
+    /// Python 3.13+, whose `items()` runs no application code. Zero when
+    /// frame inspection is unavailable, so proxies use the Python walk.
     pub frame_locals: usize,
     pub true_: Py<PyAny>,
     pub false_: Py<PyAny>,
@@ -145,14 +170,30 @@ impl Statics {
         let fake_type = |name: &str| global(name);
         let method = |owner: &str, name: &str| builtins.getattr(owner)?.getattr(name);
         let getter = |name: &str| identity.getattr(name)?.getattr("__get__");
-        // A function frame's own `f_locals`, read in a frame made for it.
-        let namespace = PyDict::new(py);
-        py.run(
-            c"import sys\nlocals_type = (lambda: type(sys._getframe().f_locals))()\n",
-            Some(&namespace),
-            None,
-        )?;
-        let frame_locals = address(&namespace.as_any().get_item(intern!(py, "locals_type"))?);
+        // A denied frame probe disables only the locals-proxy fast path;
+        // the Python walk can still read a proxy passed in by its caller.
+        let locals_type = global("_frame_locals_type")?.call0()?;
+        let frame_locals = if locals_type.is_none() {
+            0
+        } else {
+            address(&locals_type)
+        };
+        let walk: Vec<String> = global("_NATIVE_WALK")?.extract()?;
+        let access: Vec<String> = global("_STATE_ACCESS")?.extract()?;
+        let state: Vec<String> = global("_NATIVE_STATE")?.extract()?;
+        let copy: Vec<String> = global("_COPY_PROTOCOL")?.extract()?;
+        let names: Vec<&String> = walk
+            .iter()
+            .chain(&access)
+            .chain(&state)
+            .chain(&copy)
+            .collect();
+        let copy_from = names.len() - copy.len();
+        let walk_keys = names
+            .iter()
+            .map(|name| PyString::intern(py, name).unbind())
+            .collect();
+        let type_dict = builtin("type")?.getattr("__dict__")?;
         let frozendict = builtins.getattr("frozendict").ok();
         let none = py.None().into_bound(py).get_type().into_any();
         let fake_class = fake_type("FakeClass")?;
@@ -223,15 +264,39 @@ impl Statics {
             bytes_getitem: method("bytes", "__getitem__")?.unbind(),
             class_dict: getter("_CLASS_DICT")?.unbind(),
             class_mro: getter("_CLASS_MRO")?.unbind(),
+            class_flags: type_dict
+                .get_item("__flags__")?
+                .getattr("__get__")?
+                .unbind(),
             class_module: getter("_CLASS_MODULE")?.unbind(),
             class_qualname: getter("_CLASS_QUALNAME")?.unbind(),
             recursive_immutable: global("_RECURSIVE_IMMUTABLE")?.unbind(),
             recursion_limit: sys.getattr("getrecursionlimit")?.unbind(),
             get_frame: sys.getattr("_getframe")?.unbind(),
+            get_profile: sys.getattr("getprofile")?.unbind(),
+            get_trace: sys.getattr("gettrace")?.unbind(),
+            all_events: sys
+                .getattr("monitoring")?
+                .getattr("_all_events")
+                .ok()
+                .map(Bound::unbind),
+            get_tool: sys.getattr("monitoring")?.getattr("get_tool")?.unbind(),
+            object_getattribute: method("object", "__getattribute__")?.unbind(),
+            object_setattr: method("object", "__setattr__")?.unbind(),
+            untracked_dicts: !py
+                .import("gc")?
+                .getattr("is_tracked")?
+                .call1((PyDict::new(py),))?
+                .is_truthy()?,
             headroom: global("_headroom")?.unbind(),
             dump_options: address(&global("DumpOptions")?),
             counter: address(&py.import("collections")?.getattr("Counter")?),
-            walk_names: global("_NATIVE_WALK")?.extract()?,
+            walk_keys,
+            walk_count: walk.len(),
+            copy_from,
+            meta_keys: ["__copy__", "__replace__", "__getattr__", "__getattribute__"]
+                .map(|name| PyString::intern(py, name).unbind())
+                .into(),
             frame_locals,
             true_: builtin("True")?.unbind(),
             false_: builtin("False")?.unbind(),

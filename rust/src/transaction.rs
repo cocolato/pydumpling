@@ -9,10 +9,12 @@
 //! good.
 
 use std::ptr::addr_of;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
-use pyo3::exceptions::{PyRecursionError, PyValueError};
+use pyo3::exceptions::{PyRecursionError, PyReferenceError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::types::{PyTuple, PyType};
 
 use crate::arguments::{parse, Parsed};
 use crate::dispatch::prepend;
@@ -37,8 +39,42 @@ const PROBE_STEP: u64 = 256;
 /// microsecond, and a stack shallower than twice this depth is far from
 /// any recursion limit that high.
 const LOOK_LIMIT: u64 = 1024;
+/// `sys.monitoring` tool ids, 0 to 5.
+const MONITORING_TOOLS: u8 = 6;
+
+/// What `ctx._walker` holds while the Python walk takes a call from the
+/// walker: the context then captures in Python, as with `None`, and a copy
+/// of it, which shares the dicts the walker wrote before the call, makes
+/// the walker write each later call's copies at once.
+#[pyclass(module = "pydumpling._native", frozen)]
+#[derive(Default)]
+pub struct HandBack {
+    copied: AtomicBool,
+}
+
+#[pymethods]
+impl HandBack {
+    /// Notes a copy of the context: the walker's copies are written.
+    fn flush(&self) {
+        self.copied.store(true, Relaxed);
+    }
+
+    /// Pickles and copies as `None`, as the walker does.
+    fn __reduce__<'py>(&self, py: Python<'py>) -> (Bound<'py, PyType>, Bound<'py, PyTuple>) {
+        self.flush();
+        (py.None().into_bound(py).get_type(), PyTuple::empty(py))
+    }
+}
 
 impl State {
+    /// The snapshot context of the call in progress.
+    pub(crate) fn ctx<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.ctx {
+            Some(ctx) => Ok(ctx.bind(py).clone()),
+            None => Err(PyReferenceError::new_err("the walker is not capturing")),
+        }
+    }
+
     /// Enters a walk function, handing the call back to Python if the
     /// Python walk could overflow here or the native stack runs short.
     pub(crate) fn enter(&mut self, py: Python<'_>) -> Walk<()> {
@@ -49,6 +85,7 @@ impl State {
         }
         let need = self.frames + MARGIN;
         if need > self.headroom {
+            self.before_python(py)?;
             self.headroom = self.probe(py, need)?;
         }
         Ok(())
@@ -67,18 +104,23 @@ impl State {
         call: &Call<'_, 'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.ctx = Some(ctx.clone().unbind());
-        let result = self.refresh(py).and_then(|usable| {
-            if !usable {
-                return self.retire(py, call);
-            }
-            match parse(self.s, call)? {
-                Some(parsed) => self.transaction(py, call, &parsed),
-                // An argument the walker cannot read without running
-                // application code: Python takes the call as it was made.
-                None => self.hand_back(py, call),
-            }
-        });
+        self.toolless.store(false, Relaxed);
+        let result = self
+            .arm(ctx)
+            .and_then(|()| self.refresh(py))
+            .and_then(|usable| {
+                if !usable {
+                    return self.retire(py, call);
+                }
+                match parse(self.s, call)? {
+                    Some(parsed) => self.transaction(py, call, &parsed),
+                    // An argument the walker cannot read without running
+                    // application code: Python takes the call as it was made.
+                    None => self.hand_back(py, call),
+                }
+            });
         self.ctx = None;
+        self.attributes = None;
         result
     }
 
@@ -91,6 +133,7 @@ impl State {
         let truncation = self.truncation.bind(py).clone();
         let saved = truncation.copy()?;
         let nodes = self.nodes;
+        let dirty = self.dirty.len();
         self.memo.begin();
         self.added_namespaces.clear();
         self.frames = 0;
@@ -115,18 +158,17 @@ impl State {
         };
         match result {
             Ok(captured) => {
-                self.memo.commit();
-                self.publish_nodes(py)?;
+                self.commit(py)?;
                 Ok(captured)
             }
             Err(Halt::Py(err)) => {
                 // The Python walk keeps whatever it did before the error.
-                self.memo.commit();
-                self.publish_nodes(py)?;
+                self.commit(py)?;
                 Err(err)
             }
             Err(Halt::Bail) => {
                 self.memo.rollback();
+                self.dirty.truncate(dirty);
                 self.nodes = nodes;
                 truncation.clear();
                 truncation.update(saved.as_mapping())?;
@@ -139,8 +181,34 @@ impl State {
         }
     }
 
-    fn publish_nodes(&self, py: Python<'_>) -> PyResult<()> {
-        self.ctx(py)?.setattr(intern!(py, "_nodes"), self.nodes)
+    /// Keeps what the call did: its copies, and the node count, written to
+    /// the instance dict as stock attribute access writes it.
+    fn commit(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.memo.commit();
+        if let Some(attributes) = &self.attributes {
+            attributes
+                .bind(py)
+                .set_item(intern!(py, "_nodes"), self.nodes)?;
+        }
+        if self.eager {
+            // Python code the walk ran, as a collection's callbacks, may have
+            // changed the dicts since the call's sync checked them.
+            self.flush(py, false)?;
+        }
+        Ok(())
+    }
+
+    /// Sets `ctx._walker` as stock attribute access does, without the
+    /// class's hooks, which the Python walk never runs for it.
+    fn set_walker(
+        &self,
+        py: Python<'_>,
+        ctx: &Bound<'_, PyAny>,
+        walker: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let name = intern!(py, "_walker");
+        self.s.object_setattr.bind(py).call1((ctx, name, walker))?;
+        Ok(())
     }
 
     /// Runs `call` in the Python walk from the walker's state, then adopts
@@ -152,41 +220,44 @@ impl State {
     ) -> PyResult<Bound<'py, PyAny>> {
         self.handbacks += 1;
         let ctx = self.ctx(py)?;
-        // A capture re-entered from a signal handler may have added copies.
-        if self.resync(py, &ctx)? {
-            self.flush(py)?;
-        }
-        ctx.setattr(intern!(py, "_nodes"), self.nodes)?;
+        // The Python walk must see every copy the walker holds, in the dicts
+        // this call synced with. The node count needs no write:
+        // `ctx._nodes` already holds it, as a transaction publishes it on
+        // commit and a rollback restores it.
+        self.flush(py, false)?;
         // Without its walker the context captures in Python throughout.
-        let walker = ctx.getattr(intern!(py, "_walker"))?;
-        ctx.setattr(intern!(py, "_walker"), py.None())?;
+        let name = intern!(py, "_walker");
+        let walker = self.s.object_getattribute.bind(py).call1((&ctx, name))?;
+        let lent = Bound::new(py, HandBack::default())?;
+        self.set_walker(py, &ctx, lent.as_any())?;
         let result = prepend(&ctx, call.args).and_then(|args| call.pure.call(args, call.kwargs));
-        let restored = ctx.setattr(intern!(py, "_walker"), walker);
+        let restored = self.set_walker(py, &ctx, &walker);
+        if lent.get().copied.load(Relaxed) {
+            // A copy shares the dicts from now on.
+            self.eager = true;
+        }
         let synced = self.resync(py, &ctx);
-        let nodes = ctx
-            .getattr(intern!(py, "_nodes"))
-            .and_then(|nodes| nodes.extract());
         restored?;
         synced?;
-        self.nodes = nodes?;
         result
     }
 
     /// Gives the context to the Python walk for good, with every copy the
-    /// walker made, and runs `call` there.
+    /// walker made where the Python walk would have put it, in the dicts
+    /// last synced with, and runs `call` there.
     fn retire<'py>(
         &mut self,
         py: Python<'py>,
         call: &Call<'_, 'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ctx = self.ctx(py)?;
-        if self.resync(py, &ctx)? {
-            self.flush(py)?;
-        }
+        self.flush(py, false)?;
         self.memo.clear();
         self.mirror = None;
         self.mirrored = 0;
-        ctx.setattr(intern!(py, "_walker"), py.None())?;
+        self.sources_mirrored = 0;
+        self.sources_last = None;
+        self.set_walker(py, &ctx, &py.None().into_bound(py))?;
         call.pure.call(prepend(&ctx, call.args)?, call.kwargs)
     }
 }
@@ -241,5 +312,52 @@ impl State {
             }
         }
         Ok(low)
+    }
+
+    /// Hands the call back before the walk runs Python code, the stack
+    /// probe or one of pydumpling's own helpers, if a profiler, tracer or
+    /// monitoring tool would see it: the hook is application code, which
+    /// the Python walk runs at its own calls instead.
+    pub(crate) fn before_python(&self, py: Python<'_>) -> Walk<()> {
+        match self.hooked(py)? {
+            true => Err(Halt::Bail),
+            false => Ok(()),
+        }
+    }
+
+    /// Whether Python code would run a profile or trace function, or a
+    /// `sys.monitoring` tool. Hooks are asked for before each Python call,
+    /// since a signal handler, a collection or another thread may set one
+    /// while the walk runs; tool ids, once per call.
+    fn hooked(&self, py: Python<'_>) -> PyResult<bool> {
+        let s = self.s;
+        match &s.all_events {
+            // Every profile or trace function, one set from C without an
+            // object too, and every tool's global events, from any thread.
+            Some(all_events) => {
+                if all_events.bind(py).call0()?.is_truthy()? {
+                    return Ok(true);
+                }
+            }
+            None => {
+                if !s.get_profile.bind(py).call0()?.is_none()
+                    || !s.get_trace.bind(py).call0()?.is_none()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        if self.toolless.load(Relaxed) {
+            return Ok(false);
+        }
+        // A tool with only per-code events still has an id in use.
+        let get_tool = s.get_tool.bind(py);
+        for tool in 0..MONITORING_TOOLS {
+            if !get_tool.call1((tool,))?.is_none() {
+                return Ok(true);
+            }
+        }
+        self.toolless.store(true, Relaxed);
+        Ok(false)
     }
 }

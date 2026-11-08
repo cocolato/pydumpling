@@ -6,7 +6,7 @@
   "source_url": "",
   "scope_summary": "pydumpling/snapshot/values.py bounded capture walk (value, _mapping, copies, key selection, memo) as an optional PyO3 abi3 extension; pure-Python walk kept as reference and fallback",
   "started_at_epoch": 1793870278.793422,
-  "completed_at": "2026-11-06 05:45 UTC",
+  "completed_at": "2026-11-08 17:57 UTC",
   "_active_bucket": null,
   "_bucket_seconds": {
     "discovery": 2869.836016178131,
@@ -17,13 +17,13 @@
     "pgo_bench": 717.3796629905701
   },
   "story": {
-    "headline": "A 7.9x faster capture walk that never runs your code",
+    "headline": "A 7x faster capture walk that never runs your code",
     "intro": "I ported pydumpling's bounded capture walk, the part of a crash dump that copies every frame's variables while the failing process waits, to a PyO3 extension in 100% safe Rust. The pure-Python walk stays the reference and the fallback, and the native walk must produce byte-identical snapshots.",
     "ch1_narrative": "Discovery: profiling showed the value walk dominates bounded capture, at 1-3 us of interpreted dispatch per node. The rest of the project (writer, debugger, report, CLI) is I/O bound or built on pdb, so I scoped the port to values.py and the context helpers it calls, 567 lines of Python, rather than replacing a pure-Python wheel with per-platform builds for no gain.",
     "ch2_narrative": "Blueprint: the contract is strict. Capture never runs application code, and memo order, node counts and truncation counters are all part of the pickled snapshot. I designed the walker as a transaction: wherever the Python walk would call application code, or its result would depend on the recursion limit, the walker rolls back and hands the whole call to Python before anything runs.",
-    "ch3_narrative": "Rewrite: 14 modules, 2,602 lines of Rust, none over 400, no unsafe. A descriptor binds ctx.value to the walker without adding a Python frame; an insertion-ordered memo with an undo journal mirrors ctx.objects; and per-type facts from the MRO are read once per call instead of once per value.",
-    "ch4_narrative": "Verification: two adversarial reviews broke my assumptions. The first found code run twice and crashes on small thread stacks. The second found a dropped walker that never flushed its memo (from Rust, sys.getrefcount has no temporary reference, so my threshold was off by one), O(memo) hand-backs, and a frame-counting depth check that audit hooks defeated. I replaced the estimate with a probe that asks the interpreter directly, mirrored the memo incrementally, and added 34 regression tests. The final parity sweep: 30,000 seeded runs, all byte-identical.",
-    "ch5_narrative": "Optimization: across six workloads, capture went from 73.2 ms to 9.3 ms (7.88x) and a full save_dumping from 96.4 ms to 33.1 ms (2.91x), with lower peak RSS. The layout pass added about 5% and PGO another 7% on capture. A single call on a lone int is still slower natively (267 ns vs 91 ns), because a transaction has a fixed setup cost; containers are 3.4-4.6x faster."
+    "ch3_narrative": "Rewrite: 17 modules, 3,530 lines of Rust code and 877 of comments, none over 400 lines, no unsafe. A descriptor binds ctx.value to the walker without adding a Python frame; an insertion-ordered memo with an undo journal stands in for ctx.objects and ctx._sources, which the walker writes lazily, only when Python code could read them; per-type facts from the MRO are read once per call instead of once per value; and a native finalizer writes what the walker still holds before the cyclic collector frees a context.",
+    "ch4_narrative": "Verification: twenty-two adversarial reviews broke my assumptions. The first found code run twice and crashes on small thread stacks; the second a dropped walker that never flushed its memo and a depth check that audit hooks defeated; later ones found hooks the walker could not see, copy protocols it bypassed, Python code that edits the memo dicts between calls in ways the counts did not show, a context the cyclic collector freed before its walker wrote, and writes that failed halfway or met keys whose comparison runs code. Every code finding became a regression test, and more than 60 fixes were reverted one at a time to check that a test fails without them; the two that no test caught at first got new tests. Not every difference could be closed: the ones left, such as a RecursionError a few levels earlier near CPython's C recursion limit, are documented in the blueprint. The final sweep: 30,000 parity seeds, byte-identical but for those documented differences.",
+    "ch5_narrative": "Optimization: across six workloads, the first native build with PGO took capture from 73.2 ms to 9.3 ms (7.88x) and save_dumping from 96.4 ms to 33.1 ms (2.91x). The checks the reviews added cost about 7% of capture, leaving the current build 7.3x faster than the original Python walk on capture and 3.0x on save (sums; 3.4x and 2.1x geomean against the current Python walk), with byte-identical snapshots. A memo hit costs about 1.1 us natively against 0.05 us in Python, and a new context that captures a single int about 5.5 us against 2.5 us, so a throwaway context capturing a scalar is faster in Python; with a 20-key dict it is 7.9 us against 19.8 us. Containers are where the walker wins."
   },
   "census": {
     "before": {
@@ -43,19 +43,19 @@
     },
     "after": {
       "scanned": true,
-      "files": 14,
-      "code_loc": 2602,
-      "comment_loc": 489,
-      "comment_pct": 18.8,
-      "max_file_loc": 357,
-      "avg_file_loc": 221,
+      "files": 17,
+      "code_loc": 3530,
+      "comment_loc": 877,
+      "comment_pct": 24.8,
+      "max_file_loc": 385,
+      "avg_file_loc": 259,
       "files_under_400_pct": 100.0,
       "doc_tests": 3,
       "max_nesting_depth": 6,
-      "avg_fn_loc": 20,
+      "avg_fn_loc": 21,
       "unsafe_blocks": 0,
       "forbid_unsafe": true,
-      "branch_coverage_pct": 88.2,
+      "branch_coverage_pct": 96.5,
       "clippy_warnings": 0
     }
   },
@@ -183,6 +183,56 @@
       "clippy_warnings": 0,
       "failures_summary": "Second adversarial review (api-lifecycle, robustness, app-code, parity reproducers): a dropped walker never flushed its memo (getrefcount from Rust has no temporary reference, so the shared check was off by one); a walker moved to another context lost unwritten copies; bound ctx.value.__doc__ showed PyO3's generated class text signature; full memo export cost 30-125 ms per hand-back; the start check cost 27 us from a 20,000-frame stack; plus audit-hook denial, unreproducible context state, colliding instance-dict keys, planted getsets and surrogate keyword names. Coverage run: two depth-sensitive tests handed back on the unoptimized build's larger frames.",
       "fix_applied": "Recursion headroom measured by recursing into values._headroom (capped 1024-frame look); incremental memo mirroring (mirror.rs) flushed before hand-back, __getstate__, retire, release and context switch; retire for state only Python reproduces; real MethodType binding with text_signature=None; Drop compares refcount with a walker-only baseline; 34 new regression tests (re-entry, other-thread error, in-place placeholder replacement, mutation-checked). Final: 736 native + 276 pure pytest + 9 Rust tests on 3.13; 3.14 737; 3.15 737 + 1 environmental (task_for_pid denied). Coverage of the extension from the Python suites: lines 96.3%, functions 96.8%, regions 88.2% (logged; stable rustc has no branch coverage)."
+    },
+    {
+      "iteration": 6,
+      "total": 954,
+      "passed": 952,
+      "failed": 0,
+      "coverage_pct": 96.1,
+      "clippy_warnings": 0,
+      "failures_summary": "Seventh adversarial review confirmed: a removal inside a hand-back masked by that walk's additions (both dicts), a removed _sources original kept alive by the memo, a _walker slot flushing on release, copy hooks the check missed (instance attributes, metaclass __copy__/__getattr__/__getattribute__, class __getattr__, __getnewargs_ex__/__getnewargs__), a colliding _truncation key whose __eq__ ran before a helper, an order-dependent release test and an outcome comparison blind to exception args and subclass items. After the fixes: pytest 943 passed, 2 skipped (3.13); 3.12 943, 3.14 944, 3.11 pure 293; 3.15 944 with the pre-existing macOS sys.remote_exec PermissionError; cargo 9 tests; 13/13 reverted fixes caught.",
+      "fix_applied": "Boundary check of the last mirrored key in each dict at a hand-back resync and in eager mode; rebuild on a shorter _sources at sync and flush; _walker slot no longer stock; copy-hook names on instance and metaclass (with plain-key guard) checked per call; _truncation keys must be plain; release test on a fresh class first made in either walk, with slots; _comparable reads args, members and subclass items."
+    },
+    {
+      "iteration": 7,
+      "total": 996,
+      "passed": 994,
+      "failed": 0,
+      "coverage_pct": 96.3,
+      "clippy_warnings": 0,
+      "failures_summary": "Eighth adversarial review (BLUEPRINT: decisions the ninth review forced) confirmed: a flush (copy, pickle, __getstate__, hand-back, retire, release) that checked counts only and wrote back an entry Python removed while adding more; the sync checking where Python left the dicts only during a hand-back or after a copy; a _sources key of another kind whose __eq__ a rebuild ran; copy.replace/__replace__ missing from the copy hooks (dataclass contexts on 3.13+); and a hooks test that could not see metaclass reads. A new differential fuzzer that mixes removals and additions between calls (padding _sources so the count changes) then found the walker's unwritten copies written after Python's additions once Python removed an entry, also when it removed the entry the walker wrote last and put it back, or added an objects key that is not an id. After the fixes: pytest 994 passed, 2 skipped (3.13); 3.12 991, 3.14 995, 3.11 pure 293; 3.15 995 with the pre-existing macOS sys.remote_exec PermissionError; cargo 9 tests; 13/13 reverted fixes caught.",
+      "fix_applied": "Every flush but a commit's checks the key ending each mirrored part; the sync checks it whenever a count changed; after a removal the walker finds where Python's additions begin from the entry it wrote last (by key identity in _sources, by id in objects) or the first key it does not know; a _sources key not of a plain kind sends the context to the Python walk and pruning reads keys in order; __replace__ joins values._COPY_PROTOCOL and the metaclass names; 30 new parity tests."
+    },
+    {
+      "iteration": 8,
+      "total": 1040,
+      "passed": 1038,
+      "failed": 0,
+      "coverage_pct": 96.4,
+      "clippy_warnings": 0,
+      "failures_summary": "Ninth adversarial review (BLUEPRINT: decisions the tenth review forced) confirmed: a removal with as many additions between calls went unnoticed before any copy, so once a flush checked where Python left the dicts a later one put Python's addition after the walker's next copies; after a removal the walker took Python's additions to begin after its last entry wherever that was, so the entry put back after an addition (objects, or the same _sources key) put the walker's copy after both; and copy.replace through a __class__ property or class attribute missed the copy hooks. The fuzzer, no longer padding _sources, then found an original the walker wrote that Python put into a replaced _sources counted as the walker's. After the fixes: pytest 1038 passed, 2 skipped (3.13); 3.12 1033, 3.14 1039, 3.11 pure 293; 3.15 1039 with the pre-existing macOS sys.remote_exec PermissionError; cargo 9 tests; every reverted fix caught.",
+      "fix_applied": "Every sync checks the key ending each dict; one forward scan, capped at the part the walker last saw, stops after its last entry or before the first key it does not know; __class__ joins values._COPY_PROTOCOL. Tests: a removal with as many additions before any copy (36 params), the removed key or copy put back, Python entries after all the walker wrote, copy.replace through __class__."
+    },
+    {
+      "iteration": 9,
+      "total": 1056,
+      "passed": 1054,
+      "failed": 0,
+      "coverage_pct": 96.4,
+      "clippy_warnings": 0,
+      "failures_summary": "Tenth adversarial review (BLUEPRINT: decisions the eleventh review forced) found no mirror defect in about 160k fuzz seeds. It confirmed one older code defect: a memo hit in _mapping called isinstance on an entry Python code added, which reads that entry's __class__, so a mock or lazy proxy answering __class__ ran its code in the walker and again in the Python walk after the hand-back, and a stateful one changed the outcome. It also found two test gaps (unwritten rows only re-found the held copy; the precedence of the first unknown key was unpinned) and three doc inaccuracies. After the fixes: pytest 1054 passed, 2 skipped (3.13); 3.12 1049, 3.14 1055, 3.11 pure 293; 3.15 1055 with the pre-existing PermissionError; cargo 9 tests; 20/20 reverted fixes caught.",
+      "fix_applied": "mapping.rs decides by exact type: reads an exact placeholder, treats builtin scalars and containers as none, hands anything else back before running code. Tests: a memo entry answering its own __class__ (property, __getattribute__, plain and builtin controls; 12 params); the held rows now make a new copy after Python's change; the last entry put back among the first entries. BLUEPRINT: cost condition, 'as many entries as the walker last saw', the unnoticed-removal example, stale placeholders seen by lazy readers."
+    },
+    {
+      "iteration": 10,
+      "total": 1133,
+      "passed": 1126,
+      "failed": 0,
+      "coverage_pct": 96.5,
+      "clippy_warnings": 0,
+      "failures_summary": "Reviews twelve to twenty-two (BLUEPRINT: decisions the twelfth to twenty-second reviews forced) found that a context the cyclic collector freed lost the copies its walker had yet to write; that before 3.14 a dying context's untracked dicts, and on every version a spent C stack, change what a walker can write when it goes; that the lazily written mirror lost or misordered entries after a write that failed, a removal it noticed, or a copy replaced in place; that a key whose comparison runs code could fail between taking Python's entries out and putting them back; and that callbacks inside an eager call changed the dicts after the call's sync. After the fixes: pytest 1126 passed, 7 skipped (3.13); 3.12 1121, 3.14 1127, 3.11 pure 293; 3.15 1127 with the pre-existing macOS task-port PermissionError in test_native_pid_capture_preserves_business_frame; cargo 9 tests; rustfmt, clippy and ruff clean.",
+      "fix_applied": "Walker.release is the native finalizer and the only place a walker writes when it goes (release.rs); a release that writes only ctx.objects owes _sources the originals it left out (State::owed, in place or appended); flush.rs writes what is owed first, each original before its copy, clears its notes only once all of it is written, puts Python's later entries back though a write fails, leaves them in place where a key may compare with code, and reads every key where a removal or a foreign key means it has not read them all; an eager commit checks the dicts again. Each code fix has a regression test in test_native_parity.py and was reverted to check that a test fails without it."
     }
   ],
   "parity_iterations": [
@@ -217,6 +267,46 @@
       "max_abs_error": "0",
       "divergence_cause": "None in the seeded sweep (5000 seeds x PYTHONHASHSEED 0-3 on 3.13, plus 3.14 and 3.15). Reproducer-only divergences fixed: walker drop and move between contexts, class-level call over a lazily mirrored memo.",
       "fix_applied": "Flush into the previously mirrored dicts before switching; Drop refcount baseline; class attribute keeps routing to the walker."
+    },
+    {
+      "iteration": 5,
+      "seeds_tested": 54000,
+      "seeds_passed": 54000,
+      "max_abs_error": "0",
+      "divergence_cause": "Before the fixes the round-7 reproducers h1-h4 diverged (stale copy or original after a removal inside a hand-back, removed original kept alive, wrong object at a reused id), as did 7 copy-hook routes and 7 colliding-key hook counts. After: 30,000 parity seeds (5000 x PYTHONHASHSEED 0-3 on 3.13, 5000 on 3.14 and 3.15) and 24,000 mirror fuzz seeds (fuzz2 18,000, fuzz3 6,000) byte-identical; the remaining h5 (exception() then a removal) and patched Counter methods are documented differences.",
+      "fix_applied": "See test iteration 6."
+    },
+    {
+      "iteration": 6,
+      "seeds_tested": 52000,
+      "seeds_passed": 52000,
+      "max_abs_error": "0",
+      "divergence_cause": "Before the fixes the round-8 reproducers (flush past a moved boundary, a colliding _sources key's __eq__, copy.replace through __replace__) diverged, and the new mixing fuzzer found misordered unwritten copies after removals (both dicts, a re-added boundary, a non-id objects key). After: 30,000 parity seeds (5000 x PYTHONHASHSEED 0-3 on 3.13, 5000 on 3.14 and 3.15), 15,500 mixing-fuzzer seeds and 6,500 fuzz2/3/4 seeds byte-identical. Mixing-fuzzer cases left out as documented differences: equal-count removal and addition before any copy, an entry the walker wrote last put back in place, and an entry Python wrote for an unwritten copy and removed before the next call.",
+      "fix_applied": "See test iteration 7."
+    },
+    {
+      "iteration": 7,
+      "seeds_tested": 76000,
+      "seeds_passed": 76000,
+      "max_abs_error": "0",
+      "divergence_cause": "Before the fixes the ninth review's reproducers (count-neutral swap before a copy, last entry put back after an addition, copy.replace through __class__) diverged, and the unpadded mixing fuzzer found a known original in a replaced _sources counted as the walker's. After: 30,000 parity seeds (5000 x PYTHONHASHSEED 0-3 on 3.13, 5000 on 3.14 and 3.15) and 46,000 mirror fuzz seeds byte-identical but for documented differences (a non-id _sources key in an aliased dict, a put-back entry that stayed in place, a non-id key ahead).",
+      "fix_applied": "See test iteration 8."
+    },
+    {
+      "iteration": 8,
+      "seeds_tested": 43000,
+      "seeds_passed": 43000,
+      "max_abs_error": "0",
+      "divergence_cause": "Before the fix the planted-__class__ reproducer ran the hook twice natively and, for a stateful hook, changed truncation and node counts. After: 30,000 parity seeds (5000 x PYTHONHASHSEED 0-3 on 3.13, 5000 on 3.14 and 3.15) and 13,000 new mirror fuzz seeds byte-identical but for the same documented differences.",
+      "fix_applied": "See test iteration 9."
+    },
+    {
+      "iteration": 9,
+      "seeds_tested": 30000,
+      "seeds_passed": 30000,
+      "max_abs_error": "0",
+      "divergence_cause": "None in the final sweep: 5000 seeds for each PYTHONHASHSEED 0-3 on 3.13 and 5000 each on 3.14 and 3.15, byte-identical but for the documented differences.",
+      "fix_applied": "See test iteration 10."
     }
   ],
   "benchmarks": [
@@ -351,10 +441,10 @@
       "before_score": null,
       "before_grade": "N/A",
       "before_label": "Not measured",
-      "after_score": 88,
-      "after_grade": "A-",
-      "after_label": "88.2% Coverage",
-      "delta_badge": "0 Warnings \u2022 88.2% Cov",
+      "after_score": 96,
+      "after_grade": "A+",
+      "after_label": "96.5% Coverage",
+      "delta_badge": "0 Warnings \u2022 96.5% Cov",
       "explanation": "Unit, integration, doc-tests, and property-based proptest suites with clippy -D warnings verification."
     },
     {
@@ -364,10 +454,10 @@
       "before_score": 55,
       "before_grade": "D",
       "before_label": "14.1% Comments \u2022 429 Max LOC",
-      "after_score": 94,
-      "after_grade": "A",
-      "after_label": "18.8% Docs \u2022 357 Max LOC",
-      "delta_badge": "+33% Docs",
+      "after_score": 100,
+      "after_grade": "A+",
+      "after_label": "24.8% Docs \u2022 385 Max LOC",
+      "delta_badge": "+76% Docs",
       "explanation": "Public types and functions documented with rustdoc and runnable doc-tests, targeting <=400 LOC per file."
     },
     {
@@ -379,8 +469,8 @@
       "before_label": "Depth 7 \u2022 18 LOC/Fn",
       "after_score": 84,
       "after_grade": "B+",
-      "after_label": "Depth 6 \u2022 20 LOC/Fn",
-      "delta_badge": "+11% Fn Size",
+      "after_label": "Depth 6 \u2022 21 LOC/Fn",
+      "delta_badge": "+17% Fn Size",
       "explanation": "Decomposed deeply nested monolithic functions and mutable globals into small, composable functions."
     },
     {

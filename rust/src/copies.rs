@@ -24,6 +24,7 @@ impl State {
         if let Some(layout) = info.layout.clone() {
             return Ok(layout);
         }
+        self.before_python(py)?;
         let pair = self
             .ctx(py)?
             .call_method1(intern!(py, "_layout"), (value,))?;

@@ -57,13 +57,10 @@ impl State {
                 if cached_type == s.dict || cached_type == s.fake_dict_type {
                     return Ok(cached);
                 }
-                if cached.is_instance(s.truncated.bind(py))? {
+                if cached_type == s.truncated_type {
                     // Reading an application's placeholder may run its own
                     // code: only an exact one with an exact dict of plain
                     // keys is read here.
-                    if cached_type != s.truncated_type {
-                        return Err(Halt::Bail);
-                    }
                     match self.attributes(py, &cached)? {
                         Some(attrs) if s.plain_dict(&attrs) => {}
                         _ => return Err(Halt::Bail),
@@ -74,6 +71,13 @@ impl State {
                         return Err(Halt::Bail);
                     }
                     reusable = !reason.ne(intern!(py, "max_depth"))?;
+                } else if !s.plain_keys.contains(&cached_type)
+                    && ![s.bytearray, s.list, s.tuple, s.set, s.frozenset].contains(&cached_type)
+                {
+                    // The Python walk's `isinstance` reads any other entry's
+                    // `__class__`, which its class may answer with its own
+                    // code, and a placeholder's `reason`: it runs them once.
+                    return Err(Halt::Bail);
                 }
             }
             if !reusable {
@@ -212,6 +216,10 @@ impl State {
             } else {
                 self.root_value(py, &item)?
             };
+            if !self.s.plain_key(&converted_key) {
+                // A copy's own `__hash__`, `FakeContainer`'s, is Python.
+                self.before_python(py)?;
+            }
             if let Err(err) = target.set_item(converted_key, converted_value) {
                 match Halt::from(err) {
                     Halt::Py(err) if err.is_instance_of::<PyTypeError>(py) => {

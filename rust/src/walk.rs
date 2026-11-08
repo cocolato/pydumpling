@@ -273,10 +273,16 @@ impl State {
         let converted = self.value(py, item, depth + 1)?;
         match captured.cast::<PyList>() {
             Ok(list) => list.append(converted)?,
-            Err(_) => captured
-                .cast::<PySet>()
-                .map_err(PyErr::from)?
-                .add(converted)?,
+            Err(_) => {
+                if !self.s.plain_key(&converted) {
+                    // A copy's own `__hash__`, `FakeContainer`'s, is Python.
+                    self.before_python(py)?;
+                }
+                captured
+                    .cast::<PySet>()
+                    .map_err(PyErr::from)?
+                    .add(converted)?
+            }
         }
         *count += 1;
         Ok(true)
@@ -299,6 +305,7 @@ impl State {
                 Some(attrs) if s.plain_dict(&attrs) => {}
                 _ => return Err(Halt::Bail),
             }
+            self.before_python(py)?;
             s.fake_class_repr.bind(py).call1((value,))?
         } else {
             let type_name = self.type_name(py, value)?;

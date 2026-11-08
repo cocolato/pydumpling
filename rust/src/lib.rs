@@ -5,8 +5,9 @@
 //! memo, node budget, truncation counters, and copies, so a snapshot pickles
 //! to the same bytes whichever walk produced it. The walker never runs
 //! application code: where the Python walk would, or where its result would
-//! depend on its own recursion limit, the walker hands the whole call back
-//! to Python before doing anything, so that code runs exactly once.
+//! depend on its own recursion limit, the walker undoes what the call did
+//! and hands the whole call back to Python before any such code runs, so
+//! that code runs exactly once.
 //!
 //! The module is optional and needs Python 3.12+: without it, or with
 //! `PYDUMPLING_NATIVE=0`, pydumpling captures with the Python walk alone.
@@ -15,10 +16,13 @@
 mod arguments;
 mod copies;
 mod dispatch;
+mod flush;
 mod keys;
 mod mapping;
 pub mod memo;
 mod mirror;
+mod release;
+mod shadow;
 mod statics;
 mod text;
 mod transaction;
