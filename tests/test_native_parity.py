@@ -2456,7 +2456,7 @@ def test_empty_bytes_that_are_not_the_singleton():
         _same_in_both_modes(build, options, lambda c, a, b: [lambda: c.value([a, b])])
 
 
-class _Colliding(str):
+class _CollidingName(str):
     """A class-dict key that hashes like the names the walk looks up."""
 
     def __hash__(self):
@@ -2473,9 +2473,9 @@ def test_class_dict_keys_that_are_not_str():
     """Types whose class dicts hold other keys run their hooks only in Python."""
 
     def build():
-        odd = type("Odd", (), {_Colliding("tag"): 1, _Key("other"): 2})
-        big = type("Big", (int,), {_Colliding("tag"): 1})
-        space = type("Space", (dict,), {_Colliding("tag"): 1})
+        odd = type("Odd", (), {_CollidingName("tag"): 1, _Key("other"): 2})
+        big = type("Big", (int,), {_CollidingName("tag"): 1})
+        space = type("Space", (dict,), {_CollidingName("tag"): 1})
         child = type("Child", (odd,), {"__slots__": ()})
         instance = odd()
         instance.x = [1]
@@ -4027,11 +4027,11 @@ def test_copy_replacing_a_placeholder_the_original_omitted():
     _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
 
 
-@pytest.mark.parametrize("retired", [False, True], ids=["native", "retired"])
-def test_copying_a_context_that_keeps_its_walker_in_a_slot(retired):
+def test_copying_a_context_that_keeps_its_walker_in_a_slot():
     """A context class with a ``_walker`` slot and ``__getattr__`` copies and
     pickles running ``__getattr__`` exactly as often as one that captures
-    in Python, while the walker captures and after it retired."""
+    in Python, both while the slot holds the walker and after the first
+    capture, which retires it: a slotted walker captures in Python."""
     outcomes = {}
     for native in (False, True):
         log = []
@@ -4045,18 +4045,30 @@ def test_copying_a_context_that_keeps_its_walker_in_a_slot(retired):
 
         with _mode(native):
             context = Context(DumpOptions())
-        results = [context.value([1, "a"])]
-        if retired:
-            context._truncation = {}
-            results.append(context.value([2]))
+        assert (type(_slot(context)).__name__ == "_Walker") is native
+        state = context.__getstate__()
+        # Built as without a walker: no slot state, the dict without it.
+        assert isinstance(state, dict) and "_walker" not in state
+        early = copy.copy(context)
+        results = [early.value([1, "a"]), context.value([1, "a"])]
+        assert _slot(context) is None if native else _slot(context) is _UNSET
         twin = copy.copy(context)
         context.__reduce_ex__(5)
-        results += [twin.value([1, "a"]), context.value([1, "a"])]
-        walker = object.__getattribute__(context, "__dict__").get("_walker")
-        assert walker is None
+        results += [twin.value([1, "a"]), context.value([1, "a"]), sorted(state)]
         outcomes[native] = (pickle.dumps(results, protocol=5), log)
     assert outcomes[True] == outcomes[False]
     assert "_walker" in outcomes[True][1]
+
+
+_UNSET = object()
+
+
+def _slot(context):
+    """The context's ``_walker`` as stock attribute access reads it."""
+    try:
+        return object.__getattribute__(context, "_walker")
+    except AttributeError:
+        return _UNSET
 
 
 def test_instance_dict_descriptor_of_another_class():
@@ -5220,7 +5232,7 @@ def test_a_context_collected_at_the_recursion_limit_keeps_its_copies():
 
 # Before CPython 3.14 the collector leaves a dict that holds nothing it
 # tracks untracked, as the walker's dicts are until it writes them; see
-# the accepted differences in rust/migration/BLUEPRINT.md.
+# the accepted differences in rust/DESIGN.md.
 _UNTRACKED_DICTS = not gc.is_tracked({})
 _TRACKED_DICTS_ONLY = pytest.mark.skipif(
     _UNTRACKED_DICTS,
@@ -7071,7 +7083,7 @@ def test_an_original_python_removes_is_released(native, then):
     assert freed == ["x"]
 
 
-class _Colliding:
+class _CollidingReason:
     """A truncation tally key hashing like a reason, with an ``__eq__``."""
 
     def __init__(self, reason):
@@ -7104,7 +7116,7 @@ def test_a_truncation_key_of_another_kind(reason, value):
     looks it up only to count."""
 
     def build():
-        return (_Colliding(reason),)
+        return (_CollidingReason(reason),)
 
     def calls(context, key):
         def keyed():

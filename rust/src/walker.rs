@@ -294,8 +294,9 @@ impl State {
         self.node_marker = node_marker.unbind();
         self.nodes = count;
         self.attributes = Some(attributes.unbind());
-        // A class may have changed since the last call; within a call the
-        // walk runs no application code, so it cannot.
+        // A class may have changed since the last call. Within a call only
+        // code the walk lets run (a signal handler, a collection, another
+        // thread) can change one, and the next call sees it.
         self.types.clear();
         // A copy of the context shares these dicts, and its Python walk
         // may replace a depth placeholder in place, as a hand-back may.

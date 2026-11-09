@@ -10,7 +10,7 @@
 //! added entries of its own in the meantime: those came later, so they are
 //! taken out and put back after the walker's, unless a key whose comparison
 //! is its own may meet theirs, when they stay ahead (but for a key a removal
-//! the walker does not notice lets in: see `rust/migration/BLUEPRINT.md`).
+//! the walker does not notice lets in: see `rust/DESIGN.md`).
 //! An entry the Python walk wrote in place of one the dict held, Python
 //! code may have removed since, and it stays removed.
 

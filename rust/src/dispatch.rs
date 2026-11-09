@@ -12,8 +12,6 @@
 //!
 //! The walker takes only the argument shapes [`crate::arguments`] reads.
 
-use std::cell::RefCell;
-
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError};
 use pyo3::gc::PyVisit;
 use pyo3::intern;
@@ -21,39 +19,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 use pyo3::PyTraverseError;
 
-use crate::statics::address;
 use crate::walker::{Call, Walker};
-
-thread_local! {
-    /// The walkers capturing on this thread, by address.
-    static RUNNING: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Marks a walker as capturing on this thread while it lives.
-struct Running(usize);
-
-impl Running {
-    fn enter(walker: usize) -> Self {
-        RUNNING.with(|running| running.borrow_mut().push(walker));
-        Self(walker)
-    }
-
-    /// Whether `walker` is capturing on this thread.
-    fn here(walker: usize) -> bool {
-        RUNNING.with(|running| running.borrow().contains(&walker))
-    }
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        RUNNING.with(|running| {
-            let mut running = running.borrow_mut();
-            if let Some(index) = running.iter().rposition(|&walker| walker == self.0) {
-                running.remove(index);
-            }
-        });
-    }
-}
 
 // A native method descriptor over a Python walk method. Plain comments,
 // not a doc comment: a class docstring would hide the function's own
@@ -200,23 +166,17 @@ impl Dispatch {
         let Some(walker) = self.walker_of(ctx)? else {
             return pure.call(prepend(ctx, args)?, kwargs);
         };
-        let id = address(walker.as_any());
+        // A finalizer, collection callback, audit hook or signal handler
+        // that runs while this walker captures, or another thread: the
+        // copies of the call in progress are in no state the Python walk
+        // can share.
         let Ok(mut walker) = walker.try_borrow_mut() else {
-            if Running::here(id) {
-                // A finalizer, collection callback, audit hook or signal
-                // handler run while this walker captures: the copies of the
-                // call in progress are in no state the Python walk can share.
-                return Err(PyRuntimeError::new_err(
-                    "this SnapshotContext is already capturing: \
-                     reentrant capture on the same native context is unsupported",
-                ));
-            }
             return Err(PyRuntimeError::new_err(
-                "this SnapshotContext is already capturing: \
-                 a context captures on one thread at a time",
+                "this SnapshotContext is already capturing: a native context \
+                 captures one call at a time, so reentrant or concurrent \
+                 capture through it is unsupported",
             ));
         };
-        let _running = Running::enter(id);
         let call = Call {
             pure,
             mapping: self.mapping,

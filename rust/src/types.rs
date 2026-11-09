@@ -1,9 +1,11 @@
 //! What the walk learns about a type from its MRO, cached per type.
 //!
 //! The Python walk rereads a value's MRO through `type.__dict__`
-//! descriptors for every value. The native walk runs no application code,
-//! so the answers cannot change during one call; the walker reads them once
-//! per type and call, and keeps the type alive so its address is not reused.
+//! descriptors for every value. The walker reads it once per type and
+//! call, and keeps the type alive so its address is not reused. Native code
+//! runs no application code; a class that code run inside a call changes
+//! (a signal handler, a collection, another thread) is seen from the next
+//! call, an accepted difference (`rust/DESIGN.md`).
 
 use std::sync::Arc;
 
