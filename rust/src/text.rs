@@ -104,22 +104,13 @@ impl State {
             slot: Slot::Value(captured.clone().unbind()),
             original: original.clone().unbind(),
         };
-        let at = self.memo.len();
         if self
             .memo
             .insert(key, entry)
             .is_some_and(|slot| slot < self.mirrored)
         {
-            // `ctx.objects` still holds the copy this one replaces; the
-            // Python walk writes the original over `_sources`' entry, if it
-            // has one. A lookup that fails, in a key's own `__eq__`, writes
-            // it as for a `_sources` without one.
-            let py = original.py();
-            let held = self
-                .mirror
-                .as_ref()
-                .is_some_and(|(_, sources)| sources.bind(py).contains(key).unwrap_or(false));
-            self.dirty.push((key, at, held));
+            // `ctx.objects` still holds the copy this one replaces.
+            self.dirty.push(key);
         }
         captured
     }

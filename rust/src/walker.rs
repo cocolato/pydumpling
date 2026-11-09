@@ -103,20 +103,15 @@ pub(crate) struct State {
     pub(crate) mirror: Option<(Py<PyDict>, Py<PyDict>)>,
     /// How many memo entries, oldest first, `ctx.objects` holds.
     pub(crate) mirrored: usize,
-    /// How many entries `ctx._sources` held when the walker last had no
-    /// unwritten copies, and the newest: Python code added any after it.
+    /// How many entries `ctx._sources` held at the last sync or write, and
+    /// the newest: Python code added any after it.
     pub(crate) sources_mirrored: usize,
     pub(crate) sources_last: Option<Py<PyAny>>,
     /// Whether each call writes its copies to `ctx.objects` when it ends,
     /// as once a copy of the context may share that dict.
     pub(crate) eager: bool,
-    /// Keys of mirrored entries the walk replaced in place since, with the
-    /// memo length then and whether `ctx._sources` then held the key.
-    pub(crate) dirty: Vec<(usize, usize, bool)>,
-    /// Ids `ctx._sources` held without a memo entry when last read, as the
-    /// builtin exceptions `exception()` keeps: the Python walk writes an
-    /// original copied later in place, which Python code may then remove.
-    pub(crate) sources_only: AddressMap<()>,
+    /// Keys of mirrored entries the walk replaced in place since.
+    pub(crate) dirty: Vec<usize>,
     /// Whether `ctx.objects` holds a key that is not an id, or `_sources`
     /// one not of a plain kind: only the Python walk looks them up as it would.
     pub(crate) foreign: bool,
@@ -131,8 +126,8 @@ pub(crate) struct State {
     /// leaves untracked needs it: see [`crate::release`].
     pub(crate) owner: Option<Owner>,
     /// The writes into `ctx._sources` a release that wrote only
-    /// `ctx.objects` left out, in the Python walk's order, which the next
-    /// flush makes in front of anything newer: see [`crate::release`].
+    /// `ctx.objects` left out, in order, which the next write makes first:
+    /// see [`crate::release`].
     pub(crate) owed: Vec<Owed>,
     /// While such a release writes, the writes it so leaves out.
     pub(crate) owing: Option<Vec<Owed>>,
@@ -183,7 +178,6 @@ impl State {
             sources_last: None,
             eager: false,
             dirty: Vec::new(),
-            sources_only: AddressMap::default(),
             foreign: false,
             truncated: Vec::new(),
             stock,

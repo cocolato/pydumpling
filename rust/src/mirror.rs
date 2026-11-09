@@ -8,23 +8,21 @@
 //! them, on a hand-back or a copy of the context. Python adds copies to
 //! `ctx.objects` by appending, so afterwards the walker adopts just the new
 //! tail; one that replaces or empties the dict resets the memo, as it
-//! resets the Python walk's. Entries Python code adds to either dict while
-//! the walker holds unwritten copies came later than those copies, so the
-//! walker first writes its copies in front of them. The ids `_sources`
-//! holds without a copy are noted, since the Python walk writes an original
-//! the walker copies later in their place. Entries Python removes, the
-//! memo lets go of, as the Python walk then holds them nowhere; at every
-//! sync the walker checks that the last entries it saw are still where it
-//! saw them, as removing some while adding others shows in no count. It
-//! looks originals up in `_sources` only while every key it read there is
-//! of a plain kind, whose lookup runs no code; a key a removal it does not
-//! notice lets in, it never reads.
+//! resets the Python walk's. Entries Python removes, the memo lets go of,
+//! as the Python walk then holds them nowhere; at every sync the walker
+//! checks that the last entries it saw are still where it saw them, as
+//! removing some while adding others shows in no count. When Python code
+//! changes `objects`, removes entries or replaces a dict while the walker
+//! holds unwritten copies, the walker writes them first, after what Python
+//! added. Additions to `_sources` alone, as `exception()` makes, need no
+//! write. The walker looks originals up in `_sources` only while every key
+//! it read there is of a plain kind, whose lookup runs no code; a key a
+//! removal it does not notice lets in, it never reads.
 
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyInt};
 
-use crate::memo::AddressMap;
 use crate::shadow::attributes;
 use crate::statics::type_address;
 use crate::walker::{Entry, Slot, State};
@@ -40,65 +38,48 @@ impl State {
         sources: Bound<'_, PyDict>,
         overwrites: bool,
     ) -> PyResult<()> {
-        let (same, same_sources) = match &self.mirror {
-            Some((known, kept)) => (known.bind(py).is(&objects), kept.bind(py).is(&sources)),
-            None => (false, false),
+        let same = match &self.mirror {
+            Some((known, kept)) => known.bind(py).is(&objects) && kept.bind(py).is(&sources),
+            None => false,
         };
-        let same = same && same_sources;
-        let resized = objects.len() != self.mirrored || sources.len() != self.sources_mirrored;
-        // Entries Python code removed while it added others, as another
-        // Python walk does during a hand-back, show in no count, but move
-        // the last entry the walker saw; only a removal that leaves that
-        // entry where it was goes unnoticed.
+        // Python code removed entries: a dict with fewer than the walker
+        // saw has none where it saw the last. Removals alongside additions,
+        // as another Python walk makes during a hand-back, show in no count,
+        // but move that entry; only a removal that leaves it where it was
+        // goes unnoticed.
         let moved = same && !self.follows(py, &objects, &sources)?;
-        let flushes = self.unwritten() && (!same || resized || moved);
+        let flushes = self.unwritten() && (!same || moved || objects.len() != self.mirrored);
         if flushes {
-            // Python code replaced a dict, or added or removed entries,
-            // while the walker held unwritten copies, which the Python walk
-            // had written at once: they go into the dicts the walker
-            // mirrored first, in front of entries Python added. A flush
-            // lets go of the originals Python removed, and notes the ids
-            // it added, itself.
+            // The walker's copies go into the dicts it mirrored, after what
+            // Python added; the flush then takes the memo from `objects`.
             self.flush(py, same && !moved)?;
         }
-        let (len, seen) = (objects.len(), self.sources_mirrored);
         // Python emptied or replaced a dict, or removed entries: the memo
         // is then what `objects` holds, with the originals `_sources` holds,
         // letting go of the others as the Python walk did.
-        let rebuilds =
-            !same || len < self.mirrored || (!flushes && (sources.len() < seen || moved));
-        let added = match rebuilds || flushes || sources.len() <= seen {
-            true => Vec::new(),
-            false => newest(py, &sources, sources.len() - seen)?,
-        };
-        // Looking an original up in `_sources` may run a key's own methods.
-        self.foreign |= !added.iter().all(|key| self.s.plain_key(key));
+        let rebuilds = !same || (!flushes && moved);
+        let len = objects.len();
         let changed = rebuilds || len != self.mirrored;
         if rebuilds {
             self.rebuild(py, &objects, &sources)?;
-        } else if len > self.mirrored && !self.foreign {
-            // Python added copies; the walker had none unwritten.
-            self.adopt_tail(py, &objects, &sources, len - self.mirrored)?;
+        } else if !flushes {
+            self.saw_additions(py, &sources)?;
+            if len > self.mirrored && !self.foreign {
+                // Python added copies; the walker had none unwritten.
+                self.adopt_tail(py, &objects, &sources, len - self.mirrored)?;
+            }
         }
         if overwrites && !self.foreign {
             self.recheck(py, &objects, &sources)?;
         }
-        // A flush or rebuild notes the ids `_sources` holds alone itself.
-        let mut noted = rebuilds || flushes;
         if changed {
             if self.memo.len() != len && !self.foreign {
                 // A copy dropped mid-dict.
                 self.rebuild(py, &objects, &sources)?;
-                noted = true;
             }
             self.mirrored = self.memo.len();
         }
-        if !noted {
-            self.note_sources(added);
-        }
-        if !self.unwritten() {
-            self.saw_sources(py, &sources)?;
-        }
+        self.saw_sources(py, &sources)?;
         self.mirror = Some((objects.unbind(), sources.unbind()));
         Ok(())
     }
@@ -123,7 +104,9 @@ impl State {
                 key_ending(py, sources, self.sources_mirrored)?,
                 &self.sources_last,
             ) {
-                (None, None) => true,
+                // A sync that raised after its rebuild leaves no newest key
+                // for a count it saw: the dict may have shrunk since.
+                (None, None) => self.sources_mirrored == 0,
                 (Some(key), Some(last)) => key.is(last.bind(py)),
                 _ => false,
             },
@@ -141,6 +124,21 @@ impl State {
         if len != self.sources_mirrored || (len > 0 && self.sources_last.is_none()) {
             self.sources_last = newest(py, sources, 1)?.pop().map(Bound::unbind);
             self.sources_mirrored = len;
+        }
+        Ok(())
+    }
+
+    /// Checks the keys Python code appended to `_sources` since the walker
+    /// last saw it, before the walker looks an original up there, which may
+    /// run the own methods of a key not of a plain kind.
+    pub(crate) fn saw_additions(
+        &mut self,
+        py: Python<'_>,
+        sources: &Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        if sources.len() > self.sources_mirrored {
+            let added = newest(py, sources, sources.len() - self.sources_mirrored)?;
+            self.foreign |= !added.iter().all(|key| self.s.plain_key(key));
         }
         Ok(())
     }
@@ -183,17 +181,11 @@ impl State {
         self.memo.clear();
         self.truncated.clear();
         self.dirty.clear();
-        self.sources_only.clear();
         self.sources_last = None;
         // Looking an original up in `_sources` may run a key's own methods.
         self.foreign = !self.s.plain_dict(sources);
         let keys = objects.keys().iter().collect();
-        let found = self.adopt(py, objects, sources, keys)?;
-        if sources.len() > found && !self.foreign {
-            // Ids only `_sources` holds; otherwise it holds the copies' alone.
-            self.rescan_sources(sources);
-        }
-        Ok(())
+        self.adopt(py, objects, sources, keys)
     }
 
     /// Adopts the last `count` copies Python added to `objects`, in order.
@@ -206,51 +198,11 @@ impl State {
     ) -> PyResult<()> {
         let mut keys = newest(py, objects, count)?;
         keys.reverse();
-        self.adopt(py, objects, sources, keys)?;
-        Ok(())
-    }
-
-    /// Notes the ids among `keys`, `_sources` entries Python code added,
-    /// that have no memo entry. A key that is not an id the Python walk
-    /// never writes over; one of a kind whose own methods looking an id up
-    /// may run sends the context to the Python walk.
-    pub(crate) fn note_sources<'py>(&mut self, keys: impl IntoIterator<Item = Bound<'py, PyAny>>) {
-        for key in keys {
-            self.foreign |= !self.s.plain_key(&key);
-            if let Some(id) = id_of(&key) {
-                if !self.memo.contains(id) {
-                    self.sources_only.insert(id, ());
-                }
-            }
-        }
-    }
-
-    /// Notes the ids `_sources` holds without a memo entry anew.
-    pub(crate) fn rescan_sources(&mut self, sources: &Bound<'_, PyDict>) {
-        self.sources_only.clear();
-        let keys: Vec<_> = sources.keys().iter().collect();
-        self.note_sources(keys);
-    }
-
-    /// Forgets the noted ids Python code removed from `_sources` before the
-    /// walker copied them, before it writes. One it copied while `_sources`
-    /// held it stays noted: the Python walk wrote it there in place. The
-    /// keys are read in order, which, unlike looking an id up, runs no key's
-    /// own methods.
-    pub(crate) fn prune_sources(&mut self, sources: &Bound<'_, PyDict>) {
-        let held: AddressMap<()> = sources
-            .keys()
-            .iter()
-            .filter_map(|key| id_of(&key))
-            .map(|id| (id, ()))
-            .collect();
-        let memo = &self.memo;
-        self.sources_only
-            .retain(|id, _| memo.contains(*id) || held.contains_key(id));
+        self.adopt(py, objects, sources, keys)
     }
 
     /// Moves the copies under `keys` into the memo, with their originals,
-    /// if every key is an id; how many of them `_sources` holds. The Python
+    /// if every key is an id. The Python
     /// walk looks its copies up by id: a key of any other kind, one equal
     /// to an id such as a float or one whose own methods compare it, only
     /// the Python walk looks up as it would, so the context goes to it, and
@@ -261,7 +213,7 @@ impl State {
         objects: &Bound<'_, PyDict>,
         sources: &Bound<'_, PyDict>,
         keys: Vec<Bound<'_, PyAny>>,
-    ) -> PyResult<usize> {
+    ) -> PyResult<()> {
         let mut ids = Vec::with_capacity(keys.len());
         for key in &keys {
             match id_of(key) {
@@ -270,18 +222,14 @@ impl State {
             }
         }
         if self.foreign {
-            return Ok(0);
+            return Ok(());
         }
-        let mut found = 0;
         for (key, id) in keys.iter().zip(ids) {
             let Some(captured) = objects.get_item(key)? else {
                 continue;
             };
             let original = match sources.get_item(key)? {
-                Some(original) => {
-                    found += 1;
-                    original
-                }
+                Some(original) => original,
                 None => py.None().into_bound(py),
             };
             if type_address(&captured) == self.s.truncated_type && !captured.is(&original) {
@@ -293,7 +241,7 @@ impl State {
             };
             self.memo.insert(id, entry);
         }
-        Ok(found)
+        Ok(())
     }
 
     /// Adopts the copies the Python walk put in place of depth placeholders:

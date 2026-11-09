@@ -41,8 +41,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyWeakrefMethods, PyWeakrefReference};
 use pyo3::PyTraverseError;
 
-use crate::memo::AddressMap;
-use crate::mirror::id_of;
 use crate::walker::{Slot, State};
 
 /// An object's reference count, read without calling Python, so where the
@@ -167,31 +165,20 @@ impl State {
             return Ok(());
         };
         let spare = sources.copy()?.unbind();
-        let memoized: AddressMap<()> = self.memo.iter().map(|(id, _)| (id, ())).collect();
         let last = self.sources_last.as_ref().map(|last| last.clone_ref(py));
-        let seen = (self.sources_mirrored, last, self.sources_only.clone());
+        let seen = (self.sources_mirrored, last);
         self.mirror = Some((objects.clone_ref(py), spare));
         self.owing = Some(Vec::new());
         let written = self.flush(py, false);
         let owing = self.owing.take().unwrap_or_default();
-        self.mirror = Some((objects, sources.clone().unbind()));
-        (self.sources_mirrored, self.sources_last, self.sources_only) = seen;
+        self.mirror = Some((objects, sources.unbind()));
+        (self.sources_mirrored, self.sources_last) = seen;
         // The writes it made begin with what it owed, in order: unless a
         // write failed among those, which made none of the rest, it owes
         // what it wrote; otherwise all it owed still.
         if owing.len() >= self.owed.len() {
             self.owed = owing;
         }
-        // The copies a rebuild let go of, as Python removed them from
-        // `objects`, have originals `_sources` holds without one. The keys
-        // are read in order, which, unlike looking an id up, runs no key's
-        // own methods.
-        let dropped: Vec<_> = (sources.keys().iter())
-            .filter(|key| {
-                id_of(key).is_some_and(|id| memoized.contains_key(&id) && !self.memo.contains(id))
-            })
-            .collect();
-        self.note_sources(dropped);
         written
     }
 
@@ -245,7 +232,6 @@ impl State {
         self.mirrored = 0;
         self.sources_mirrored = 0;
         self.sources_last = None;
-        self.sources_only.clear();
         self.ctx_type = None;
         self.owner = None;
         self.owed.clear();
