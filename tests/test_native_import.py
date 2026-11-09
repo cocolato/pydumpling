@@ -13,20 +13,24 @@ from pydumpling.snapshot import values as values_module
 _IMPORT_SCRIPT = """
 import sys
 
-# dill itself inspects a frame during its first import; the regression is the
-# additional frame access required only by pydumpling's optional extension.
-import dill
-
 def namespace():
     value = [1, 2]
     return sys._getframe().f_locals
 
 source = namespace()
 
+# A module pydumpling first imports from outside itself may read a frame as it
+# loads: dill does, and before 3.12 so does each collections.namedtuple call,
+# which uuid makes on Linux by importing platform. Those load first; the
+# regression is frame access by pydumpling's own code.
+for name in PRELOAD:
+    __import__(name)
+
 def deny(event, arguments):
-    if event == "sys._getframe":
+    if DENY and event == "sys._getframe":
         raise ERROR("frame access denied")
 
+loaded = set(sys.modules)
 sys.addaudithook(deny)
 from pydumpling.options import DumpOptions
 from pydumpling.snapshot import SnapshotContext
@@ -41,22 +45,29 @@ else:
     assert walker is None
 assert context._mapping(source) == {"value": [1, 2]}
 if NATIVE and type(source) is not dict:
-    assert walker.handbacks == 1
+    # Only frame access tells the walker the locals proxy's type; without it
+    # the walker hands the proxy to the Python walk.
+    assert walker.handbacks == int(DENY)
+
+def outside(name):
+    # Aliases such as multiprocessing's __mp_main__ load with their module.
+    spec = getattr(sys.modules[name], "__spec__", None)
+    return name.partition(".")[0] != "pydumpling" and spec and spec.name == name
+
+print(*sorted(filter(outside, set(sys.modules) - loaded)))
 print("ok")
 """
 
 
-@pytest.mark.parametrize("native", [False, True], ids=["python", "native"])
-@pytest.mark.parametrize("error", ["RuntimeError", "PermissionError"])
-def test_import_with_frame_access_denied(native, error):
-    if native and values_module._native is None:
-        pytest.skip("the optional native walker is unavailable")
+def _run_import_script(script, native):
+    """Run ``script`` and return the modules from outside pydumpling it loaded."""
+    # Built here, not passed in, so that a failure's traceback leaves the
+    # environment out.
     root = Path(__file__).resolve().parents[1]
     environment = dict(os.environ, PYDUMPLING_NATIVE="1" if native else "0")
     environment["PYTHONPATH"] = (
         str(root) + os.pathsep + environment.get("PYTHONPATH", "")
     )
-    script = _IMPORT_SCRIPT.replace("ERROR", error).replace("NATIVE", repr(native))
     process = subprocess.run(
         [sys.executable, "-B", "-c", script],
         cwd=root,
@@ -66,7 +77,23 @@ def test_import_with_frame_access_denied(native, error):
         timeout=30,
     )
     assert process.returncode == 0, process.stderr
-    assert process.stdout.strip() == "ok"
+    *_, outside, ok = process.stdout.splitlines()
+    assert ok == "ok"
+    return outside.split()
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["python", "native"])
+@pytest.mark.parametrize("error", ["RuntimeError", "PermissionError"])
+def test_import_with_frame_access_denied(native, error):
+    if native and values_module._native is None:
+        pytest.skip("the optional native walker is unavailable")
+    script = _IMPORT_SCRIPT.replace("ERROR", error).replace("NATIVE", repr(native))
+    # A run that allows frame access learns what pydumpling loads from outside
+    # itself, which the run that denies it then loads first.
+    allowed = script.replace("DENY", "False").replace("PRELOAD", "()")
+    outside = _run_import_script(allowed, native)
+    denied = script.replace("DENY", "True").replace("PRELOAD", repr(outside))
+    _run_import_script(denied, native)
 
 
 @pytest.mark.parametrize("error", [KeyboardInterrupt, SystemExit])
