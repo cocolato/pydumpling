@@ -13,7 +13,7 @@ use pyo3::types::{PyDict, PySet};
 use crate::keys::{pair, Chosen};
 use crate::memo::AddressMap;
 use crate::statics::{address, type_address};
-use crate::types::{Base, Kind};
+use crate::types::{plain_reason, reads_plainly, Base, Kind};
 use crate::walk::is_exact_str;
 use crate::walker::{Halt, Slot, State, Walk};
 
@@ -58,19 +58,18 @@ impl State {
                     return Ok(cached);
                 }
                 if cached_type == s.truncated_type {
-                    // Reading an application's placeholder may run its own
-                    // code: only an exact one with an exact dict of plain
-                    // keys is read here.
-                    match self.attributes(py, &cached)? {
-                        Some(attrs) if s.plain_dict(&attrs) => {}
-                        _ => return Err(Halt::Bail),
-                    }
-                    let reason = cached.getattr(intern!(py, "reason"))?;
-                    if !is_exact_str(self, &reason) {
-                        // An application's reason runs its own `__ne__`.
+                    // Reading an application's placeholder's `reason` may
+                    // run its class's code, raise, or run the reason's own
+                    // `__ne__`: only an exact str the read finds in the
+                    // instance dict is read here.
+                    let name = intern!(py, "reason");
+                    if !reads_plainly(py, s, cached.get_type().as_any(), name)? {
                         return Err(Halt::Bail);
                     }
-                    reusable = !reason.ne(intern!(py, "max_depth"))?;
+                    let Some(reason) = plain_reason(py, s, &cached)? else {
+                        return Err(Halt::Bail);
+                    };
+                    reusable = reason.eq(intern!(py, "max_depth"))?;
                 } else if !s.plain_keys.contains(&cached_type)
                     && ![s.bytearray, s.list, s.tuple, s.set, s.frozenset].contains(&cached_type)
                 {
@@ -94,10 +93,10 @@ impl State {
         }
         if self.depth_reached(depth) {
             self.count(py, intern!(py, "max_depth"))?;
-            let empty = container.call0()?;
+            let empty = self.s.empty_mapping(py, container)?;
             return Ok(self.remember(source, empty));
         }
-        let empty = container.call0()?;
+        let empty = self.s.empty_mapping(py, container)?;
         let captured = self.remember(source, empty);
         // Frame variable names are identifiers, not application string
         // values, so a string budget must not rewrite them.

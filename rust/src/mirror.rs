@@ -23,23 +23,61 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyInt};
 
-use crate::shadow::attributes;
 use crate::statics::type_address;
+use crate::types::{placeholder_like, plain_reason, reads_plainly};
 use crate::walker::{Entry, Slot, State};
 
 impl State {
     /// Brings the memo in line with `objects`, which Python code may have
-    /// added to, emptied, or replaced since the last sync. `overwrites`
-    /// also adopts the depth placeholders the Python walk replaced in place.
+    /// added to, emptied, or replaced since the last sync, and adopts the
+    /// depth placeholders a Python walk replaced in place: one a hand-back
+    /// ran since the last recheck, or, once a copy shares the dicts, one
+    /// it may run at any time.
     pub(crate) fn sync(
         &mut self,
         py: Python<'_>,
         objects: Bound<'_, PyDict>,
         sources: Bound<'_, PyDict>,
-        overwrites: bool,
+    ) -> PyResult<()> {
+        let rechecks = self.eager || self.unchecked;
+        let mut passes = 0_u64;
+        loop {
+            self.take_in(py, &objects, &sources)?;
+            // Last: the recheck may raise (out of memory, at CPython's C
+            // recursion limit, or from the `__eq__` of a key an unnoticed
+            // removal let in that hashes like an id), when the walker has
+            // then taken in all else it found, and stays unchecked.
+            if !rechecks || self.foreign {
+                return Ok(());
+            }
+            // The Python walk runs the finalizers of a placeholder it
+            // replaces nested: the recursion limit ends a chain of them,
+            // except on 3.12, where CPython's trashcan frees the
+            // placeholders one after another. Past it, the next sync
+            // carries on.
+            if passes > 0 && passes >= self.s.recursion_limit.bind(py).call0()?.extract()? {
+                return Ok(());
+            }
+            self.recheck(py, &objects, &sources)?;
+            passes += 1;
+            // Unless a placeholder it let go of had finalizers that wrote
+            // there, as they ran when the Python walk replaced it.
+            if objects.len() == self.mirrored && sources.len() == self.sources_mirrored {
+                self.unchecked = false;
+                return Ok(());
+            }
+        }
+    }
+
+    /// The sync up to its recheck.
+    fn take_in(
+        &mut self,
+        py: Python<'_>,
+        objects: &Bound<'_, PyDict>,
+        sources: &Bound<'_, PyDict>,
     ) -> PyResult<()> {
         let same = match &self.mirror {
-            Some((known, kept)) => known.bind(py).is(&objects) && kept.bind(py).is(&sources),
+            Some((known, kept)) => known.bind(py).is(objects) && kept.bind(py).is(sources),
             None => false,
         };
         // Python code removed entries: a dict with fewer than the walker
@@ -47,12 +85,17 @@ impl State {
         // as another Python walk makes during a hand-back, show in no count,
         // but move that entry; only a removal that leaves it where it was
         // goes unnoticed.
-        let moved = same && !self.follows(py, &objects, &sources)?;
+        let moved = same && !self.follows(py, objects, sources)?;
         let flushes = self.unwritten() && (!same || moved || objects.len() != self.mirrored);
         if flushes {
             // The walker's copies go into the dicts it mirrored, after what
             // Python added; the flush then takes the memo from `objects`.
             self.flush(py, same && !moved)?;
+        }
+        if !same {
+            // Python let go of a dict it replaced then, and its finalizers,
+            // which may write into `objects`, ran: they run before it is read.
+            self.mirror = None;
         }
         // Python emptied or replaced a dict, or removed entries: the memo
         // is then what `objects` holds, with the originals `_sources` holds,
@@ -61,26 +104,23 @@ impl State {
         let len = objects.len();
         let changed = rebuilds || len != self.mirrored;
         if rebuilds {
-            self.rebuild(py, &objects, &sources)?;
+            self.rebuild(py, objects, sources)?;
         } else if !flushes {
-            self.saw_additions(py, &sources)?;
+            self.saw_additions(py, sources)?;
             if len > self.mirrored && !self.foreign {
                 // Python added copies; the walker had none unwritten.
-                self.adopt_tail(py, &objects, &sources, len - self.mirrored)?;
+                self.adopt_tail(py, objects, sources, len - self.mirrored)?;
             }
-        }
-        if overwrites && !self.foreign {
-            self.recheck(py, &objects, &sources)?;
         }
         if changed {
             if self.memo.len() != len && !self.foreign {
                 // A copy dropped mid-dict.
-                self.rebuild(py, &objects, &sources)?;
+                self.rebuild(py, objects, sources)?;
             }
             self.mirrored = self.memo.len();
         }
-        self.saw_sources(py, &sources)?;
-        self.mirror = Some((objects.unbind(), sources.unbind()));
+        self.saw_sources(py, sources)?;
+        self.mirror = Some((objects.clone().unbind(), sources.clone().unbind()));
         Ok(())
     }
 
@@ -104,8 +144,9 @@ impl State {
                 key_ending(py, sources, self.sources_mirrored)?,
                 &self.sources_last,
             ) {
-                // A sync that raised after its rebuild leaves no newest key
-                // for a count it saw: the dict may have shrunk since.
+                // A sync or write that failed after its rebuild, before the
+                // walker noted `_sources`, leaves no newest key for a count
+                // it saw: the dict may have shrunk since.
                 (None, None) => self.sources_mirrored == 0,
                 (Some(key), Some(last)) => key.is(last.bind(py)),
                 _ => false,
@@ -149,28 +190,6 @@ impl State {
         self.memo.len() > self.mirrored || !self.dirty.is_empty() || !self.owed.is_empty()
     }
 
-    /// [`State::sync`] with the dicts the context holds after a hand-back,
-    /// read from its instance dict; `false` if they are not exact dicts or
-    /// the context is no longer one the walker mirrors, which the next
-    /// call's refresh then reports.
-    pub(crate) fn resync(&mut self, py: Python<'_>, ctx: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let Some(attributes) = attributes(py, self.s, &self.ctx_type, ctx)? else {
-            return Ok(false);
-        };
-        let objects = attributes.get_item(intern!(py, "objects"))?;
-        let sources = attributes.get_item(intern!(py, "_sources"))?;
-        match (
-            objects.map(Bound::cast_into_exact::<PyDict>),
-            sources.map(Bound::cast_into_exact::<PyDict>),
-        ) {
-            (Some(Ok(objects)), Some(Ok(sources))) => {
-                self.sync(py, objects, sources, true)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
     /// Makes the memo exactly the copies `objects` holds, in its order.
     pub(crate) fn rebuild(
         &mut self,
@@ -202,11 +221,10 @@ impl State {
     }
 
     /// Moves the copies under `keys` into the memo, with their originals,
-    /// if every key is an id. The Python
-    /// walk looks its copies up by id: a key of any other kind, one equal
-    /// to an id such as a float or one whose own methods compare it, only
-    /// the Python walk looks up as it would, so the context goes to it, and
-    /// checking runs no code.
+    /// if every key is an id. The Python walk looks its copies up by id: a
+    /// key of any other kind, one equal to an id such as a float or one
+    /// whose own methods compare it, only the Python walk looks up as it
+    /// would, so the context goes to it, and checking runs no code.
     fn adopt(
         &mut self,
         py: Python<'_>,
@@ -232,7 +250,7 @@ impl State {
                 Some(original) => original,
                 None => py.None().into_bound(py),
             };
-            if type_address(&captured) == self.s.truncated_type && !captured.is(&original) {
+            if placeholder_like(py, self.s, &captured)? {
                 self.truncated.push(id);
             }
             let entry = Entry {
@@ -253,47 +271,89 @@ impl State {
         objects: &Bound<'_, PyDict>,
         sources: &Bound<'_, PyDict>,
     ) -> PyResult<()> {
+        if self.truncated.is_empty() {
+            return Ok(());
+        }
         let mut keys = std::mem::take(&mut self.truncated);
         keys.sort_unstable();
         keys.dedup();
-        for key in keys {
-            let Some(Entry {
-                slot: Slot::Value(cached),
-                original,
-            }) = self.memo.get(key)
-            else {
-                continue;
-            };
-            let (cached, original) = (cached.bind(py).clone(), original.clone_ref(py));
-            if type_address(&cached) != self.s.truncated_type {
-                continue;
+        // Only an exact `TruncatedValue`'s reason is read.
+        let class = self.s.truncated.bind(py);
+        let plain = match reads_plainly(py, self.s, class, intern!(py, "reason")) {
+            Ok(plain) => plain,
+            Err(err) => {
+                self.truncated = keys;
+                return Err(err);
             }
-            // Only a depth placeholder is ever replaced; the walker made
-            // it, so its reason is an exact str in an exact dict.
-            let reason = cached.getattr(intern!(py, "reason"))?;
-            if type_address(&reason) != self.s.str_ || reason.ne(intern!(py, "max_depth"))? {
-                continue;
+        };
+        for (at, &key) in keys.iter().enumerate() {
+            if let Err(err) = self.take_up(py, objects, sources, key, plain) {
+                // It and the ones not yet checked stay noted for the next.
+                self.truncated.extend_from_slice(&keys[at..]);
+                return Err(err);
             }
-            let current = match objects.get_item(key)? {
-                Some(current) if !current.is(&cached) => current,
-                _ => {
-                    self.truncated.push(key);
-                    continue;
-                }
-            };
-            let original = match sources.get_item(key)? {
-                Some(source) => source.unbind(),
-                None => original,
-            };
-            if type_address(&current) == self.s.truncated_type {
-                self.truncated.push(key);
-            }
-            let entry = Entry {
-                slot: Slot::Value(current.unbind()),
-                original,
-            };
-            self.memo.insert(key, entry);
         }
+        Ok(())
+    }
+
+    /// Adopts what `objects` holds for `key` if the Python walk put it in
+    /// place of the memo's depth placeholder, and keeps a placeholder that
+    /// may still be replaced noted. `plain` if `TruncatedValue` reads
+    /// `reason` only from the instance dict.
+    fn take_up(
+        &mut self,
+        py: Python<'_>,
+        objects: &Bound<'_, PyDict>,
+        sources: &Bound<'_, PyDict>,
+        key: usize,
+        plain: bool,
+    ) -> PyResult<()> {
+        let Some(Entry {
+            slot: Slot::Value(cached),
+            original,
+        }) = self.memo.get(key)
+        else {
+            return Ok(());
+        };
+        let (cached, original) = (cached.bind(py).clone(), original.clone_ref(py));
+        // The Python walk's `_mapping` replaces only a `TruncatedValue`, of
+        // a subclass too: a key the walker's own copy took since, or whose
+        // placeholder application code gave another class, is let go of.
+        if !placeholder_like(py, self.s, &cached)? {
+            return Ok(());
+        }
+        let current = match objects.get_item(key)? {
+            Some(current) if !current.is(&cached) => current,
+            _ => {
+                // Still in place. Only a depth placeholder is ever replaced,
+                // so one whose reason reads as another is let go of.
+                // Application code may hold it, and may have changed it or
+                // its class since: one of a subclass, or whose reason the
+                // walker cannot read without running code or finds missing,
+                // stays noted, as the Python walk may yet replace it.
+                if plain && type_address(&cached) == self.s.truncated_type {
+                    if let Some(reason) = plain_reason(py, self.s, &cached)? {
+                        if reason.ne(intern!(py, "max_depth"))? {
+                            return Ok(());
+                        }
+                    }
+                }
+                self.truncated.push(key);
+                return Ok(());
+            }
+        };
+        let original = match sources.get_item(key)? {
+            Some(source) => source.unbind(),
+            None => original,
+        };
+        if placeholder_like(py, self.s, &current)? {
+            self.truncated.push(key);
+        }
+        let entry = Entry {
+            slot: Slot::Value(current.unbind()),
+            original,
+        };
+        self.memo.insert(key, entry);
         Ok(())
     }
 }

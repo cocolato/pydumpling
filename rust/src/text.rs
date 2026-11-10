@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
 
 use crate::statics::{address, type_address, Statics};
+use crate::types::fresh_dict;
 use crate::walker::{Entry, Halt, Slot, State, Walk};
 
 /// Whether `chars` code points surely fit in `limit` UTF-8 bytes: each takes
@@ -97,7 +98,7 @@ impl State {
         captured: Bound<'py, PyAny>,
     ) -> Bound<'py, PyAny> {
         let key = address(original);
-        if type_address(&captured) == self.s.truncated_type && !captured.is(original) {
+        if type_address(&captured) == self.s.truncated_type {
             self.truncated.push(key);
         }
         let entry = Entry {
@@ -205,20 +206,18 @@ impl State {
         self.code_text(py, &text)
     }
 
-    /// A `TruncatedValue(reason, type_name)`, built as its `__init__` would.
+    /// A `TruncatedValue(reason, type_name)`, built as its `__init__` would,
+    /// through the instance-dict descriptor the class had at import: no
+    /// hook application code gave the class runs.
     pub(crate) fn truncated<'py>(
         &self,
         py: Python<'py>,
         reason: &Bound<'py, PyAny>,
         type_name: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
-        let placeholder = self
-            .s
-            .object_new
-            .bind(py)
-            .call1((self.s.truncated.bind(py),))?;
-        let attributes = placeholder.getattr(intern!(py, "__dict__"))?;
-        let attributes = attributes.cast::<PyDict>().map_err(PyErr::from)?;
+        let s = self.s;
+        let placeholder = s.object_new.bind(py).call1((s.truncated.bind(py),))?;
+        let attributes = fresh_dict(&s.truncated_dict, &placeholder)?;
         attributes.set_item(intern!(py, "reason"), reason)?;
         attributes.set_item(intern!(py, "type_name"), type_name)?;
         Ok(placeholder)
@@ -272,6 +271,51 @@ impl State {
         let placeholder = self.truncated(py, &reason, &type_name)?;
         Ok(self.remember(&original, placeholder))
     }
+}
+
+/// `options.max_items`, `max_nodes`, `max_depth` and `max_string_bytes`,
+/// for `options` an exact `DumpOptions`, if reading each runs no code, as
+/// the walker reads them all where the Python walk reads only those it
+/// needs: from an instance dict of exact str keys (a dict subclass assigned
+/// as `__dict__` too, which attribute lookup reads as a dict), while
+/// `DumpOptions` holds no hook, and for each, if anything, `None` or an
+/// int, a default the instance dict overrides, as the dataclass does.
+pub(crate) fn plain_budgets<'py>(
+    py: Python<'py>,
+    s: &Statics,
+    options: &Bound<'py, PyAny>,
+) -> PyResult<Option<[Bound<'py, PyAny>; 4]>> {
+    let names = [
+        intern!(py, "max_items"),
+        intern!(py, "max_nodes"),
+        intern!(py, "max_depth"),
+        intern!(py, "max_string_bytes"),
+    ];
+    let Some(defaults) = s.options_own.entries(py, s, names)? else {
+        return Ok(None);
+    };
+    let int_or_none = |entry: &Bound<'_, PyAny>| entry.is_none() || type_address(entry) == s.int;
+    if !defaults.iter().flatten().all(int_or_none) {
+        return Ok(None);
+    }
+    let Ok(fields) = s
+        .options_dict
+        .bind(py)
+        .call1((options,))?
+        .cast_into::<PyDict>()
+    else {
+        return Ok(None);
+    };
+    if !s.str_keys(&fields) {
+        return Ok(None);
+    }
+    let [items, nodes, depth, string] = names.map(|name| fields.get_item(name));
+    Ok(match (items?, nodes?, depth?, string?) {
+        (Some(items), Some(nodes), Some(depth), Some(string)) => {
+            Some([items, nodes, depth, string])
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]

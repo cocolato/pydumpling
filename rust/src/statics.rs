@@ -11,7 +11,8 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 
-use crate::types::{Base, Scalar};
+use crate::copies::CopyClass;
+use crate::types::{dict_getter, Base, OwnClass, Scalar};
 
 /// An object's address: its `id()`, and the identity types are compared by.
 pub(crate) fn address(object: &Bound<'_, PyAny>) -> usize {
@@ -55,18 +56,26 @@ pub(crate) struct Statics {
     pub frozenset_cls: Py<PyAny>,
     pub frozendict_cls: Option<Py<PyAny>>,
     pub slice_cls: Py<PyAny>,
-    pub fake_dict: Py<PyAny>,
-    pub fake_list: Py<PyAny>,
-    pub fake_tuple: Py<PyAny>,
-    pub fake_set: Py<PyAny>,
-    pub fake_frozen_set: Py<PyAny>,
-    pub fake_str: Py<PyAny>,
-    pub fake_bytes: Py<PyAny>,
-    pub fake_int: Py<PyAny>,
-    pub fake_float: Py<PyAny>,
+    pub fake_dict: CopyClass,
+    pub fake_list: CopyClass,
+    pub fake_tuple: CopyClass,
+    pub fake_set: CopyClass,
+    pub fake_frozen_set: CopyClass,
+    pub fake_str: CopyClass,
+    pub fake_bytes: CopyClass,
+    pub fake_int: CopyClass,
+    pub fake_float: CopyClass,
     pub fake_class: Py<PyAny>,
     pub fake_class_repr: Py<PyAny>,
+    /// `FakeClass` and `DumpOptions` as at import, and the instance-dict
+    /// getter of `DumpOptions`, from [`dict_getter`].
+    pub fake_class_own: OwnClass,
+    pub options_own: OwnClass,
+    pub options_dict: Py<PyAny>,
     pub truncated: Py<PyAny>,
+    /// The copy classes' instance-dict getters, from [`dict_getter`].
+    pub truncated_dict: Py<PyAny>,
+    pub fake_class_dict: Py<PyAny>,
     pub object_new: Py<PyAny>,
     pub dict_items: Py<PyAny>,
     pub dict_keys: Py<PyAny>,
@@ -197,6 +206,8 @@ impl Statics {
         let frozendict = builtins.getattr("frozendict").ok();
         let none = py.None().into_bound(py).get_type().into_any();
         let fake_class = fake_type("FakeClass")?;
+        let options = global("DumpOptions")?;
+        let (class_mro, class_dict) = (getter("_CLASS_MRO")?, getter("_CLASS_DICT")?);
         let plain_keys = [
             address(&builtin("str")?),
             address(&builtin("int")?),
@@ -239,17 +250,22 @@ impl Statics {
             },
             frozendict_cls: frozendict.map(Bound::unbind),
             slice_cls: builtin("slice")?.unbind(),
-            fake_dict: fake_type("FakeDict")?.unbind(),
-            fake_list: fake_type("FakeList")?.unbind(),
-            fake_tuple: fake_type("FakeTuple")?.unbind(),
-            fake_set: fake_type("FakeSet")?.unbind(),
-            fake_frozen_set: fake_type("FakeFrozenSet")?.unbind(),
-            fake_str: fake_type("FakeStr")?.unbind(),
-            fake_bytes: fake_type("FakeBytes")?.unbind(),
-            fake_int: fake_type("FakeInt")?.unbind(),
-            fake_float: fake_type("FakeFloat")?.unbind(),
+            fake_dict: CopyClass::new(fake_type("FakeDict")?, &builtin("dict")?)?,
+            fake_list: CopyClass::new(fake_type("FakeList")?, &builtin("list")?)?,
+            fake_tuple: CopyClass::new(fake_type("FakeTuple")?, &builtin("tuple")?)?,
+            fake_set: CopyClass::new(fake_type("FakeSet")?, &builtin("set")?)?,
+            fake_frozen_set: CopyClass::new(fake_type("FakeFrozenSet")?, &builtin("frozenset")?)?,
+            fake_str: CopyClass::new(fake_type("FakeStr")?, &builtin("str")?)?,
+            fake_bytes: CopyClass::new(fake_type("FakeBytes")?, &builtin("bytes")?)?,
+            fake_int: CopyClass::new(fake_type("FakeInt")?, &builtin("int")?)?,
+            fake_float: CopyClass::new(fake_type("FakeFloat")?, &builtin("float")?)?,
             fake_class_repr: fake_class.getattr("__repr__")?.unbind(),
+            fake_class_own: OwnClass::new(&fake_class, &class_mro, &class_dict)?,
+            options_own: OwnClass::new(&options, &class_mro, &class_dict)?,
+            options_dict: dict_getter(&options)?.unbind(),
+            fake_class_dict: dict_getter(&fake_class)?.unbind(),
             fake_class: fake_class.unbind(),
+            truncated_dict: dict_getter(&fake_type("TruncatedValue")?)?.unbind(),
             truncated: fake_type("TruncatedValue")?.unbind(),
             object_new: method("object", "__new__")?.unbind(),
             dict_items: method("dict", "items")?.unbind(),
@@ -262,8 +278,8 @@ impl Statics {
             float_float: method("float", "__float__")?.unbind(),
             str_getitem: method("str", "__getitem__")?.unbind(),
             bytes_getitem: method("bytes", "__getitem__")?.unbind(),
-            class_dict: getter("_CLASS_DICT")?.unbind(),
-            class_mro: getter("_CLASS_MRO")?.unbind(),
+            class_dict: class_dict.unbind(),
+            class_mro: class_mro.unbind(),
             class_flags: type_dict
                 .get_item("__flags__")?
                 .getattr("__get__")?
@@ -289,7 +305,7 @@ impl Statics {
                 .call1((PyDict::new(py),))?
                 .is_truthy()?,
             headroom: global("_headroom")?.unbind(),
-            dump_options: address(&global("DumpOptions")?),
+            dump_options: address(&options),
             counter: address(&py.import("collections")?.getattr("Counter")?),
             walk_keys,
             walk_count: walk.len(),
@@ -313,10 +329,16 @@ impl Statics {
         }
     }
 
-    /// Whether every key of `dict` is plain, so looking a str up in it
+    /// Whether every key of `dict` is plain, so looking a key up in it
     /// compares with builtin keys only.
     pub(crate) fn plain_dict(&self, dict: &Bound<'_, PyDict>) -> bool {
         dict.iter().all(|(key, _)| self.plain_key(&key))
+    }
+
+    /// Whether every key of `dict` is an exact str, so looking a str up in
+    /// it runs no code and compares only strs.
+    pub(crate) fn str_keys(&self, dict: &Bound<'_, PyDict>) -> bool {
+        dict.iter().all(|(key, _)| type_address(&key) == self.str_)
     }
 
     /// The scalar base a type in an MRO stands for, if any.
@@ -354,38 +376,5 @@ impl Statics {
             Base::FrozenDict => self.frozendict_cls.as_ref().unwrap_or(&self.dict_cls),
         };
         cls.bind(py).clone()
-    }
-
-    /// The copy type for exact instances of `base` and the snapshot subclass
-    /// for instances of its subclasses; every frozendict copy is a FakeDict.
-    pub(crate) fn copy_types<'py>(
-        &self,
-        py: Python<'py>,
-        base: Base,
-    ) -> (Bound<'py, PyAny>, Bound<'py, PyAny>) {
-        let snapshot = match base {
-            Base::Dict | Base::FrozenDict => &self.fake_dict,
-            Base::List => &self.fake_list,
-            Base::Tuple => &self.fake_tuple,
-            Base::Set => &self.fake_set,
-            Base::FrozenSet => &self.fake_frozen_set,
-        };
-        let snapshot = snapshot.bind(py).clone();
-        let plain = match base {
-            Base::FrozenDict => snapshot.clone(),
-            _ => self.base_cls(py, base),
-        };
-        (plain, snapshot)
-    }
-
-    /// The snapshot subclass for instances of a scalar subclass.
-    pub(crate) fn scalar_copy<'py>(&self, py: Python<'py>, scalar: Scalar) -> Bound<'py, PyAny> {
-        let copy = match scalar {
-            Scalar::Str => &self.fake_str,
-            Scalar::Bytes => &self.fake_bytes,
-            Scalar::Int => &self.fake_int,
-            Scalar::Float => &self.fake_float,
-        };
-        copy.bind(py).clone()
     }
 }

@@ -14,10 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use pyo3::exceptions::{PyRecursionError, PyReferenceError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyTuple, PyType};
+use pyo3::types::{PyDict, PyTuple, PyType};
 
 use crate::arguments::{parse, Parsed};
 use crate::dispatch::prepend;
+use crate::shadow::attributes;
 use crate::walker::{Call, Halt, State, Walk};
 
 /// Native stack the walk may use before handing a call back to Python.
@@ -236,6 +237,8 @@ impl State {
             // A copy shares the dicts from now on.
             self.eager = true;
         }
+        // Until a sync rechecks, which this resync may not reach.
+        self.unchecked = true;
         let synced = self.resync(py, &ctx);
         restored?;
         synced?;
@@ -259,6 +262,28 @@ impl State {
         self.sources_last = None;
         self.set_walker(py, &ctx, &py.None().into_bound(py))?;
         call.pure.call(prepend(&ctx, call.args)?, call.kwargs)
+    }
+
+    /// [`State::sync`] with the dicts the context holds after a hand-back,
+    /// read from its instance dict; `false` if they are not exact dicts or
+    /// the context is no longer one the walker mirrors, which the next
+    /// call's refresh then reports.
+    pub(crate) fn resync(&mut self, py: Python<'_>, ctx: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let Some(attributes) = attributes(py, self.s, &self.ctx_type, ctx)? else {
+            return Ok(false);
+        };
+        let objects = attributes.get_item(intern!(py, "objects"))?;
+        let sources = attributes.get_item(intern!(py, "_sources"))?;
+        match (
+            objects.map(Bound::cast_into_exact::<PyDict>),
+            sources.map(Bound::cast_into_exact::<PyDict>),
+        ) {
+            (Some(Ok(objects)), Some(Ok(sources))) => {
+                self.sync(py, objects, sources)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 

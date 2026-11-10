@@ -19,7 +19,7 @@ use crate::memo::{AddressMap, Memo};
 use crate::release::{refcount, Owner};
 use crate::shadow::{unshadowed, ContextType};
 use crate::statics::{type_address, Statics, StaticsHandle};
-use crate::text::budget;
+use crate::text::{budget, plain_budgets};
 use crate::types::TypeInfo;
 
 /// Why the walk stopped early.
@@ -110,6 +110,9 @@ pub(crate) struct State {
     /// Whether each call writes its copies to `ctx.objects` when it ends,
     /// as once a copy of the context may share that dict.
     pub(crate) eager: bool,
+    /// Whether a hand-back ran the Python walk, which may replace a depth
+    /// placeholder in place, since the last recheck.
+    pub(crate) unchecked: bool,
     /// Keys of mirrored entries the walk replaced in place since.
     pub(crate) dirty: Vec<usize>,
     /// Whether `ctx.objects` holds a key that is not an id, or `_sources`
@@ -177,6 +180,7 @@ impl State {
             sources_mirrored: 0,
             sources_last: None,
             eager: false,
+            unchecked: false,
             dirty: Vec::new(),
             foreign: false,
             truncated: Vec::new(),
@@ -238,11 +242,13 @@ impl State {
         if type_address(&options) != s.dump_options {
             return Ok(false);
         }
-        let string_limit = options.getattr(intern!(py, "max_string_bytes"))?;
+        let Some([items, nodes, depth, string_limit]) = plain_budgets(py, s, &options)? else {
+            return Ok(false);
+        };
         let budgets = (
-            budget(s, &options.getattr(intern!(py, "max_items"))?),
-            budget(s, &options.getattr(intern!(py, "max_nodes"))?),
-            budget(s, &options.getattr(intern!(py, "max_depth"))?),
+            budget(s, &items),
+            budget(s, &nodes),
+            budget(s, &depth),
             budget(s, &string_limit),
             budget(s, &code_limit),
         );
@@ -279,8 +285,9 @@ impl State {
         (self.max_string_bytes, self.code_text_limit) = (string, code);
         self.string_limit = string_limit.unbind();
         let truncation = truncation.cast_into::<PyDict>()?;
-        // Reading a tally, as before a helper, may run no key's `__eq__`.
-        if !s.plain_dict(&truncation) {
+        // Reading a tally, as before a helper the Python walk may not
+        // count with, may run no key's `__eq__`.
+        if !s.str_keys(&truncation) {
             return Ok(false);
         }
         self.truncation = truncation.unbind();
@@ -294,7 +301,7 @@ impl State {
         self.types.clear();
         // A copy of the context shares these dicts, and its Python walk
         // may replace a depth placeholder in place, as a hand-back may.
-        self.sync(py, objects, sources, self.eager)?;
+        self.sync(py, objects, sources)?;
         Ok(!self.foreign)
     }
 }

@@ -56,6 +56,7 @@ from pydumpling.fake_types import (
     FakeFloat,
     FakeList,
     FakeStr,
+    FakeType,
     TruncatedValue,
 )
 from pydumpling.options import DumpOptions
@@ -2372,6 +2373,31 @@ def test_call_arguments_of_any_shape(call):
     )
 
 
+@pytest.mark.parametrize(
+    "depth, handed_back",
+    [
+        (-(2**63), True),
+        (-(2**63) + 1, True),
+        (-(2**62) - 1, True),
+        (-(2**62), False),
+        (2**62, False),
+        (2**62 + 1, True),
+    ],
+)
+def test_a_depth_beyond_two_to_the_62_is_handed_back(depth, handed_back):
+    """A depth of more than 2**62 in magnitude, which adding to could
+    overflow, hands the call back, down to -2**63, whose magnitude no i64
+    holds; the walker takes one within that bound."""
+    found = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_depth=2))
+        _check_walker(context, native)
+        found[native] = pickle.dumps(context.value([[[1]]], depth), 4)
+    assert found[True] == found[False]
+    assert context._walker.handbacks == (1 if handed_back else 0)
+
+
 def test_copy_of_a_capturing_context():
     """A copy of a native context captures in Python from the walker's memo."""
 
@@ -2969,6 +2995,258 @@ def test_placeholders_replaced_in_place():
         ]
 
     _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+def _shadowed(placeholder):
+    """Put a key that hashes like ``reason`` ahead of it in the instance dict
+    of ``placeholder``, so that reading ``reason`` runs the key's
+    ``__eq__``, as application code holding a placeholder may; return the
+    placeholder."""
+    attributes = vars(placeholder)
+    reason = attributes.pop("reason", "max_depth")
+    attributes[_Key("reason")] = None
+    attributes["reason"] = reason
+    attributes.setdefault("type_name", "dict")
+    return placeholder
+
+
+@pytest.mark.parametrize(
+    "taken", ["made by the walk", "natively", "by a hand-back", "from objects"]
+)
+def test_a_placeholder_application_code_changed_is_not_read(taken):
+    """Once the context was copied, each call checks the depth placeholders
+    in its memo, which the Python walk may replace in place: one the walk
+    made and returned, which application code changed since, or one that
+    is its own copy, captured natively, by a call the Python walk takes, or
+    written by Python code as both copy and original. A placeholder whose
+    instance dict holds a key that may run code the walker does not read,
+    as the Python walk, which reads one only when ``_mapping`` meets it,
+    does not."""
+
+    def build():
+        return (_shadowed(object.__new__(TruncatedValue)), {"k": 1}, [0])
+
+    def calls(context, placeholder, mapping, other):
+        def written():
+            context.objects[id(mapping)] = placeholder
+            context._sources[id(mapping)] = placeholder
+            del context.objects[id(other)]  # the next call rebuilds its memo
+
+        taking = {
+            "made by the walk": [lambda: _shadowed(context.value(mapping, 1)) and None],
+            "natively": [lambda: context.value(placeholder) is placeholder],
+            "by a hand-back": [lambda: context.value(value=placeholder) is placeholder],
+            "from objects": [
+                lambda: context.value(mapping, 1),
+                lambda: context.value(other),
+                written,
+            ],
+        }
+        return [
+            lambda: copy.copy(context) and None,
+            *taking[taken],
+            lambda: context.value([1]),
+            lambda: context.value([2]),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+def test_a_placeholder_class_with_its_own_hooks_is_not_read(monkeypatch):
+    """Once the context was copied, each call checks the depth placeholders
+    in its memo; once application code gave ``TruncatedValue`` an attribute
+    hook of its own, the walker runs it for none of them, as the Python
+    walk, which reads one only when ``_mapping`` meets it, does not."""
+
+    def build():
+        return ({"k": 1},)
+
+    def calls(context, mapping):
+        def hooked():
+            def counting(placeholder, name):
+                _called(f"placeholder {name}")
+                return object.__getattribute__(placeholder, name)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(TruncatedValue, "__getattribute__", counting)
+                return [context.value([1]), context.value([2])]
+
+        return [
+            lambda: copy.copy(context) and None,
+            lambda: context.value(mapping, 1) and None,  # too deep: a placeholder
+            hooked,
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+@pytest.mark.parametrize("key", [1, 1.5, b"reason"], ids=["int", "float", "bytes"])
+def test_a_placeholder_with_a_key_not_a_str_is_handed_back(key):
+    """``_mapping`` meeting a depth placeholder in its memo reads its
+    ``reason`` only from an instance dict of exact str keys: one that holds
+    another, a bytes key too, which compared with a str warns under
+    ``python -b``, hands the call back, and the Python walk replaces it."""
+    found = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_depth=1))
+        _check_walker(context, native)
+        inner = {"k": 1}
+        (placeholder,) = context.value([inner])
+        vars(placeholder)[key] = 1
+        found[native] = (context._mapping(inner), dict(context._truncation))
+    assert found[True] == found[False] == ({"k": 1}, {"max_depth": 1})
+    assert context._walker.handbacks == 1
+
+
+@pytest.mark.parametrize("answer", ["a str subclass", "max_depth", "nothing"])
+def test_a_placeholder_class_hook_runs_once_where_mapping_meets_it(monkeypatch, answer):
+    """``_mapping`` meeting a depth placeholder reads its ``reason``, which
+    an attribute hook application code gave ``TruncatedValue`` answers with
+    a str subclass, the reason itself, or ``AttributeError``: the hook runs
+    once, as in the Python walk, and the call goes on as there."""
+
+    class Reason(str):
+        pass
+
+    def build():
+        return ({"k": 1},)
+
+    def calls(context, mapping):
+        def hooked():
+            def reading(placeholder, name):
+                if name != "reason":
+                    return object.__getattribute__(placeholder, name)
+                _called("placeholder reason")
+                if answer == "nothing":
+                    raise AttributeError(name)
+                reason = object.__getattribute__(placeholder, name)
+                return Reason(reason) if answer == "a str subclass" else reason
+
+            with monkeypatch.context() as patch:
+                patch.setattr(TruncatedValue, "__getattribute__", reading)
+                return context._mapping(mapping)
+
+        return [
+            lambda: context.value([mapping]) and None,  # too deep: a placeholder
+            hooked,
+            lambda: context.value(mapping),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+def test_a_write_names_an_unfilled_tuple_under_a_planted_class_key(monkeypatch):
+    """A tuple an error left unfilled keeps its placeholder in ``objects``
+    when a copy of the context makes the walker write it, as in the Python
+    walk, though application code planted a key that is not a str in
+    ``TruncatedValue``'s class dict meanwhile: the write builds the
+    placeholder as before."""
+
+    def build():
+        return (("x" * 50, [1]),)
+
+    def calls(context, graph):
+        def interrupted():
+            def fail(text, limit):
+                raise _Error("interrupted")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(context_module, "_utf8_prefix", fail)
+                return context.value(graph)
+
+        def written():
+            real = gc.get_referents(TruncatedValue.__dict__)[0]
+            real[12345] = None
+            try:
+                return copy.copy(context).objects.get(id(graph))
+            finally:
+                del real[12345]
+
+        return [interrupted, written, lambda: context.value(graph)]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(max_string_bytes=8), calls)
+    assert isinstance(native.results[1], TruncatedValue)
+
+
+def test_a_write_names_an_unfilled_tuple_under_a_planted_dict_descriptor(monkeypatch):
+    """A ``__dict__`` descriptor planted in ``TruncatedValue``'s class dict
+    while a copy of the context makes the walker write an unfilled tuple's
+    placeholder does not run: the write builds the placeholder through the
+    instance-dict descriptor the class had at import, as the Python walk,
+    which named it when it met the tuple, ran none either."""
+    real = vars(TruncatedValue)["__dict__"]
+
+    def instance_dict(placeholder):
+        _called("placeholder __dict__")
+        return real.__get__(placeholder)
+
+    def build():
+        return (("x" * 50, [1]),)
+
+    def calls(context, graph):
+        def interrupted():
+            def fail(text, limit):
+                raise _Error("interrupted")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(context_module, "_utf8_prefix", fail)
+                return context.value(graph)
+
+        def written():
+            with _planted_in_truncated_value("__dict__", property(instance_dict)):
+                return copy.copy(context).objects.get(id(graph))
+
+        return [interrupted, written, lambda: context.value(graph)]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(max_string_bytes=8), calls)
+    assert isinstance(native.results[1], TruncatedValue)
+
+
+@pytest.mark.parametrize("taken", ["natively", "by a hand-back", "natively, copied"])
+def test_a_placeholder_captured_as_itself_and_replaced_in_place(taken):
+    """A depth placeholder captured as its own copy is, to the Python walk's
+    ``_mapping``, a depth placeholder like any other: it replaces it in
+    place before it fails on the placeholder's missing ``items``. The
+    walker, which handed that call back, takes the replacement up and
+    returns it from then on, as the Python walk does."""
+
+    def build():
+        return (TruncatedValue("max_depth", "dict"),)
+
+    def calls(context, placeholder):
+        taking = {
+            "natively": [lambda: context.value(placeholder) is placeholder],
+            "by a hand-back": [lambda: context.value(value=placeholder) is placeholder],
+            "natively, copied": [
+                lambda: copy.copy(context) and None,
+                lambda: context.value(placeholder) is placeholder,
+            ],
+        }
+        return [
+            *taking[taken],
+            lambda: context._mapping(placeholder, 0),
+            lambda: context.value(placeholder),
+            lambda: context.value([placeholder])[0],
+            lambda: copy.copy(context).objects[id(placeholder)],
+        ]
+
+    _same_in_both_modes(build, DumpOptions(), calls)
+
+
+def test_a_placeholder_replaced_in_place_is_let_go():
+    """A depth placeholder that a root capture replaces in place is held
+    nowhere once that call returns, as in the Python walk, where the copy
+    took its place in ``objects``."""
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_depth=1))
+        _check_walker(context, native)
+        mapping = {"k": 1}
+        placeholder = weakref.ref(context.value(mapping, 1))
+        context._mapping(mapping)
+        gc.collect()
+        assert placeholder() is None
 
 
 def _inside_the_walk(context):
@@ -4266,6 +4544,26 @@ def test_a_replaced_placeholder_after_python_s_change(change):
     assert found[True] == {"k": 1}
 
 
+def test_python_s_entry_where_a_placeholder_was_replaced_before_any_write():
+    """A depth placeholder the walk replaced in place before the walker
+    wrote it is, to ``objects``, a copy the walker has yet to write: an
+    entry Python code then puts under its id stays through the walker's
+    next write, as in the Python walk, where it overwrote the replacement
+    written at once."""
+    found = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_depth=1))
+        _check_walker(context, native)
+        mapping = {"k": 1}
+        context.value(mapping, 1)  # too deep: a placeholder, the first entry
+        context._mapping(mapping)  # a root capture replaces it in place
+        context.objects[id(mapping)] = "<python>"
+        found[native] = _contents(context)
+    assert found[True] == found[False]
+    assert repr("<python>") in found[False][0]
+
+
 @pytest.mark.parametrize("change", ["written", "removed"])
 def test_a_replaced_placeholder_s_original_after_python_s_change(change):
     """The original of a depth placeholder the walk replaced in place goes
@@ -4291,11 +4589,39 @@ def test_a_replaced_placeholder_s_original_after_python_s_change(change):
     assert found[True] is mapping
 
 
-def test_a_removal_after_a_sync_that_raised_is_noticed():
-    """A sync that raises after it took its memo from ``objects``, as one
-    does natively on a depth placeholder Python code wrote there without a
-    ``reason``, still lets the walker notice a later removal from
-    ``_sources``: it lets go of the original, as the Python walk does."""
+@pytest.mark.parametrize("written_by", ["hand-back", "copy"])
+@pytest.mark.parametrize("changed", ["objects", "_sources"])
+def test_a_written_replacement_is_not_written_again(changed, written_by):
+    """A depth placeholder the walk replaced in place goes into the dicts
+    at the walker's next write and at no later one: Python code that then
+    overwrites the replacement in ``objects``, or its original in
+    ``_sources``, keeps its value through the writes that follow, as with
+    the Python walk, which wrote the replacement once, at once."""
+    found = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_depth=1))
+        _check_walker(context, native)
+        mapping = {"k": 1}
+        context.value([mapping])  # the mapping is too deep: a placeholder
+        context.value(value=0)  # a hand-back writes it
+        context._mapping(mapping)  # a root capture replaces it in place
+        if written_by == "copy":
+            copy.copy(context)  # each call's copies are written from now on
+        else:
+            context.value(value=1)  # a hand-back writes the replacement
+        getattr(context, changed)[id(mapping)] = "<python>"
+        context.value(value=2)  # a hand-back writes again
+        found[native] = _contents(context)  # and so does a copy
+    assert found[True] == found[False]
+    assert repr("<python>") in found[False][changed == "_sources"]
+
+
+def test_a_removal_after_a_placeholder_without_a_reason_is_noticed():
+    """A sync that took its memo from ``objects``, where Python code wrote a
+    depth placeholder without a ``reason``, which its recheck keeps noted,
+    still lets the walker notice a later removal from ``_sources``: it lets
+    go of the original, as the Python walk does."""
 
     class Held:
         pass
@@ -4311,10 +4637,7 @@ def test_a_removal_after_a_sync_that_raised_is_noticed():
         context._sources[id(third)] = third
         context.objects[id(third)] = object.__new__(TruncatedValue)
         del context.objects[id(first)]  # noticed: the next sync rebuilds
-        try:
-            context.value([1])
-        except AttributeError:
-            assert native  # the placeholder has no ``reason``
+        assert context.value([1]) == [1]  # no walk reads the placeholder
         context.objects[id(third)].reason = "other"
         held = weakref.ref(second)
         del context._sources[id(second)], context._sources[id(third)]
@@ -4324,27 +4647,1121 @@ def test_a_removal_after_a_sync_that_raised_is_noticed():
         assert held() is None
 
 
-def test_a_removal_that_leaves_the_ending_entry_goes_unnoticed():
-    """Python code that removes an entry the walker wrote, adds one, and
-    moves the entry the walker wrote last back to the end leaves the count
-    and the key ending ``objects`` as they were: the walker does not
-    notice, and returns its copy of the removed original, where the Python
-    walk copies it afresh."""
-    same = {}
+def test_a_key_python_adds_after_a_hand_back_that_raised_is_noticed():
+    """After a call that raises in the Python walk, as ``_mapping`` does when
+    it meets a depth placeholder without a ``reason``, once a sync took the
+    walker's memo from ``objects``, a key that is not an id, which Python
+    code appends to ``objects`` next, is noticed at the next call, which
+    goes to the Python walk, and a copy made then is in ``objects`` at once,
+    as in the Python walk."""
+
+    def build():
+        mapping = {"k": 1}
+        return (["first"], ["second"], mapping, [mapping], ["fresh"])
+
+    def calls(context, first, second, mapping, outer, fresh):
+        def emptied():
+            context._sources.clear()
+
+        def unreasoned():
+            del context.objects[id(first)]  # noticed: the next sync rebuilds
+            del context.objects[id(mapping)].reason
+
+        def tagged():
+            context.objects["tag"] = "planted"
+
+        return [
+            lambda: context.value(first),
+            lambda: context.value(second),
+            lambda: context.value(outer),  # the mapping is too deep: a placeholder
+            lambda: copy.copy(context) is not context,  # every sync then rechecks
+            emptied,
+            lambda: context.value(first),  # the sync sees ``_sources`` empty
+            unreasoned,
+            lambda: context._mapping(mapping),  # raises in both walks
+            tagged,
+            lambda: context.value(fresh),
+            lambda: id(fresh) in context.objects,
+            lambda: vars(context).get("_walker") is None,
+            lambda: _contents(context),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+def test_a_placeholder_without_a_reason_stays_noted():
+    """A recheck that meets a depth placeholder without a ``reason`` keeps
+    it noted, and checks the others after it: once the reason is back, the
+    walker notices a hand-back's Python walk replacing any of them in place,
+    and returns the replacement, as the Python walk does. The walker checks
+    them in address order, so the one without a reason is the first."""
+
+    def build():
+        return ([{"k": 1} for _ in range(6)],)
+
+    def calls(context, mappings):
+        bad = min(mappings, key=id)
+        others = [mapping for mapping in mappings if mapping is not bad]
+
+        def unreasoned():
+            del context.objects[id(bad)].reason
+
+        def reasoned():
+            context.objects[id(bad)].reason = "max_depth"
+
+        return [
+            # Each mapping is too deep. The placeholders are not compared: the
+            # one without a reason has its keys in another order once it is back.
+            lambda: context.value(mappings) and None,
+            lambda: copy.copy(context) is not context,  # every sync then rechecks
+            unreasoned,
+            lambda: context._mapping(bad),  # raises in both walks
+            lambda: context.value([1]),  # a recheck meets it
+            reasoned,
+            # Handed back: the Python walk replaces each in place.
+            *[
+                lambda mapping=mapping: context._mapping(source=mapping)
+                for mapping in [*others, bad]
+            ],
+            *[
+                lambda mapping=mapping: context.value(mapping)
+                for mapping in [*others, bad]
+            ],
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "appended",
+        "in place",
+        "in place, after a removal",
+        "in place, in a replaced dict",
+    ],
+)
+def test_a_placeholder_without_a_reason_raises_only_where_the_walk_reads_it(where):
+    """A ``TruncatedValue`` Python code writes into ``objects`` without a
+    ``reason``, appended, over the walker's own depth placeholder, after a
+    removal, or in a dict Python put in place of ``objects``, raises
+    ``AttributeError`` only where ``_mapping`` meets it, in both walks:
+    neither a sync nor a recheck reads it, before or after a copy of the
+    context."""
+    raised = {}
+    for copied in (False, True):
+        for native in (False, True):
+            with _mode(native):
+                context = SnapshotContext(DumpOptions(max_depth=1))
+            _check_walker(context, native)
+            first, mapping, extra = [0], {"k": 1}, [0]
+            context.value(first)
+            context.value([mapping])  # the mapping is too deep: a placeholder
+            context.value(value=-1)  # a hand-back writes both
+            if copied:
+                copy.copy(context)  # every sync then rechecks the placeholders
+            if where.endswith("replaced dict"):
+                context.objects = dict(context.objects)
+            target = extra if where == "appended" else mapping
+            if where == "appended":
+                context._sources[id(extra)] = extra
+            context.objects[id(target)] = object.__new__(TruncatedValue)
+            if where.endswith("removal"):
+                del context.objects[id(first)]  # noticed: the count drops
+            raised[native, copied] = []
+            steps = (False, False, True, False, True, None, False, True)
+            for step, handed_back in enumerate(steps):
+                try:
+                    if handed_back is None:
+                        context._mapping(target)
+                    elif handed_back:
+                        context.value(value=step)
+                    else:
+                        context.value([step])
+                except AttributeError:
+                    raised[native, copied].append(step)
+    assert raised == dict.fromkeys(raised, [5])
+
+
+@pytest.mark.parametrize("change", ["a key not of a plain kind", "no reason"])
+def test_a_placeholder_application_code_changed_is_taken_up(change):
+    """A depth placeholder the walk returned, whose instance dict
+    application code gave a key that may run code, or took ``reason`` from
+    and gave it back, which a hand-back's Python walk then replaces in
+    place: the walker, which cannot read its reason meanwhile, keeps it
+    noted, and returns the replacement, as the Python walk does."""
+    found = {}
     for native in (False, True):
         with _mode(native):
-            context = SnapshotContext(DumpOptions())
+            context = SnapshotContext(DumpOptions(max_depth=1))
         _check_walker(context, native)
-        early, later, filler = [1], [2], ["filler"]
-        first = context.value(early)
-        context.value(later)
-        context.value(value=0)  # a hand-back writes the copies
-        last = list(context.objects)[-1]
-        del context.objects[id(early)]
-        context.objects[id(filler)] = "<python>"
-        context.objects[last] = context.objects.pop(last)
+        mapping = {"k": 1}
+        placeholder = context.value(mapping, 1)  # too deep: a placeholder
+        if change == "no reason":
+            del placeholder.reason
+            context.value(value=0)  # handed back: the recheck cannot read it
+            placeholder.reason = "max_depth"
+        else:
+            vars(placeholder)[object()] = None
+        context._mapping(source=mapping)  # handed back: replaced in place
+        got = context.value(mapping, 1)
+        found[native] = "placeholder" if got is placeholder else got
+    assert found == {False: {"k": 1}, True: {"k": 1}}
+
+
+def test_a_resync_that_reads_nothing_leaves_its_replacements_to_the_next_sync():
+    """Application code a hand-back's Python walk runs gives the context an
+    instance attribute named like a copy hook, so the resync that ends that
+    hand-back reads nothing, and removes it before the next call, which
+    stays native: that call takes up the depth placeholder the Python walk
+    replaced in place, and returns the replacement, as the Python walk does."""
+    contexts = []
+
+    class Name(str):
+        def __radd__(self, other):
+            vars(contexts[-1])["__deepcopy__"] = None
+            return str.__add__(other, str(self))
+
+    Odd = type("Odd", (), {})
+    Odd.__qualname__ = Name("Odd")
+    outcomes = {}
+    try:
+        for native in (False, True):
+            mapping = {"k": Odd()}
+            with _mode(native):
+                context = SnapshotContext(DumpOptions(max_depth=1))
+            contexts.append(context)
+            context.value([mapping])  # too deep: a placeholder
+            replaced = context._mapping(mapping)  # a str subclass name: handed back
+            del context.__deepcopy__
+            _check_walker(context, native)
+            outcomes[native] = (
+                context.value(mapping) is replaced,
+                context._mapping(mapping) is replaced,
+                context._nodes,
+            )
+    finally:
+        # The collector does not see a class's ``__qualname__``, which holds
+        # ``Name``, whose method holds the contexts.
+        contexts.clear()
+    assert outcomes[True] == outcomes[False] == (True, True, 5)
+
+
+def test_a_placeholder_a_recheck_cannot_read_yet_is_checked_again():
+    """A depth placeholder stays noted through a recheck made while the class
+    dict of ``TruncatedValue`` holds a key that is not an exact str: once
+    the class is plain again, the walker takes up the replacement a later
+    hand-back's Python walk makes in place, and returns it, as the Python
+    walk does."""
+
+    class Tag(str):
+        pass
+
+    namespace = gc.get_referents(vars(TruncatedValue))[0]
+    outcomes = {}
+    for native in (False, True):
+        mapping = {"k": 1}
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_depth=1))
+        _check_walker(context, native)
+        context.value([mapping])  # too deep: a placeholder
+        namespace[Tag("tag")] = 1
+        try:
+            context.value(value=0)  # handed back: its resync rechecks
+        finally:
+            del namespace["tag"]
+        replaced = context._mapping(mapping, False)  # a bool depth: handed back
+        outcomes[native] = (
+            context.value(mapping) is replaced,
+            context._mapping(mapping) is replaced,
+            context._nodes,
+        )
+    assert outcomes[True] == outcomes[False] == (True, True, 6)
+
+
+class _Placeholder(TruncatedValue):
+    """A ``TruncatedValue`` subclass, which ``_mapping``'s ``isinstance``
+    takes for a placeholder."""
+
+
+@pytest.mark.parametrize(
+    "cls", [TruncatedValue, _Placeholder], ids=["exact", "subclass"]
+)
+def test_a_placeholder_python_wrote_in_place_is_noted_in_turn(cls):
+    """A depth placeholder, of a subclass too, that Python code writes in
+    place over the walker's, which the recheck ending the next hand-back
+    takes up, is one the Python walk may replace in turn: the walker keeps
+    it noted, and returns the replacement a later hand-back's Python walk
+    makes, as the Python walk does."""
+
+    def build():
+        return ({"k": 1}, cls("max_depth", "dict"))
+
+    def calls(context, mapping, placeholder):
+        def written():
+            context.objects[id(mapping)] = placeholder
+
+        return [
+            lambda: context.value(mapping, 1) and None,  # too deep: a placeholder
+            lambda: context.value(value=0),  # handed back: written
+            written,
+            lambda: context.value(value=1),  # handed back: its recheck takes it up
+            lambda: context._mapping(source=mapping),  # handed back: replaced
+            lambda: context.value(mapping, 1),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+@pytest.mark.parametrize("by", ["a hand-back", "a copy of the context"])
+def test_a_placeholder_whose_reason_changes_after_its_replacement_is_taken_up(by):
+    """A Python walk, a hand-back's or that of a shallow copy sharing the
+    dicts, replaces a depth placeholder in place, then runs application
+    code, a type name's own ``__radd__`` met later in the same mapping, that
+    changes the reason of the placeholder it no longer holds: the walker
+    takes the replacement up all the same, and returns it from then on, as
+    the Python walk does."""
+    held = []
+
+    class Name(str):
+        def __radd__(self, other):
+            held[-1].reason = "other"
+            return str.__add__(other, str(self))
+
+    Odd = type("Odd", (), {})
+    Odd.__qualname__ = Name("Odd")
+
+    def build():
+        return ({"a": 1, "b": Odd()},)
+
+    def calls(context, mapping):
+        walking = context if by == "a hand-back" else None
+        return [
+            # Too deep: a placeholder.
+            lambda: held.append(context.value(mapping, 2)),
+            # Meets a str subclass type name, natively handed back: either
+            # Python walk replaces the placeholder in place.
+            lambda: (walking or copy.copy(context))._mapping(mapping),
+            lambda: context.value(mapping, 2),
+            lambda: context.value([mapping]),
+        ]
+
+    try:
+        _same_in_both_modes(build, DumpOptions(max_depth=2), calls)
+    finally:
+        # The collector does not see a class's ``__qualname__``, which holds
+        # ``Name``, whose method holds the placeholders.
+        held.clear()
+
+
+@pytest.mark.parametrize(
+    "when",
+    [
+        "before any recheck",
+        "after a recheck",
+        "before a rebuild",
+        "answering its reason",
+    ],
+)
+def test_a_placeholder_application_code_gave_a_subclass_is_taken_up(when):
+    """A depth placeholder the walk returned, whose ``__class__`` application
+    code set to a subclass of ``TruncatedValue``, here one whose ``reason``
+    property answers ``"max_depth"`` over another in the instance dict, is
+    still one to the Python walk's ``_mapping``, whose ``isinstance`` takes
+    it for one, and which replaces it in place: the walker, which hands that
+    call back and reads no reason of a subclass, keeps it noted through a
+    recheck, or notes it as it takes its memo from ``objects``, and returns
+    the replacement from then on, as the Python walk does."""
+
+    class Placeholder(TruncatedValue):
+        pass
+
+    class Answering(TruncatedValue):
+        reason = property(lambda _: "max_depth")
+
+    def build():
+        return ([0], {"k": 1})
+
+    def calls(context, first, mapping):
+        def reclassed():
+            placeholder = context.value(mapping, 1)
+            if when == "answering its reason":
+                vars(placeholder)["reason"] = "other"
+                placeholder.__class__ = Answering
+            else:
+                placeholder.__class__ = Placeholder
+
+        def removed():
+            del context.objects[id(first)]  # noticed: the next sync rebuilds
+
+        rechecked = [lambda: context.value(value=0)]  # handed back
+        between = {
+            "before any recheck": [],
+            "after a recheck": rechecked,
+            "before a rebuild": [lambda: context.value(value=-1), removed],
+            "answering its reason": rechecked,
+        }[when]
+        return [
+            lambda: context.value(first),
+            lambda: context.value(mapping, 1) and None,  # too deep: a placeholder
+            reclassed,
+            *between,
+            lambda: context._mapping(mapping),  # handed back: replaced in place
+            lambda: context.value(mapping, 1),
+            lambda: context.value([mapping]),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+def test_a_placeholder_class_whose_getattribute_is_none_raises_where_mapping_meets_it(
+    monkeypatch,
+):
+    """Application code that sets ``TruncatedValue.__getattribute__ = None``
+    makes reading any attribute of a placeholder raise ``TypeError``, as
+    ``_mapping`` meeting a depth placeholder does in the Python walk: a
+    class dict entry of ``None`` is a ``__getattribute__`` other than
+    ``object``'s, so the walker reads no reason there either."""
+
+    def build():
+        return ({"k": 1},)
+
+    def calls(context, mapping):
+        def hooked():
+            with monkeypatch.context() as patch:
+                patch.setattr(TruncatedValue, "__getattribute__", None)
+                return context._mapping(mapping)
+
+        return [
+            lambda: context.value([mapping]) and None,  # too deep: a placeholder
+            hooked,
+            lambda: context.value(mapping),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+def test_a_fake_class_given_another_base_is_built_as_its_init_builds_it():
+    """``FakeClass`` given a base other than ``FakeType`` with the same
+    layout, which ``__bases__`` accepts, still gets its copies: the Python
+    walk builds each through ``FakeClass.__init__`` and the new base's
+    ``__dict__``, and so does the walker, which hands the copy back where
+    the instance-dict descriptor ``FakeType`` had at import refuses it."""
+
+    class Other:
+        pass
+
+    class Plain:
+        def __init__(self):
+            self.x = 1
+
+    def build():
+        return (Plain(),)
+
+    def calls(context, value):
+        def rebased():
+            FakeClass.__bases__ = (Other,)
+            try:
+                return context.value(value)
+            finally:
+                FakeClass.__bases__ = (FakeType,)
+
+        return [rebased, lambda: context.value([value])]
+
+    _same_in_both_modes(build, DumpOptions(), calls)
+
+
+def test_a_fake_class_given_another_base_hands_back_before_running_anything():
+    """``FakeClass`` given a base whose ``__getattribute__`` and ``__del__``
+    are application code: the walker hands the call back before it makes a
+    copy it would drop, whose ``__del__`` would run, as the import-time
+    instance-dict descriptor refuses it before 3.15, or reads a
+    ``FakeClass``'s representation through the base's ``__getattribute__``,
+    which the Python walk then runs again."""
+    originals = []
+
+    class Other:
+        def __getattribute__(self, name):
+            if any(self is original for original in originals):
+                _called(f"__getattribute__ {name}")
+            return object.__getattribute__(self, name)
+
+        def __del__(self):
+            _called("__del__")
+
+    def build():
+        originals[:] = [FakeClass("<copied snapshot>", {"a": 1})]
+        return (originals[0], _Plain())
+
+    def calls(context, copied, plain):
+        def rebased(value):
+            FakeClass.__bases__ = (Other,)
+            try:
+                return context.value(value)
+            finally:
+                FakeClass.__bases__ = (FakeType,)
+
+        return [lambda: rebased(copied), lambda: rebased(plain)]
+
+    _same_in_both_modes(build, DumpOptions(), calls)
+
+
+def test_a_fake_class_hook_runs_once_when_a_later_value_hands_the_call_back(
+    monkeypatch,
+):
+    """A ``__getattribute__`` application code gave ``FakeClass`` runs where
+    ``FakeClass.__repr__`` reads a copied ``FakeClass``'s ``__dict__``: the
+    walker hands such a call back before it runs, so a value it hands the
+    call back on later does not make it run twice."""
+    originals = []
+
+    def hooked(self, name):
+        if any(self is original for original in originals):
+            _called(f"FakeClass.__getattribute__ {name}")
+        return object.__getattribute__(self, name)
+
+    odd_name = _odd_types()[0]  # a str subclass ``__qualname__``: handed back
+
+    def build():
+        originals[:] = [FakeClass("<copied snapshot>", {"odd": odd_name()})]
+        return (originals[0],)
+
+    def calls(context, copied):
+        def hooked_call():
+            with monkeypatch.context() as patch:
+                patch.setattr(FakeClass, "__getattribute__", hooked)
+                return context.value(copied)
+
+        return [hooked_call]
+
+    _same_in_both_modes(build, DumpOptions(), calls)
+
+
+def test_a_patched_fake_class_repr_names_the_copy(monkeypatch):
+    """The Python walk calls ``FakeClass.__repr__`` as the class has it
+    then: one application code patched in names the copy of a copied
+    ``FakeClass``, and runs once, as the walker hands such a call back."""
+
+    def patched(self):
+        _called("FakeClass.__repr__")
+        return "<patched>"
+
+    def build():
+        return (FakeClass("<copied snapshot>", {"a": 1}),)
+
+    def calls(context, copied):
+        def patched_call():
+            with monkeypatch.context() as patch:
+                patch.setattr(FakeClass, "__repr__", patched)
+                return context.value(copied)
+
+        return [patched_call, lambda: context.value(FakeClass("<again>", {}))]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(), calls)
+    assert vars(native.results[0])["_FakeClass__repr"] == "<patched>"
+
+
+@pytest.mark.parametrize("hook", ["__getattribute__", "a property"])
+def test_hooks_patched_onto_dump_options_run_as_in_the_python_walk(monkeypatch, hook):
+    """The walker reads every budget each call, the Python walk only those a
+    call uses: while ``DumpOptions`` holds a ``__getattribute__``, or under
+    a budget's name anything but ``None`` or an int, such as a property,
+    the walker leaves the context to the Python walk, so the hook runs as
+    often, and a property's answer is the budget."""
+
+    def items(options):
+        _called("DumpOptions.max_items")
+        return 1
+
+    def get(options, name):
+        _called(f"DumpOptions.__getattribute__ {name}")
+        return object.__getattribute__(options, name)
+
+    def build():
+        return ([[1, 2, 3]],)
+
+    def calls(context, value):
+        def hooked():
+            with monkeypatch.context() as patch:
+                if hook == "a property":
+                    patch.setattr(DumpOptions, "max_items", property(items))
+                else:
+                    patch.setattr(DumpOptions, "__getattribute__", get)
+                return context.value(value)
+
+        return [lambda: context.value(None), hooked, lambda: context.value(value)]
+
+    _same_in_both_modes(build, DumpOptions(), calls)
+
+
+@pytest.mark.parametrize("hook", ["__getattribute__", "reason", "a str subclass key"])
+def test_a_placeholder_whose_class_answers_its_reason_stays_noted(monkeypatch, hook):
+    """A depth placeholder whose instance dict holds another reason, while a
+    ``__getattribute__``, a ``reason`` property, or one under a str subclass
+    key equal to ``reason``, which application code gave ``TruncatedValue``,
+    answers ``"max_depth"``, is one the Python walk's ``_mapping`` replaces
+    in place: the walker, which reads no reason the class may answer, keeps
+    it noted, and returns the replacement a hand-back's Python walk makes,
+    as the Python walk does."""
+
+    class Tag(str):
+        pass
+
+    def answering(placeholder, name):
+        if name == "reason":
+            return "max_depth"
+        return object.__getattribute__(placeholder, name)
+
+    answered = property(lambda _: "max_depth")
+
+    @contextlib.contextmanager
+    def patched():
+        if hook == "a str subclass key":
+            with _planted_in_truncated_value(Tag("reason"), answered):
+                yield
+            return
+        with monkeypatch.context() as patch:
+            value = answering if hook == "__getattribute__" else answered
+            patch.setattr(TruncatedValue, hook, value, raising=False)
+            yield
+
+    def build():
+        return ({"k": 1},)
+
+    def calls(context, mapping):
+        def hooked():
+            with patched():
+                return [
+                    context.value(value=0),  # handed back: its recheck reads nothing
+                    context._mapping(source=mapping),  # handed back: replaced
+                ]
+
+        return [
+            lambda: context.value(mapping, 1) and None,  # too deep: a placeholder
+            lambda: vars(context.value(mapping, 1)).update(reason="other"),
+            hooked,
+            lambda: context.value(mapping, 1),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+@contextlib.contextmanager
+def _planted_in_truncated_value(key, value):
+    """Put ``key`` in ``TruncatedValue``'s class dict itself, as only code
+    that reaches it through ``gc`` can, and take it out again; the class's
+    attribute cache is reset each time."""
+    namespace = gc.get_referents(vars(TruncatedValue))[0]
+    saved = namespace.get(key, _planted_in_truncated_value)
+    namespace[key] = value
+    TruncatedValue._planted = None  # resets the attribute cache
+    del TruncatedValue._planted
+    try:
+        yield
+    finally:
+        if saved is _planted_in_truncated_value:
+            del namespace[key]
+        else:
+            namespace[key] = saved
+        TruncatedValue._planted = None
+        del TruncatedValue._planted
+
+
+@pytest.mark.parametrize("hook", ["__getattr__", "__dict__", "a colliding key"])
+def test_a_recheck_runs_no_hook_of_the_placeholder_class(monkeypatch, hook):
+    """Once the context was copied, each call rechecks the depth placeholders
+    in its memo, here one without a ``reason``. It runs no code application
+    code gave ``TruncatedValue``: not a ``__getattr__``, which attribute
+    lookup runs for a ``reason`` the instance dict lacks, nor a ``__dict__``
+    planted in the class dict, as the walker reads the instance dict through
+    the descriptor the class had at import, nor the ``__eq__`` of a key
+    planted there that collides with ``reason``, as the walker reads no
+    reason from a class with such a key. The Python walk reads the reason
+    only where ``_mapping`` meets it. The placeholder stays noted: the walker
+    takes up what Python code writes in its place next, and returns it, as
+    the Python walk does."""
+    real = vars(TruncatedValue)["__dict__"]
+
+    def missing(placeholder, name):
+        _called(f"placeholder __getattr__ {name}")
+        raise AttributeError(name)
+
+    def instance_dict(placeholder):
+        _called("placeholder __dict__")
+        return real.__get__(placeholder)
+
+    def build():
+        return ({"k": 1},)
+
+    def calls(context, mapping):
+        def unreasoned():
+            del context.objects[id(mapping)].reason
+
+        def hooked():
+            if hook == "__getattr__":
+                with monkeypatch.context() as patch:
+                    patch.setattr(TruncatedValue, "__getattr__", missing, raising=False)
+                    return [context.value([1]), context.value([2])]
+            if hook == "__dict__":
+                planted = _planted_in_truncated_value(
+                    "__dict__", property(instance_dict)
+                )
+            else:
+                planted = _planted_in_truncated_value(_Key("reason"), None)
+            with planted:
+                return [context.value([1]), context.value([2])]
+
+        def overwritten():
+            context.objects[id(mapping)] = "<python>"
+
+        return [
+            lambda: copy.copy(context) and None,
+            lambda: context.value(mapping, 1) and None,  # too deep: a placeholder
+            unreasoned,
+            hooked,
+            overwritten,
+            lambda: context.value(mapping, 1),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+class _Finalized:
+    """An object whose finalizer runs ``action``."""
+
+    def __init__(self, action):
+        self.action = action
+
+    def __del__(self):
+        self.action()
+
+
+def test_a_recheck_takes_up_what_a_replaced_dict_s_finalizer_wrote():
+    """Python code replaces ``objects`` with a copy; the old dict holds the
+    last reference to an object whose finalizer writes Python's own copy
+    over a depth placeholder in the new dict. Without the walker the old
+    dict goes at once; the walker lets go of it at its next sync, before it
+    reads the new dict, so it takes Python's copy up and returns it, as the
+    Python walk does. Nothing raises."""
+
+    def build():
+        mapping = {"k": 1}
+        return (mapping, [mapping])
+
+    def calls(context, mapping, outer):
+        def replaced():
+            old = context.objects
+            context.objects = dict(old)
+
+            def wrote():
+                context.objects[id(mapping)] = {"python": 1}
+
+            old["finalized"] = _Finalized(wrote)
+
+        return [
+            lambda: context.value(outer),  # the mapping is too deep: a placeholder
+            lambda: copy.copy(context) and None,  # every sync then rechecks
+            replaced,
+            lambda: context.value(mapping),
+            lambda: context.value([mapping]),
+        ]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+    assert native.results[3:] == [{"python": 1}, [{"python": 1}]]
+
+
+@pytest.mark.parametrize("change", ["added", "overwritten", "removed"])
+def test_a_replaced_dict_s_finalizer_writes_before_the_next_call_reads_objects(change):
+    """Python code replaces ``objects`` with a copy; the old dict holds the
+    last reference to an object whose finalizer adds an entry to the new
+    dict, overwrites one, or removes one. Without the walker the old dict
+    goes at once, before the next call; the walker lets go of it at its
+    next sync, before it reads the new dict, so that call sees the
+    finalizer's change and returns what the Python walk returns."""
+
+    def build():
+        return ([1, 2],)
+
+    def calls(context, target):
+        def replaced():
+            old = context.objects
+            context.objects = dict(old)
+
+            def wrote():
+                if change == "removed":
+                    del context.objects[id(target)]
+                else:
+                    context.objects[id(target)] = "<python>"
+                    context._sources[id(target)] = target
+
+            old["finalized"] = _Finalized(wrote)
+
+        first = [0] if change == "added" else target
+        return [
+            lambda: copy.copy(context) and None,  # each call's copies written at once
+            lambda: context.value(first),  # the walker then holds the dicts
+            replaced,
+            lambda: context.value(target),
+            lambda: context.value([target]),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(), calls)
+
+
+@pytest.mark.parametrize("by", ["a copy of the context", "a hand-back"])
+def test_what_a_replaced_placeholder_s_finalizer_writes_is_taken_in(by):
+    """A Python walk replaces a depth placeholder in place, which lets go of
+    an object application code put in its instance dict, whose finalizer
+    adds an entry to ``objects``: in the Python walk it runs then; the
+    walker, which holds the placeholder until its recheck takes the
+    replacement up, takes the entry in once the recheck lets go of it, in
+    the same sync, and returns it, as the Python walk does."""
+
+    def build():
+        return ({"k": 1}, [1, 2])
+
+    def calls(context, mapping, target):
+        def attached():
+            def wrote():
+                context.objects[id(target)] = "<python>"
+                context._sources[id(target)] = target
+
+            vars(context.objects[id(mapping)])["finalized"] = _Finalized(wrote)
+
+        if by == "a hand-back":
+            # A bool depth is not one the walker reads: Python takes the call.
+            replaced = lambda: context._mapping(mapping, False) and None  # noqa: E731
+        else:
+            replaced = lambda: copy.copy(context)._mapping(mapping) and None  # noqa: E731
+        return [
+            lambda: copy.copy(context) and None,  # each call's copies written at once
+            lambda: context.value(mapping, 1) and None,  # too deep: a placeholder
+            attached,
+            replaced,
+            lambda: context.value(target),
+            lambda: context.value([target]),
+        ]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+    assert native.results[4:] == ["<python>", ["<python>"]]
+
+
+class _Chained(TruncatedValue):
+    """A depth placeholder whose finalizer runs the ``then`` it holds."""
+
+    def __del__(self):
+        self.then()
+
+
+def _chained(native, rounds):
+    """A hand-back's Python walk replaces a depth placeholder in place; its
+    finalizer, and each one's after it while ``rounds`` last, writes a new
+    placeholder over the entry of another mapping, which lets go of the
+    last one, and adds an entry to ``objects``. The Python walk runs them
+    nested; the walker, holding the noted placeholders, as its recheck lets
+    go of each. Returns how many ran in that call and in the next, which
+    looks the other mapping up, and whether it returned ``objects``' entry."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions(max_depth=1))
+    _check_walker(context, native)
+    first, second = {"a": 1}, {"b": 2}
+    runs, added = [], []
+
+    def placeholder():
+        made = _Chained("max_depth", "dict")
+        made.then = then
+        return made
+
+    def then():
+        runs.append(None)
+        if len(runs) < rounds:
+            added.append(object())
+            context.objects[id(added[-1])] = 0
+            context.objects[id(second)] = placeholder()
+
+    context.value(0)
+    for mapping in (first, second):
+        context.objects[id(mapping)] = placeholder()
+        context._sources[id(mapping)] = mapping
+    context.value(value=0)  # handed back: each noted
+    runs.clear()
+    context._mapping(first)  # handed back: a subclass's reason is not read
+    handed = len(runs)
+    got = context.value(second, 1)
+    found = (handed, len(runs) - handed, got is context.objects[id(second)])
+    runs.append(None)  # no more rounds while the rest goes
+    return found
+
+
+def test_a_chain_of_placeholder_finalizers_is_followed_to_its_end():
+    """Forty finalizers of depth placeholders, each writing a new one over a
+    noted one: the walker reruns its recheck until they stop, and ends where
+    the Python walk, which runs them nested, ends."""
+    assert _chained(True, 40) == _chained(False, 40) == (40, 0, True)
+
+
+class _Compared(Exception):
+    """Raised by the ``__eq__`` of an armed :class:`_ArmedKey`."""
+
+
+class _ArmedKey:
+    """A key of another kind than an id that hashes like the id of
+    ``target``, so looking that id up may compare it; once armed, comparing
+    it raises :class:`_Compared`."""
+
+    def __init__(self, target):
+        self.hash = hash(id(target))
+        self.armed = False
+
+    def __hash__(self):
+        return self.hash
+
+    def __eq__(self, other):
+        if self.armed:
+            raise _Compared
+        return other is self
+
+
+def _let_in_ahead(context, target, key):
+    """Let ``key`` into ``objects`` as the walker does not notice, ahead of
+    the id of ``target`` in the dict's probe order, and arm it: take out the
+    entries from that id on, put ``key`` in, put them back, and remove the
+    first entry, which leaves the count and the key ending ``objects`` as
+    the walker saw them."""
+    objects = context.objects
+    order = list(objects)
+    taken = [(entry, objects.pop(entry)) for entry in order[order.index(id(target)) :]]
+    objects[key] = "planted"
+    objects.update(taken)
+    del objects[order[0]]
+    key.armed = True
+
+
+def test_a_hand_back_whose_recheck_raised_rechecks_again():
+    """A hand-back whose Python walk and resync both look up the id of a
+    depth placeholder past a key an unnoticed removal let in, whose
+    ``__eq__`` raises, leaves the walker unchecked: the next call's sync
+    rechecks, and raises again, as the Python walk's lookup does."""
+
+    def build():
+        mapping = {"k": 1}
+        return (mapping, [mapping])
+
+    def calls(context, mapping, outer):
+        key = _ArmedKey(mapping)
+        return [
+            lambda: context.value(outer),  # the mapping is too deep: a placeholder
+            lambda: context.value(value=outer),  # a hand-back writes the copies
+            lambda: _let_in_ahead(context, mapping, key),
+            lambda: context.value(value=mapping),  # a hand-back: raises in both walks
+            lambda: context.value(mapping),  # raises in both walks
+        ]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+    assert native.results[3:] == [("raised", "_Compared", "")] * 2
+
+
+class _IdLike:
+    """A key that hashes like ``identity``, whose ``__eq__`` is application
+    code, counted once the key is in place: putting it there compares it
+    with the id it hashes like, as often as the probe meets that id."""
+
+    def __init__(self, identity):
+        self.identity = identity
+        self.placed = False
+
+    def __hash__(self):
+        return self.identity
+
+    def __eq__(self, other):
+        if self.placed:
+            _called("key __eq__")
+        return self is other
+
+
+def test_a_sync_that_finds_a_key_not_an_id_rechecks_no_placeholder():
+    """Once the context was copied, each sync rechecks the depth placeholders
+    in its memo, but not the sync that finds in ``objects`` a key that is not
+    an id: the context then retires, and looking the placeholder's id up
+    would run the ``__eq__`` of that key where it hashes like the id and sits
+    ahead of it. Every id starts probing a dict of eight slots at slot 0,
+    which the oldest entry holds; once Python code removes that entry, which
+    the walker notices, a key Python adds next takes the slot."""
+
+    def build():
+        return ({"k": 1}, [0])
+
+    def calls(context, mapping, oldest):
+        def removed():
+            del context.objects[id(oldest)]  # noticed: the next call rebuilds
+
+        def planted():
+            key = _IdLike(id(mapping))
+            context.objects[key] = "planted"
+            key.placed = True
+
+        return [
+            lambda: copy.copy(context) and None,  # every sync rechecks from now on
+            lambda: context.value(oldest),
+            lambda: context.value(mapping, 1),  # too deep: a placeholder
+            removed,
+            lambda: context.value(mapping, 1),  # memoized: writes nothing
+            planted,
+            lambda: context.value(0),  # the walker reads the key and retires
+            lambda: context.value([0]),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
+
+
+_BYTES_WARNING_SCRIPT = """
+import os, warnings
+from pydumpling.options import DumpOptions
+from pydumpling.snapshot import SnapshotContext
+
+mixed = {"a": 1, b"a": 2}  # under -b, built with a warning
+counts = []
+for native in ("0", "1"):
+    os.environ["PYDUMPLING_NATIVE"] = native
+    context = SnapshotContext(DumpOptions())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", BytesWarning)
+        context.value(mixed)  # the copy compares b"a" with "a" again
+    counts.append(len(caught))
+print(vars(context).get("_walker") is not None, counts[0] == counts[1], counts[1] > 0)
+"""
+
+
+@pytest.mark.parametrize("flags", [[], ["-b"]], ids=["plain", "-b"])
+def test_under_python_b_a_context_captures_in_python(flags):
+    """Under ``python -b`` comparing bytes with str warns: the walker's own
+    lookups and inserts, which a call it hands back makes the Python walk
+    repeat, would warn where the Python walk does not, or twice, so a
+    context captures in Python there, and warns as the Python walk does."""
+    process = subprocess.run(
+        [sys.executable, *flags, "-c", _BYTES_WARNING_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=_child_environment(),
+        timeout=120,
+    )
+    assert process.returncode == 0, process.stderr
+    assert process.stdout.split() == (
+        ["False", "True", "True"] if flags else ["True", "True", "False"]
+    )
+
+
+def test_a_recheck_takes_up_only_the_originals_of_replaced_placeholders():
+    """After a copy, every call rechecks the depth placeholders the walker
+    wrote. One that Python code replaced in ``objects`` takes its original
+    from ``_sources``, so the walker lets go of its own, as the Python walk
+    does; one still in place takes nothing from ``_sources``, so a value
+    Python code wrote there over its original, and then replaced, is held
+    nowhere, as in the Python walk."""
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_depth=1))
+        _check_walker(context, native)
+        kept, replaced, first = [1], _Freed("replaced"), _Freed("first")
+        context.value(kept, 1)  # too deep: depth placeholders
+        context.value(replaced, 1)
+        copy.copy(context)  # every sync then rechecks the placeholders
+        context._sources[id(kept)] = first
+        context.objects[id(replaced)] = "<python>"
+        context._sources[id(replaced)] = "mine"
+        context.value(0)
+        context._sources[id(kept)] = "second"
+        freed = [weakref.ref(first), weakref.ref(replaced)]
+        del first, replaced
+        gc.collect()
+        assert [ref() for ref in freed] == [None, None]
+
+
+def _after_an_unnoticed_removal(native):
+    """A context whose ``objects`` Python code changed as the walker does not
+    notice: it removed the entry the walker wrote for ``early``, added one
+    of its own at the id of ``filler``, and moved the entry the walker wrote
+    last back to the end, which leaves the count and the key ending
+    ``objects`` as they were. Returns the context, ``early``, ``filler``,
+    the copy the first capture of ``early`` returned and the removed
+    entry."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+    _check_walker(context, native)
+    early, later, filler = [1], [2], []
+    first = context.value(early)
+    context.value(later)
+    context.value(value=0)  # a hand-back writes the copies
+    last = list(context.objects)[-1]
+    removed = context.objects.pop(id(early))
+    context.objects[id(filler)] = "<python>"
+    context.objects[last] = context.objects.pop(last)
+    return context, early, filler, first, removed
+
+
+def test_a_removal_that_leaves_the_ending_entry_goes_unnoticed():
+    """The walker does not notice a removal that leaves the count and the
+    key ending ``objects`` as they were, and returns its copy of the
+    removed original, where the Python walk copies it afresh."""
+    same = {}
+    for native in (False, True):
+        context, early, _, first, _ = _after_an_unnoticed_removal(native)
         same[native] = context.value(early) is first
     assert same == {False: False, True: True}
+
+
+def test_a_copy_made_after_an_unnoticed_removal_goes_over_python_s_entry():
+    """After a removal the walker does not notice, an entry Python code
+    added at the id of an original the walker has yet to capture goes
+    unnoticed too: the walker copies that original afresh, and its next
+    write, which still finds ``objects`` as it last saw it, puts the copy
+    over Python's entry and returns it from then on. The Python walk
+    returns Python's entry and keeps it."""
+    found = {}
+    for native in (False, True):
+        context, _, filler, _, _ = _after_an_unnoticed_removal(native)
+        fresh = context.value(filler)
+        context.value(value=1)  # a hand-back writes again
+        found[native] = (
+            fresh,
+            context.objects[id(filler)] is fresh,
+            context.value(filler) is fresh,
+        )
+    assert found == {False: ("<python>", True, True), True: ([], True, True)}
+
+
+def test_an_entry_put_back_after_an_unnoticed_removal_is_noticed():
+    """After a removal the walker does not notice, Python code puts the
+    removed entry back at the end. The walker, taking that entry up, finds
+    its memo one entry shorter than ``objects``: it takes its memo from
+    ``objects`` and returns Python's entry at the id of ``filler``, as the
+    Python walk does."""
+    found = {}
+    for native in (False, True):
+        context, early, filler, _, removed = _after_an_unnoticed_removal(native)
+        context.objects[id(early)] = removed
+        found[native] = context.value(filler)
+    assert found == {False: "<python>", True: "<python>"}
+
+
+def test_a_write_after_an_unnoticed_removal_lets_go_of_the_removed_copy():
+    """After a removal the walker does not notice, a write that puts the
+    walker's copy of ``filler`` over Python's entry leaves ``objects`` one
+    entry shorter than the walker's memo: the walker takes its memo from
+    ``objects`` and lets go of its copy of ``early``. It then copies
+    ``early`` afresh, as the Python walk does, even after Python code adds
+    an entry and moves the entry of ``filler`` behind it, which gives
+    ``objects`` the count and ending key of a memo that kept that copy."""
+    other = object()
+    same = {}
+    for native in (False, True):
+        context, early, filler, first, _ = _after_an_unnoticed_removal(native)
+        context.value(filler)
+        copy.copy(context)  # the walker writes
+        context.objects[id(other)] = "<python>"
+        context.objects[id(filler)] = context.objects.pop(id(filler))
+        same[native] = context.value(early) is first
+    assert same == {False: False, True: False}
 
 
 def test_replaced_sources_release_the_originals():
@@ -4503,6 +5920,106 @@ def test_a_copy_finds_a_sources_key_of_another_kind(native, change):
     assert vars(context).get("_walker") is None
 
 
+def test_a_key_a_copy_found_retires_the_context_before_a_recheck():
+    """A key of another kind that a copy of the context found in
+    ``_sources``, which hashes like the id of a depth placeholder the walker
+    took up, sends the context to the Python walk at its next call, though
+    Python code added only plain keys there since, before the walker
+    rechecks: once Python code overwrote the placeholder in ``objects``, a
+    recheck would look that id up in ``_sources`` and run the key's
+    ``__eq__``, which the Python walk, never looking the id up, runs not."""
+
+    def build():
+        return ([0], KeyError("kept"))
+
+    def calls(context, other, kept):
+        key = _IdLike(id(other))
+
+        def noted():
+            context.objects[id(other)] = TruncatedValue("max_depth", "list")
+
+        def planted():
+            context._sources[key] = None
+            key.placed = True
+
+        def overwritten():
+            context._sources[id(kept)] = kept  # as ``exception()`` keeps one
+            context.objects[id(other)] = "<python>"
+
+        return [
+            noted,
+            lambda: context.value(1),  # the walker takes the placeholder up
+            planted,
+            lambda: copy.copy(context) and None,  # its write finds the key
+            overwritten,
+            lambda: context.value(2),
+            lambda: vars(context).get("_walker") is None,
+        ]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(), calls)
+    assert native.results[-1] is True
+
+
+@pytest.mark.parametrize("read_by", ["copy", "hand-back"])
+def test_a_key_not_an_id_removed_before_the_next_call_retires_the_context(read_by):
+    """A key that is not an id, which Python code put in ``objects`` and the
+    walker read there, at a copy of the context or as a hand-back's Python
+    walk added it, sends the context to the Python walk at the next call,
+    though Python code removed it before then: the walker took up no copy
+    from ``objects`` once it read the key, so it cannot notice the removal.
+    From then on ``objects`` holds each copy as soon as it is made, as in
+    the Python walk."""
+
+    def build():
+        return (["zero"], [1], ["two"])
+
+    def calls(context, zero, first, second):
+        def planted():
+            context.objects["tag"] = "planted"
+
+        def removed():
+            del context.objects["tag"]
+
+        if read_by == "copy":
+            read = [planted, lambda: copy.copy(context) is not context]
+        else:
+            read = [lambda: context._mapping(_items_hook(planted, {"a": first}))]
+        return [
+            lambda: context.value(zero),
+            *read,
+            removed,
+            lambda: context.value(second),
+            lambda: sorted(map(repr, context.objects.values())),
+            lambda: vars(context).get("_walker") is None,
+        ]
+
+    _same_in_both_modes(build, DumpOptions(), calls)
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["pure", "native"])
+def test_a_retired_walker_held_elsewhere_keeps_nothing_alive(native):
+    """A walker Python code still holds after its context went to the
+    Python walk, as a key of another kind in ``_sources`` sends it there,
+    keeps none of the originals, dicts or keys of ``objects`` and
+    ``_sources`` alive: once Python code replaces ``_sources``, its
+    originals and keys go, as in the Python walk."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+    held = context._walker
+    original, key = _Plain(), _Plain()
+    released = weakref.ref(original), weakref.ref(key)
+    context.value(original)
+    context.value(value="hand-back")  # writes the copy before the key goes in
+    context._sources[key] = "tag"
+    context.value("next")
+    assert vars(context).get("_walker") is None
+    context._sources = {}
+    del original, key
+    gc.collect()
+    assert [ref() for ref in released] == [None, None]
+    assert (held is not None) is native
+
+
 def test_copy_made_while_a_call_runs_in_python():
     """A copy of the context that application code makes while the Python
     walk takes a call from the walker shares the memo from then on, so it
@@ -4572,6 +6089,41 @@ def test_placeholder_of_an_interrupted_tuple_under_a_profiler(monkeypatch):
 
     native, _ = _same_in_both_modes(build, DumpOptions(max_string_bytes=8), calls)
     assert isinstance(native.results[2], TruncatedValue)
+
+
+@pytest.mark.parametrize("written_by", ["copy", "hand-back", "eager commit"])
+def test_a_write_names_the_tuples_an_error_left_unfilled(monkeypatch, written_by):
+    """A tuple whose capture an error interrupted is still unfilled when
+    the walker next writes, before anything refers back to it: a copy of
+    the context, a hand-back, or, once the context was copied, the commit
+    of the interrupted call itself. The write names it, so ``objects``
+    holds its placeholder, which a later call returns, as the Python walk
+    wrote and returns it, rather than capturing the tuple afresh."""
+
+    def build():
+        return (("x" * 50, [1]),)
+
+    def calls(context, graph):
+        def interrupted():
+            def fail(text, limit):
+                raise _Error("interrupted")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(context_module, "_utf8_prefix", fail)
+                return context.value(graph)
+
+        def written():
+            if written_by == "copy":
+                return copy.copy(context).objects.get(id(graph))
+            return context.value(value=0)
+
+        made = [interrupted, written, lambda: context.value(graph)]
+        if written_by == "eager commit":
+            made[:2] = [lambda: copy.copy(context) and None, interrupted]
+        return made
+
+    native, _ = _same_in_both_modes(build, DumpOptions(max_string_bytes=8), calls)
+    assert isinstance(native.results[-1], TruncatedValue)
 
 
 @pytest.mark.parametrize(
@@ -5061,6 +6613,36 @@ def test_a_context_in_a_reference_cycle_keeps_its_copies(held, copy_kept):
     )
 
 
+def _collected_through_a_key_of_sources(native):
+    """Capture once in the Python walk, so that the walker holds no copy it
+    has yet to write, then key ``_sources`` by an object that refers back to
+    the context and copy the context, which makes the walker read that key
+    as the newest of ``_sources``; let go of both and collect once. Returns
+    whether the context was freed."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+    _check_walker(context, native)
+    context.value(value=0)  # a keyword call is handed back
+    key = _Referrer()
+    key.context = context
+    context._sources[key] = None
+    copy.copy(context)
+    alive = weakref.ref(context)
+    del key, context
+    gc.collect()
+    return alive() is None
+
+
+def test_a_context_in_a_cycle_through_a_key_of_its_sources_is_collected():
+    """The walker shows the cyclic collector every object it holds between
+    calls, the dicts it mirrors and the newest key it saw in ``_sources``
+    among them: a context that ``_sources`` holds through a key that refers
+    back to it is freed by one collection, as in the Python walk."""
+    assert _collected_through_a_key_of_sources(
+        True
+    ) == _collected_through_a_key_of_sources(False)
+
+
 def _collected_at_the_recursion_limit(native):
     """Collect a context in a reference cycle where no Python frame fits."""
     with _mode(native):
@@ -5372,6 +6954,101 @@ def test_a_context_freed_before_its_walker_keeps_its_copies():
     """A walker told its context was freed takes no reference for that
     context's when the collector frees the walker later."""
     assert _freed_before_its_walker(True) == _freed_before_its_walker(False)
+
+
+class _Bringing:
+    """An object whose finalizer brings back every walker the collector has
+    cleared but not yet freed, as code that scans ``gc.get_objects()``
+    finds them."""
+
+    found = []
+
+    def __del__(self):
+        _Bringing.found += [
+            found for found in gc.get_objects() if type(found) is values_module._Walker
+        ]
+
+
+class _Holder:
+    """An object in a reference cycle of its own. CPython lets go of slots
+    in sorted order, so a ``_Bringing`` in ``bringing`` goes first, while
+    ``walker`` still holds the walker."""
+
+    __slots__ = ("bringing", "context", "cycle", "walker")
+
+
+def _cleared_then_brought_back(native):
+    """Let a collection of the youngest generation free a context, its
+    walker, and a ``_Holder`` made after them that holds both and a
+    ``_Bringing`` from an older generation, which only the holder holds:
+    the collector clears the walker, then the holder, whose ``_Bringing``
+    then goes and brings the walker back. The context's ``_sources`` and
+    an original captured into it are from the older generation too, so the
+    collector clears neither. Returns whether the original outlives the
+    collection, and how many walkers came back."""
+    gc.collect()
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        bringing, original, sources = _Bringing(), _Plain(), {"tracked": []}
+        gc.collect()  # to the oldest generation
+        with _mode(native):
+            context = SnapshotContext(DumpOptions())
+        _check_walker(context, native)
+        context._sources = sources
+        context.value(original)
+        copy.copy(context)  # the walker writes each call's copies at once
+        holder = _Holder()
+        holder.bringing, holder.walker = bringing, vars(context).get("_walker")
+        holder.context, holder.cycle = context, holder
+        alive = weakref.ref(original)
+        del bringing, original, sources, context, holder
+        gc.collect(0)
+    finally:
+        if enabled:
+            gc.enable()
+    outlived = alive() is not None
+    brought_back = len(_Bringing.found)
+    _Bringing.found.clear()
+    return outlived, brought_back
+
+
+def test_a_walker_brought_back_after_it_was_cleared_keeps_nothing_alive():
+    """The collector may clear a walker that an object it clears later
+    still holds, and the finalizer of an object only that one held, which
+    runs then, can bring the walker back. The walker then keeps none of its
+    context's dicts alive, and so none of the originals they hold, as the
+    Python walk, which has no walker, keeps none."""
+    assert _cleared_then_brought_back(True) == (False, 1)
+    assert _cleared_then_brought_back(False) == (False, 0)
+
+
+def _used_after_a_freed_notice(native):
+    """Run the callback of each weak reference to a context that captured
+    a referrer of its own, as Python code can while the context lives,
+    capture through the context again, let go of both and collect once.
+    Returns how many referrers the collection left alive."""
+    gc.collect()
+    before = _referrers()
+    with _mode(native):
+        context = SnapshotContext(DumpOptions(max_depth=1))
+    _check_walker(context, native)
+    referrer = _Referrer()
+    referrer.context = context
+    context.value(referrer)
+    for callback in [ref.__callback__ for ref in weakref.getweakrefs(context)]:
+        callback(None)
+    context.value([5])
+    del referrer, context
+    gc.collect()
+    return _referrers() - before
+
+
+def test_a_context_used_after_a_freed_notice_is_its_walker_s_again():
+    """A walker told its context was freed while the context lives on takes
+    the context of its next call for its own again: a cycle through that
+    context is then freed by one collection, as in the Python walk."""
+    assert _used_after_a_freed_notice(True) == _used_after_a_freed_notice(False)
 
 
 class _Later:
@@ -5726,7 +7403,7 @@ def _owed_after_python_removed_its_entry(released):
 
 
 @pytest.mark.skipif(
-    not _UNTRACKED_DICTS, reason="from 3.14 the walker owes `_sources` nothing"
+    not _UNTRACKED_DICTS, reason="from 3.14 a release writes a `_sources` still held"
 )
 def test_what_a_walker_owes_is_what_it_would_have_written():
     """The walker owes ``_sources`` the writes it made into the copy of it
@@ -5766,6 +7443,84 @@ def test_python_s_entry_where_the_walker_owes_an_original_is_overwritten():
         found[native] = context._sources.get(id(error))
         del kept
     assert found == {False: "mine", True: error}
+
+
+def _changed_after_the_walker_wrote_what_it_owed(native, how):
+    """A release that writes only ``objects``, as the collector's finalizer
+    makes for a dying context, then a copy of the context, whose write
+    makes what the walker owes ``_sources``; Python code then overwrites or
+    removes one of those originals before a second copy."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+    _check_walker(context, native)
+    kept = context.objects
+    error = KeyError("kept")
+    context.value([error])
+    walker = vars(context).get("_walker")
+    if walker is not None:
+        # As the collector's finalizer does, for a dying context.
+        walker.release()
+    del walker
+    copy.copy(context)
+    if how == "overwritten":
+        context._sources[id(error)] = "mine"
+    else:
+        del context._sources[id(error)]
+    return _contents(context), len(kept)
+
+
+@pytest.mark.skipif(
+    not _UNTRACKED_DICTS, reason="from 3.14 a release writes a `_sources` still held"
+)
+@pytest.mark.parametrize("how", ["overwritten", "removed"])
+def test_what_a_walker_owed_it_writes_once(how):
+    """The first write that succeeds after a release that wrote only
+    ``objects`` makes what the walker owes ``_sources``, and the walker then
+    owes nothing: an original Python code overwrites or removes afterwards
+    stays as Python left it through the walker's later writes, as in the
+    Python walk."""
+    assert _changed_after_the_walker_wrote_what_it_owed(
+        True, how
+    ) == _changed_after_the_walker_wrote_what_it_owed(False, how)
+
+
+def _overwritten_after_a_release(native):
+    """Python code overwrites in ``objects`` the copy that a release which
+    wrote only that dict put there, as the collector's finalizer writes for
+    a dying context, and the context captures the original again; ``"first
+    copy"`` stands for the copy the first capture returned."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+    _check_walker(context, native)
+    kept = context.objects
+    original = [[]]
+    first = context.value(original)
+    walker = vars(context).get("_walker")
+    if walker is not None:
+        # As the collector's finalizer does, for a dying context.
+        walker.release()
+        assert id(original) in context.objects
+        assert id(original) not in context._sources
+    del walker
+    context.objects[id(original)] = "<python>"
+    again = context.value(original)
+    del kept
+    return "first copy" if again is first else again
+
+
+@pytest.mark.skipif(
+    not _UNTRACKED_DICTS, reason="from 3.14 the walker owes only a dict it alone holds"
+)
+def test_a_release_that_wrote_only_objects_keeps_the_walker_s_view_of_sources():
+    """A release that writes only ``objects`` writes the originals into a
+    copy of ``_sources`` it drops, and the walker then takes ``_sources`` as
+    it last saw it, not as that copy: its next sync finds no change where
+    Python code made none, and rebuilds nothing. So an entry Python
+    overwrote in ``objects`` goes unnoticed after it as after any other
+    write, an accepted difference that
+    ``test_an_entry_python_overwrites_in_place`` pins."""
+    assert _overwritten_after_a_release(False) == "<python>"
+    assert _overwritten_after_a_release(True) == "first copy"
 
 
 def _owed_then_a_write_fails(native, released):
@@ -5823,7 +7578,7 @@ def _owed_then_a_write_fails(native, released):
 
 
 @pytest.mark.skipif(
-    not _UNTRACKED_DICTS, reason="from 3.14 the walker owes `_sources` nothing"
+    not _UNTRACKED_DICTS, reason="from 3.14 a release writes a `_sources` still held"
 )
 @pytest.mark.parametrize("released", [False, True], ids=["used", "released"])
 def test_what_a_walker_owes_stays_owed_until_its_write_succeeds(released):
@@ -5834,6 +7589,80 @@ def test_what_a_walker_owes_stays_owed_until_its_write_succeeds(released):
     assert _owed_then_a_write_fails(True, released) == _owed_then_a_write_fails(
         False, released
     )
+
+
+def _replaced_over_python_then_released(native, how):
+    """Depth placeholders a hand-back wrote, which the walk then replaced in
+    place after Python code wrote its own entry at each original's id in
+    ``_sources``, or removed the walker's; then a release that writes only
+    ``objects``, as the collector's finalizer makes for a dying context."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions(max_depth=1))
+    _check_walker(context, native)
+    kept = context.objects
+    mappings = [{"old": n} for n in range(5)]
+    context.value(mappings)  # each mapping too deep: a placeholder
+    context.value(value=0)  # a hand-back writes them
+    for mapping in mappings:
+        if how == "in place":
+            context._sources[id(mapping)] = "mine"
+        else:
+            del context._sources[id(mapping)]
+    for mapping in mappings:
+        context._mapping(mapping)
+    walker = vars(context).get("_walker")
+    if walker is not None:
+        # As the collector's finalizer does, for a dying context.
+        walker.release()
+    del walker
+    return _contents(context), len(kept)
+
+
+@pytest.mark.skipif(
+    not _UNTRACKED_DICTS, reason="from 3.14 a release writes a `_sources` still held"
+)
+@pytest.mark.parametrize("how", ["in place", "appended"])
+def test_a_walker_owes_the_originals_of_its_replacements(how):
+    """A release that writes only ``objects`` owes ``_sources`` the original
+    of each copy the walk put over a depth placeholder, whether it goes
+    over Python's own entry or after the entries Python left, as it owes
+    those of new copies: else ``_sources`` keeps Python's entry, or none,
+    and once a rebuild of the memo lets go of the original, a new object
+    at its id gets the old copy."""
+    assert _replaced_over_python_then_released(
+        True, how
+    ) == _replaced_over_python_then_released(False, how)
+
+
+def _owed_to_a_replaced_sources(native):
+    """Python code replaces ``_sources`` after a call, so that only the
+    walker holds the one it mirrored, and the walker is released with
+    ``objects`` kept, as the collector's finalizer releases it, writing
+    only ``objects``; then the context captures again. Returns what both
+    dicts hold."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+    _check_walker(context, native)
+    kept = context.objects
+    first, then = ["first"], ["then"]
+    context.value(first)
+    context._sources = {}
+    walker = vars(context).get("_walker")
+    if walker is not None:
+        walker.release()
+    del walker
+    context.value(then)
+    return _contents(context), len(kept)
+
+
+def test_what_a_walker_owes_a_replaced_sources_goes_there():
+    """A release that writes only ``objects`` owes the ``_sources`` it
+    mirrored the originals; once Python code has put another dict in its
+    place, the walker's next sync makes those writes into the dict it
+    mirrored, before it takes the new one, so the new ``_sources`` holds
+    only what the walk put there since, as in the Python walk, which wrote
+    each original into the replaced dict at once."""
+    assert _owed_to_a_replaced_sources(True) == _owed_to_a_replaced_sources(False)
 
 
 def _replaced_where_a_write_fails(native, then):
@@ -5880,7 +7709,9 @@ def _changed_inside_an_eager_call(native):
     """A copied context, whose walker writes each call's copies as it ends,
     captures a large value; a collection while the walk runs removes the
     exception Python kept last in ``_sources`` and adds a key that compares
-    with an id of Python's by raising, then two entries of Python's."""
+    with an id of Python's by raising, then two entries of Python's, which
+    leave ``_sources`` two longer. Python code then gives ``objects`` an
+    entry at that id, and the context captures again."""
     with _mode(native):
         context = SnapshotContext(DumpOptions(max_nodes=None, max_items=None))
     _check_walker(context, native)
@@ -5909,18 +7740,68 @@ def _changed_inside_an_eager_call(native):
     try:
         with _collecting(callback):
             captured = context.value(graph)
+        armed = False
+        context.objects[ids[1]] = "<python>"
+        again = context.value(["c"])
     finally:
         armed = False
         _Armed.armed = False
     assert changed, "no collection ran during the call"
-    return captured == graph, [key in context._sources for key in ids]
+    return captured == graph, again, [key in context._sources for key in ids]
 
 
 def test_python_s_changes_inside_an_eager_call_are_noticed():
     """A walker that writes each call's copies as the call ends checks
     where Python code left the dicts then, as code the walk ran, such as a
-    collection's callbacks, may have changed them since the call began."""
+    collection's callbacks, may have changed them since the call began: a
+    key Python added there that is not of a plain kind, which no count
+    shows beside a removal, keeps the walker from looking ids up in
+    ``_sources``, where comparing with it runs its own code."""
     assert _changed_inside_an_eager_call(True) == _changed_inside_an_eager_call(False)
+
+
+def _replaced_inside_an_eager_call(native):
+    """A copied context, whose walker writes each call's copies as it ends,
+    captures a large value; a collection while the walk runs removes from
+    ``objects`` the copy of a list captured before and adds an entry of
+    Python's, which leaves the dict as long as it was. The list is then
+    captured again: whether that gives its first copy back, and what both
+    dicts hold."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions(max_nodes=None, max_items=None))
+    _check_walker(context, native)
+    copy.copy(context)
+    known = ["known"]
+    first = context.value(known)
+    context.value(["b"])
+    graph = [[i] for i in range(5000)]
+    changed = []
+
+    def callback(phase, info):
+        if phase != "start" or changed:
+            return
+        if native and not _inside_the_walk(context):
+            return
+        changed.append(True)
+        del context.objects[id(known)]
+        context.objects[10**9 + 3] = "<python>"
+
+    with _collecting(callback):
+        captured = context.value(graph)
+    assert changed, "no collection ran during the call"
+    again = context.value(known)
+    return captured == graph, again == known, again is first, _contents(context)
+
+
+def test_a_removal_masked_inside_an_eager_call_is_noticed():
+    """A walker that writes each call's copies as the call ends checks, as
+    it writes them, where Python code left the end of ``objects``: a copy
+    that code the walk ran, such as a collection's callbacks, removed
+    while it added another, which no count shows, is then let go of, and
+    its original captured afresh, as by the Python walk."""
+    native = _replaced_inside_an_eager_call(True)
+    assert native == _replaced_inside_an_eager_call(False)
+    assert native[:3] == (True, True, False)
 
 
 def _shape(value):
@@ -6197,6 +8078,44 @@ def test_a_hand_back_removes_a_copy_its_additions_mask():
     _same_in_both_modes(build, DumpOptions(), calls)
 
 
+def test_a_key_a_hand_back_puts_in_place_of_copies_retires_the_context():
+    """Application code a hand-back's Python walk runs removes copies the
+    walker wrote and puts a key that is no id in ``objects``, which leaves
+    the count as it was. The walker then holds none of the entries in
+    ``objects``, so it watches none of them: the next call sends the context
+    to the Python walk, though Python code swapped that key for an entry of
+    its own before it, and the call's copies go into ``objects`` at once, as
+    in the Python walk."""
+
+    def build():
+        return ([], [], [], [], [])
+
+    def calls(context, a, b, c, d, e):
+        def swaps():
+            del context.objects[id(a)], context.objects[id(b)]
+            context.objects["key"] = None
+
+        def swapped_back():
+            del context.objects["key"]
+            context.objects[id(d)] = "<python>"
+            context._sources[id(d)] = d
+
+        hooked = _items_hook(swaps, {})
+        return [
+            lambda: context.value(a),
+            lambda: context.value(b),
+            lambda: context.value(c),
+            lambda: context.value(value=0),  # a hand-back writes the copies
+            lambda: context._mapping(hooked),
+            swapped_back,
+            lambda: context.value(e),
+            lambda: vars(context).get("_walker") is None,
+            lambda: sorted(map(repr, context.objects.values())),
+        ]
+
+    _same_in_both_modes(build, DumpOptions(), calls)
+
+
 def test_after_a_copy_a_removal_and_an_addition_are_noticed():
     """Once the context was copied the walker writes each call's copies at
     once, and Python code that removes an entry and adds another between two
@@ -6324,6 +8243,37 @@ def test_a_removal_with_as_many_additions_is_noticed_before_any_copy(
     _same_in_both_modes(build, DumpOptions(), calls)
 
 
+def _overwritten_after_a_rebuild(native):
+    """Python code swaps the entry of ``_sources`` for ``original`` for one
+    of its own, leaving the count as it was, which the next call notices
+    and rebuilds the memo for; Python code then overwrites in ``objects``
+    the copy of ``original``, and the context captures it again. ``"first
+    copy"`` stands for the copy the first capture returned."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+    _check_walker(context, native)
+    original, other = [[]], [[]]
+    first = context.value(original)
+    context.value(value=0)  # a hand-back writes every copy
+    del context._sources[id(original)]
+    context._sources[id(other)] = other
+    context.value(1)  # noticed: the walker rebuilds its memo
+    context.objects[id(original)] = "<python>"
+    again = context.value(original)
+    return "first copy" if again is first else again
+
+
+def test_a_rebuild_takes_the_newest_key_of_sources_afresh():
+    """A rebuild forgets the key it last saw ending ``_sources``, so the
+    sync takes it afresh even where the count stayed as it was: the next
+    sync finds no change where Python code made none, and rebuilds nothing.
+    So an entry Python overwrote in ``objects`` goes unnoticed after it as
+    after any other sync, an accepted difference that
+    ``test_an_entry_python_overwrites_in_place`` pins."""
+    assert _overwritten_after_a_rebuild(False) == "<python>"
+    assert _overwritten_after_a_rebuild(True) == "first copy"
+
+
 class _Freed:
     """An original whose release a finalizer records."""
 
@@ -6362,6 +8312,28 @@ def test_an_original_python_removes_is_released(native, then):
         context.value("next")
     else:
         context.__getstate__()
+    del original
+    assert freed == ["x"]
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["pure", "native"])
+def test_an_original_written_at_a_commit_is_released_once_python_removes_it(native):
+    """Once the context was copied, each call writes its copies as it
+    commits; an original Python code then removes from ``_sources`` is held
+    nowhere once its caller lets it go, as in the Python walk: the walker
+    notices at the next call that ``_sources`` holds fewer entries than
+    that write left, and lets go of its own reference."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+    _check_walker(context, native)
+    context.value(["first"])  # ``_sources`` is not empty when the commit writes
+    copy.copy(context)  # each call's copies are written as it commits
+    original = _Freed("x")
+    freed = []
+    weakref.finalize(original, freed.append, "x")
+    context.value(original)
+    del context._sources[id(original)]
+    context.value("next")
     del original
     assert freed == ["x"]
 

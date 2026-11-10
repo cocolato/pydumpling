@@ -55,9 +55,14 @@ extension has been built and tested on macOS arm64 only.
 A context gets a walker at the end of `SnapshotContext.__init__`
 (`ValuesMixin._start_walker`) when the extension imported (CPython 3.12+,
 built, and `PYDUMPLING_NATIVE` was not `"0"` when `values` was imported),
-`PYDUMPLING_NATIVE` is not `"0"` when the context is created, and the class
-has a `_stock_walk`, which `context.py` records for `SnapshotContext` only;
-subclasses inherit it and face the per-call check.
+`PYDUMPLING_NATIVE` is not `"0"` when the context is created, Python does
+not run under `-b` (`sys.flags.bytes_warning`), and the class has a
+`_stock_walk`, which `context.py` records for `SnapshotContext` only;
+subclasses inherit it and face the per-call check. Under `-b` comparing
+bytes with str warns, and the walker's own dict and set lookups and
+inserts, which a call it hands back makes the Python walk repeat, would
+warn where the Python walk does not, or twice; the flag is fixed for the
+life of the process.
 
 Before every call the walker checks the context without running any of its
 code (see "The class check"). If the class or state is one only the Python
@@ -79,12 +84,17 @@ happens for:
 - no plain `__dict__` getset, one that refuses the instance (such as
   another class's planted there, before 3.15; 3.15 accepts it), or an
   instance dict that is not an exact dict or holds a non-str key;
-- a missing state attribute; options not exactly `DumpOptions`; a budget
-  that is not `None` or a positive exact int; a code text limit below 9;
-  `_unlimited` not `False`; `_truncation` not an exact `Counter`, or with a
-  key not of a plain kind; `_namespaces` not an exact set; `_layouts` not an
-  exact dict; `_nodes` not an exact non-negative int; `objects` or
-  `_sources` not exact dicts, or one dict for both;
+- a missing state attribute; options not exactly `DumpOptions`, whose instance
+  dict (a dict subclass assigned as `__dict__` too, which attribute lookup
+  reads as a dict) holds a key other than an exact str or lacks a budget, or
+  whose class has an MRO other than at import, a `__getattribute__`, or under a
+  budget's name anything but `None` or an exact int (each call reads every
+  budget, the Python walk only those it uses, so neither may run code); a
+  budget that is not `None` or a positive exact int; a code text limit below 9;
+  `_unlimited` not `False`; `_truncation` not an exact `Counter`, or with a key
+  other than an exact str; `_namespaces` not an exact set; `_layouts` not an
+  exact dict; `_nodes` not an exact non-negative int; `objects` or `_sources`
+  not exact dicts, or one dict for both;
 - a key in `objects` that is not an id (an exact int in address range), or
   one in `_sources` not of a plain kind (exact str, int, float, complex,
   bool, bytes, `None`, or an exact tuple of those).
@@ -114,16 +124,27 @@ Why these, where it is not obvious:
 
 A single call goes to the Python walk (a *hand-back*), and the context
 stays native, when its arguments are not in a shape the walker reads
-without running code (no value or more than two positional arguments, the
-value or source by keyword, a depth that is not an exact int or exceeds
-2**62 in magnitude, a keyword name that is not an exact str, a `priority`
-that is not an exact tuple, list, set or frozenset of plain keys, `counted`
-not `True`/`False`, a `container` other than `dict` or `FakeDict`); when the
-walk reaches a point where the Python walk would run application code
-(listed under "The transaction"); when the Python walk would come within
-64 frames of the recursion limit, any `RecursionError` is raised, or the
-native stack budget runs out; and when Python code is needed while a
-profiler, tracer or monitoring tool is set. `Walker.handbacks` counts them.
+without running code (listed below); when the walk reaches a point where
+the Python walk would run application code (listed under "The
+transaction"); when the Python walk would come within 64 frames of the
+recursion limit, any `RecursionError` is raised, or the native stack
+budget runs out; and when Python code is needed while a profiler, tracer
+or monitoring tool is set. `Walker.handbacks` counts them. These argument
+shapes hand a call back before the walk starts (`arguments.rs`), and the
+Python walk then raises or converts as it would:
+
+- no positional argument after the context (as when the value or source
+  is passed by keyword), or more than two;
+- a depth, positional or by keyword, that is not an exact int (a bool is
+  not) or exceeds 2**62 in magnitude, or a depth given both ways;
+- a keyword name that is not an exact str, or not valid UTF-8 (a lone
+  surrogate);
+- a keyword other than `depth` for `value`, or other than `depth`,
+  `priority`, `counted` and `container` for `_mapping`;
+- a `priority` that is not an exact tuple, list, set or frozenset of
+  exact str names;
+- `counted` other than `True` or `False`;
+- a `container` other than `dict` or `FakeDict`.
 
 ## Module map
 
@@ -138,7 +159,9 @@ profiler, tracer or monitoring tool is set. `Walker.handbacks` counts them.
     mapping.rs      _mapping, _attribute_mapping, _root_value
     keys.rs         key selection: preferred names, link order, limit + 1
     text.rs         budgets, tallies, _remember, text fast paths
-    types.rs        per-type facts from the MRO, cached for one call
+    types.rs        per-type facts from the MRO, cached for one call; plain
+                    reads of a placeholder's reason and the copy classes'
+                    instance dicts
     statics.rs      per-import table of types, base methods and sys hooks
     memo.rs         insertion-ordered identity memo with journaled rollback
     mirror.rs       sync of the memo with ctx.objects and ctx._sources
@@ -286,11 +309,23 @@ that code twice. The points are:
 - a memo hit in `_mapping` on an entry that is not an exact `dict`,
   `FakeDict`, `TruncatedValue`, builtin scalar or builtin container: the
   Python walk's `isinstance` reads its `__class__`;
-- a placeholder or `FakeClass` whose instance dict is not an exact dict of
-  plain keys, or a placeholder whose `reason` is not an exact str;
+- copying a `FakeClass` whose instance dict is not an exact dict of exact
+  str keys, or whose class holds, along its MRO, a `__repr__` other than
+  the one it had at import or a `__getattribute__` (the Python walk calls
+  `FakeClass.__repr__` as the class then has it);
+- any object while `FakeClass` has an MRO other than the one it had at
+  import, checked before anything runs: given other bases, it builds its
+  copies through theirs, and 3.12 to 3.14 refuse the instance-dict
+  descriptor it had at import;
+- a memo hit in `_mapping` on a placeholder whose `reason` the walker cannot
+  read without running code, as an exact str: one whose class holds, along its
+  MRO, `reason`, a `__getattribute__` but `object`'s, or a class dict key other
+  than an exact str, whose instance dict holds a key other than an exact str,
+  or that holds no `reason`, or one of another type (the Python walk then
+  raises or runs the hook once);
 - an item view yielding anything but exact 2-tuples;
 - filtering the private attribute of a captured snapshot copy, or reading
-  its own type name, from a dict whose keys are not all plain;
+  its own type name, from a dict whose keys are not all exact str;
 - a truncation tally that is not an exact int below 2**63 - 1, checked
   before the walker or a Python helper adds to it;
 - adding a copy that is not a plain key to a set or dict, which may run
@@ -355,8 +390,11 @@ Why lazy: an eager prototype that wrote every call's copies to
 (7.1x to 3.5x) and raised peak RSS above the Python walk's, only to honor
 code outside the walk changing that internal dict, which nothing in
 pydumpling does. Replacing a dict is still honored. Exporting the whole memo
-at each hand-back was also rejected: 30-125 ms with 300,000 entries, where
-the incremental mirror takes 0.17 ms.
+at each hand-back was also rejected: with 300,000 entries in the dicts, a
+hand-back that wrote them all again took 21-100 ms (run medians 23-49 ms),
+where one that writes only the entries made since the last write takes
+3-5 µs, the handed-back call included (CPython 3.13, release build; each
+hand-back followed a one-item call).
 
 The fields are documented on `State` in `walker.rs`. In short: `mirror`
 holds the dicts as of the last sync; `mirrored` counts the memo entries,
@@ -382,27 +420,68 @@ That check costs nothing while neither dict holds an entry the walker
 synced with, and up to about 0.1 us per call once either does; capture and
 save times are unchanged in the benchmark.
 
-If Python code replaced a dict, changed `objects`, or removed entries
-while the walker held unwritten copies, the walker first writes them into
-the dicts it mirrored (see "Writes"), then takes its memo from `objects`.
-Otherwise a replaced dict or a moved ending key (a shorter dict has none
-where the walker saw it) rebuilds the memo from `objects` with the
-originals `_sources` holds, letting go of the originals Python removed so
-their ids can be reused as in the Python walk, and copies Python appended
-to `objects` (a hand-back's, say) are adopted from the tail. Entries Python only appended to `_sources`, as `exception()`
-keeps builtin exceptions there, need no write: the walker checks their
-keys and takes the new length. In eager mode, and after a hand-back, depth
-placeholders Python replaced in place are adopted. Every key the walker
-reads is checked as it reads it, without running code: a key in `objects`
-that is not an id, or a `_sources` key not of a plain kind, sets
-`foreign`, and the context retires once the walker has written what it
-holds.
+If Python code replaced a dict, changed `objects`, or removed entries while the
+walker held unwritten copies, the walker first writes them into the dicts it
+mirrored (see "Writes"), then takes its memo from `objects`. A dict Python
+replaced, the sync lets go of once it has written there the copies it had yet
+to write, before it reads the dicts that replaced it, so it takes in what that
+dict's finalizers write into `objects`, as they run at once without the walker;
+a dict such a finalizer puts on the context in place of one it reads, the
+walker reads from the next call (see "Accepted, documented differences").
+Otherwise a replaced dict or a moved ending key (a shorter dict has none where
+the walker saw it) rebuilds the memo from `objects` with the originals
+`_sources` holds, letting go of the originals Python removed so their ids can
+be reused as in the Python walk, and copies Python appended to `objects` (a
+hand-back's, say) are adopted from the tail; if that leaves the memo shorter
+than `objects`, as when Python put back an entry a removal the walker did not
+notice took out, the memo is rebuilt too. Entries Python only appended to
+`_sources`, as `exception()` keeps builtin exceptions there, need no write: the
+walker checks their keys and takes the new length. In eager mode, and at the
+first sync after a hand-back, depth placeholders Python replaced in place are
+adopted, each with the original `_sources` then holds for it: a hand-back
+leaves the walker unchecked until a sync rechecks, so a resync that reads
+nothing, or stops before or in its recheck, leaves it to the next call's. The
+walker notes every `TruncatedValue` it makes or finds in `objects`, of a
+subclass too, which the Python walk's `isinstance` takes for one (the walker
+reads that from the type's MRO, which runs no code), and adopts whatever
+`objects` holds in place of one whose class still derives from
+`TruncatedValue`. The walker returned each placeholder, and application code
+may have changed it or its class since, so of one still in place it reads
+`reason` only where that runs no code: an exact `TruncatedValue`'s, through the
+instance-dict descriptor the class had at import, from a dict of exact str keys
+while the class holds along its MRO no `reason` or `__getattribute__` but
+`object`'s, and only exact str keys. It lets go of one whose reason reads so as
+another than `"max_depth"`, as the Python walk replaces only depth
+placeholders, and of one application code gave a class not derived from
+`TruncatedValue`; any other, it keeps checking, and it never raises for one. It
+checks them last, once the sync has taken in all it found and counted what each
+dict holds. A placeholder the recheck lets go of may have finalizers that write
+into the dicts, as they ran at once when the Python walk replaced it: when
+either dict's length then moved, the sync runs again and takes those writes in
+(an overwrite of an entry that is not a noted placeholder it does not notice,
+as with any such overwrite). It reruns its recheck at most as many times as the
+recursion limit: the Python walk runs such finalizers nested, so the recursion
+limit ends a chain of them, except on 3.12, where CPython's trashcan frees the
+placeholders one after another and the chain runs to its end; past that, the
+walker stays unchecked and the next sync carries on (see "Accepted, documented
+differences"). It counts as checked only once a recheck returns with neither
+length moved. So a recheck cut short, which takes `MemoryError`, CPython's C
+recursion limit, or the `__eq__` of a key that hashes like an id and that a
+removal the walker did not notice let in (see "Accepted, documented
+differences"), leaves the walker as one that returned would, but still
+unchecked, so that the next sync rechecks, with the placeholder it was checking
+and those it had yet to check still noted. Every key the walker reads is
+checked as it reads it, without running code: a key in `objects` that is not an
+id, or a `_sources` key not of a plain kind, sets `foreign`, and the context
+retires once the walker has written what it holds.
 
 ### Writes
 
 The walker writes (`flush.rs`) on a hand-back, a retire, `Walker.flush`
 (from `__getstate__`, a copy or a pickle), a sync that found the dicts
-changed, an eager commit, and a release. Every write first checks where
+changed, an eager commit, and a release that holds copies it has yet to
+write or owes `_sources` (a release with nothing to write neither checks
+the dicts nor rebuilds the memo). Every write first checks where
 Python left the dicts, and the keys Python appended to `_sources`, except
 the one a sync makes right after checking them itself; an eager commit
 checks too, since Python code the walk ran, such as a collection's
@@ -485,12 +564,16 @@ exception may be unwinding, which a call into Python would replace
 which pydumpling never makes, has no finalizer and writes nothing when
 freed.
 
-Why `_walker` is the instance dict's last key: on 3.12 and 3.13 an instance
-dict releases its values in its class's shared-key order, which the class's
-first instance fixes. A walker released before `objects` and `_sources`
-found them still held and wrote every unwritten copy into dicts about to be
-freed (about 70 ms and a memory peak above the Python walk's for 50,000
-ints). Released last, it finds them held by itself alone and writes
+Why `_walker` is the instance dict's last key: an instance dict releases
+its values in its class's shared-key order, which the class's first
+instance fixes, on 3.12 to 3.15 alike. A walker released before `objects`
+and `_sources` would find them still held and write every unwritten copy
+into dicts about to be freed. On 3.13, with a fresh class whose first
+instance set `_walker` first, freeing a context that had captured a list
+of 50,000 distinct ints took 2.5-3 ms instead of 0.2 ms (0.5 ms in the
+Python walk; 22-45 ms under `tracemalloc`), and peak RSS rose by 13-15 MB
+over the capture, against 4 MB with `_walker` last and 12 MB in the
+Python walk. Released last, it finds them held by itself alone and writes
 nothing. An instance releases slots before its dict, which is why a
 `_walker` slot retires the context.
 
@@ -528,31 +611,42 @@ them.
 ### Retire
 
 `retire` flushes into the mirrored dicts, without reading the context
-again (so a replaced `_sources` loses nothing), clears the memo and the
-mirror, sets `_walker = None` with `object.__setattr__`, and runs the call
-in Python. The walker is then usually freed, with nothing left to write.
+again (so a replaced `_sources` loses nothing), clears the memo, the
+mirror and its view of `_sources` (whose newest key may be the very key
+that retired the context), sets `_walker = None` with
+`object.__setattr__`, and runs the call in Python. The walker is then
+usually freed, with nothing left to write; one that Python code still
+holds keeps none of the context's originals, nor `objects`, `_sources` or
+their keys, alive (it still holds the `_truncation` and `_namespaces` it
+last read).
 
 ## Invariants and why
 
-- Native code never runs application code, but for the key comparisons
-  listed under the accepted differences (a dict key not of a plain kind
-  whose `__eq__` runs when the walker writes or looks up an id it collides
-  with). Types are compared by address,
-  class attributes are read through `type.__dict__` descriptors, containers
-  through their builtin base's unbound methods, and keys are hashed or
-  compared only when they are of a plain kind. Anything else hands back
-  before it runs, so application hooks run exactly as often as without the
-  extension. Neither a call nor a release imports anything, since
-  `builtins.__import__` may be the application's: every module-level
-  object the walker or its finalizer needs (including the answer of
-  `gc.is_tracked({})` and `collections.Counter`) is resolved when
-  `Statics` is built.
-- The order of memo entries, node counts and truncation counters is part
-  of the snapshot, and so is object sharing (the pickle memo shows it). The
-  walker follows the Python walk step for step, builds `TruncatedValue` and
-  `FakeClass` as their `__init__` would, and uses the same reason objects
-  (`_RECURSIVE_IMMUTABLE`, the node marker) so placeholders pickle to the
-  same bytes.
+- Native code never runs application code, but for the key comparisons listed
+  under the accepted differences (a dict key not of a plain kind whose `__eq__`
+  runs when the walker writes or looks up an id it collides with, an element of
+  `_namespaces` that hashes like the id of a dict it captures, and a key other
+  than a str planted in a class dict of `DumpOptions` that hashes like a
+  budget's name), and for the finalizers and weak reference callbacks of
+  objects whose last reference the walker lets go of: mostly objects the Python
+  walk lets go of too, but at other times (a dict Python replaced, at the next
+  sync; an original or copy the memo drops), and also originals the Python walk
+  keeps, when a write in the walker's finalizer is cut short (see the accepted
+  differences). Types are compared by address, class attributes are read
+  through `type.__dict__` descriptors, containers through their builtin base's
+  unbound methods, and keys are hashed or compared only when they are of a
+  plain kind. Anything else hands back before it runs, so application hooks run
+  exactly as often as without the extension. Neither a call nor a release
+  imports anything, since `builtins.__import__` may be the application's: every
+  module-level object the walker or its finalizer needs (including the answer
+  of `gc.is_tracked({})` and `collections.Counter`) is resolved when `Statics`
+  is built.
+- The order of memo entries, node counts and truncation counters is part of the
+  snapshot, and so is object sharing (the pickle memo shows it). The walker
+  follows the Python walk step for step, builds every copy as its class's
+  constructor does while the class holds no hook of its own, and uses the same
+  reason objects (`_RECURSIVE_IMMUTABLE`, the node marker) so placeholders
+  pickle to the same bytes.
 - A call either commits what it did or rolls back to the exact state it
   started from; the Python walk then runs from that state.
 - `objects` and `_sources` end up holding what the Python walk would
@@ -566,8 +660,13 @@ in Python. The walker is then usually freed, with nothing left to write.
 - The walker reads the context only after the class check, and only
   through its instance dict, `object.__getattribute__` and
   `object.__setattr__`. It holds the context only during a call; between
-  calls it refers to it only through what its memo or `owed` keeps and,
-  before 3.14, a weak reference.
+  calls it refers to it only through what its memo, `owed`, the dicts it
+  mirrors, the newest key of `_sources`, the `_truncation`, `_namespaces`
+  and node marker it last read and the types it last met keep and, before
+  3.14, a weak reference. `__traverse__` visits all of them (the weak
+  reference too, through which the collector does not reach the context),
+  so a context in a cycle through any of them is collected as in the
+  Python walk.
 - The `Statics` table is built from the `values` module's own globals at
   import and leaked for the life of the process: a reloaded or vendored
   package gets its own table and copies into its own classes, and old
@@ -605,7 +704,12 @@ Each of these is a difference from the Python walk that remains by design.
   - Python overwrote an entry the walker already wrote: the walker does
     not notice, and keeps returning its own copy until a noticed removal,
     a replaced dict, or a write after Python changed `objects` makes it
-    take its memo from `objects` again;
+    take its memo from `objects` again, or, for a placeholder it still
+    notes whose class still derives from `TruncatedValue`, until its next
+    recheck takes up Python's entry (see "Sync");
+    likewise, an original whose `_sources` entry Python overwrote stays
+    alive in the memo until then or the walker's release, where the
+    Python walk lets go of it;
   - Python wrote or removed an entry of `_sources` at an id where the
     walker holds an original it has yet to write (one whose copy the walk
     replaced in place included), or owes one: the walker's original goes
@@ -616,9 +720,11 @@ Each of these is a difference from the Python walk that remains by design.
     its own key, and the walker takes it up; a key there equal to the id
     but not an int (a float, say) thus stays where the Python walk keeps
     the int it wrote first, and then retires the context;
-  - Python removed or overwrote an entry of `objects` that the walk has
-    since replaced in place (a depth placeholder captured later as a
-    root): the walker's replacement goes in over it, or back in;
+  - Python removed or overwrote an entry of `objects`, which the walker
+    had written, that the walk has since replaced in place (a depth
+    placeholder captured later as a root): the walker's replacement goes
+    in over it, or back in (a placeholder replaced before the walker
+    wrote it is a new entry, and Python's stays, as in the Python walk);
   - `objects.clear()` lets go of the copies the walker wrote, as in the
     Python walk, but the walker's next write puts those it had yet to
     write into the emptied dict, and it keeps returning them, where the
@@ -630,8 +736,10 @@ Each of these is a difference from the Python walk that remains by design.
     by key in `_sources`), as when Python removes that entry and puts its
     own back, or removes an earlier entry, adds one, then removes the
     walker's last entry and puts it back after its addition. The walker
-    may then return a removed copy, count nodes differently, or keep a
-    removed original alive until a rebuild or its release; a key not of a
+    may then return a removed copy, count nodes differently, keep a
+    removed original alive until a rebuild or its release, or copy afresh
+    an original whose id Python gave an entry of its own in the same
+    change and write that copy over Python's entry; a key not of a
     plain kind let in that way it never reads, so the context stays on
     the walker, and the key's comparison may run (below).
 - A key of either dict not of a plain kind (an int subclass, a frozenset)
@@ -647,11 +755,33 @@ Each of these is a difference from the Python walk that remains by design.
   is not an id (anything but an exact int in address range, such as a str
   or a float equal to an id), or a key in `_sources` not of a plain kind,
   retires the context once the walker, having read it, has written what
-  it holds.
-- A depth placeholder Python code writes into `objects` without a
-  `reason` makes the walker's next sync, in eager mode or after a
-  hand-back, raise `AttributeError`; the Python walk raises only when
-  `_mapping` meets it.
+  it holds. One that a write between calls (a copy's, say) found retires
+  it at the next call, unless Python removed it before then and that
+  call notices the removal, which leaves the context on the walker.
+- An element of `_namespaces` that hashes like the id of a dict a call
+  captures runs its `__eq__` when the walker looks that id up, and again
+  in the Python walk when the walker hands the call back after it. A key
+  other than a str planted in a class dict of `DumpOptions` (through
+  `gc.get_referents`: `setattr` adds only str keys) that hashes like a
+  budget's name runs its `__eq__` at each call, as the walker looks every
+  budget's name up along the class's MRO, where the Python walk reads a
+  budget only when the call uses it, through CPython's attribute cache.
+- A chain of finalizers of depth placeholders, each writing a new
+  placeholder over a noted one as a recheck lets go of it, is followed for
+  as many rechecks per sync as the recursion limit, and then at each later
+  sync, where the Python walk, which runs such a chain nested, stops it at
+  the recursion limit (the `RecursionError` a finalizer raises is ignored),
+  except on 3.12, where CPython's trashcan frees the chain's placeholders
+  one after another: there it follows the chain to its end, and never
+  returns from an endless one.
+- A placeholder a recheck lets go of, as above, stays let go of: one whose
+  `reason` application code changed to another, or whose class it changed
+  to one not derived from `TruncatedValue`. If the code changes it back,
+  or that class answers `__class__` with `TruncatedValue`, which the
+  Python walk's `isinstance` reads, the walker does not notice when the
+  Python walk replaces it in place, and keeps returning the placeholder,
+  where the Python walk returns the replacement; nor does it note a
+  placeholder of such a class that it finds in `objects`.
 - Replacing `_sources` releases the originals only it held at the next
   call, not at once: a finalizer of one runs inside that call, where
   capturing through the context raises `RuntimeError`, and its id is not
@@ -681,13 +811,17 @@ Each of these is a difference from the Python walk that remains by design.
     before that write lacks them, as it lacks the walker's unwritten
     copies; a new object may then take one's id and get its copy;
   - the cycle takes a second collection to free when another object of it
-    holds `objects` or `_sources` or keeps the walker's weak reference
-    (from `weakref.getweakrefs`) reachable, or when a finalizer of the
-    cycle makes the walker write: one that captures through the context
-    after the walker's finalizer ran, or one that, before or after it,
-    copies or pickles the context or calls it so that the call is handed
-    back. The walker then writes into an untracked dict, which keeps what
-    it holds alive until the next collection. Why not write only into
+    holds `_sources`, or holds `objects` while a copy the walker writes
+    there refers back into the cycle (only a captured `TruncatedValue`,
+    which is its own copy, can); when something outside the cycle holds
+    the walker's weak reference to the context (from
+    `weakref.getweakrefs`), so the collector runs its callback and the
+    walker takes the context for freed; or when a finalizer of the cycle
+    makes the walker write: one that captures through the context after
+    the walker's finalizer ran, or one that, before or after it, copies or
+    pickles the context or calls it so that the call is handed back. The
+    walker then writes into an untracked dict, which keeps what it holds
+    alive until the next collection. Why not write only into
     dicts something outside the cycle holds: the copy or pickle that
     finalizer makes would then lack the walker's copies.
 
@@ -718,13 +852,18 @@ Each of these is a difference from the Python walk that remains by design.
   nested C calls the Python walk does not (the descriptor call, reading
   `_walker`, the sync's reads, and on a hand-back its write), and the
   hand-back runs the Python walk beneath them, which may capture part of
-  the value before it raises. Measured shifts: in `list(map(...))`
-  recursion under a raised limit, about one level on 3.12 and 3.13 and two
-  to five from 3.14 (for `save_dumping`, one on 3.14 and none elsewhere);
-  in nested `repr` at the default limit, two levels on 3.12 and 3.13 and
-  sixteen to twenty-five from 3.14 (for `save_dumping`, none on 3.12 and
-  3.13 and three to six from 3.14); in a thread with a 512 KiB stack, up to
-  four levels from 3.14. Nothing short of a Python descriptor avoids this.
+  the value before it raises. Measured shifts, which depend on the value
+  and the stack's layout: in `list(map(...))` recursion under a raised
+  limit, about one level on 3.12 and 3.13 and two to five from 3.14 (for
+  `save_dumping`, one on 3.14 and none elsewhere); in nested `repr` or
+  `==` at the default limit, two or three levels on 3.12 and 3.13, about
+  twenty on 3.14 and about ten on 3.15 (for `save_dumping`, none on 3.12
+  and 3.13 and three to six from 3.14); in a thread with a 512 KiB stack,
+  up to four levels from 3.14. Nothing short of a Python descriptor avoids
+  this. On 3.12 and 3.13 the limit can also move the other way: a call the
+  walker completes itself on a value holding a dict can return one or two
+  levels deeper than the Python walk, whose `_mapping` resumes generators
+  (`dict.fromkeys`, `itertools.islice`) that CPython counts as C levels.
 - Copies made outside the context class's own protocol (through `copyreg`, a
   pickler's `reducer_override` or `dispatch_table`, the `copy` module's
   dispatch tables, or a by-hand copy of the instance dict) read the instance
@@ -754,6 +893,14 @@ Each of these is a difference from the Python walk that remains by design.
   the next call: it reads each type's facts once per call, where the
   Python walk rereads them, apart from the layouts both cache per context,
   for every value.
+- Code that runs inside a native call (as above, or a finalizer of a dict
+  Python replaced, which the walker lets go of at the next call's sync, or
+  of a placeholder a recheck lets go of) and replaces `objects` or
+  `_sources` is seen by the walker from the next call: it captures the rest
+  of the call against the dicts it read and writes the call's copies there,
+  where the Python walk puts the copies it makes afterwards into the new
+  dicts. A later call then captures those values afresh and counts their
+  nodes again.
 - Under a profiler, tracer or `sys.monitoring` tool, a call that needs
   Python code runs in the Python walk; one that does not stays native, and
   the hook sees none of it, as with any C accelerator. `_all_events` is
@@ -780,16 +927,31 @@ Each of these is a difference from the Python walk that remains by design.
 - `_walker` is the walker's own attribute, set with `object.__setattr__`: a
   class attribute of that name, such as a property, is unsupported; a slot
   of that name makes the context capture in Python.
-- The walker's table is built when `values` is imported: patching its
-  globals afterwards (`FakeClass`, `TruncatedValue`, `DumpOptions`,
-  `_headroom`) is not seen by any walker, and the walker never calls
-  `_plain_key`. A call the walker hands back runs in the Python walk,
-  which sees them, so one context can show a patch in some calls and not
-  in others (under a tracer, an `OrderedDict` is handed back). Patching
-  the context's walk methods is seen. To patch the
-  module's helpers, set `PYDUMPLING_NATIVE=0`. Methods patched onto
-  `collections.Counter`, such as `__missing__`, are not run by the walker's
-  own counts, which write the tally dict directly.
+- The walker's table is built when `values` is imported: patching its globals
+  afterwards (`FakeClass`, `TruncatedValue`, `DumpOptions`, `_headroom`) is not
+  seen by any walker, and the walker never calls `_plain_key`. A call the
+  walker hands back runs in the Python walk, which sees them, so one context
+  can show a patch in some calls and not in others (under a tracer, an
+  `OrderedDict` is handed back). Patching the context's walk methods is seen.
+  To patch the module's helpers, set `PYDUMPLING_NATIVE=0`. Methods patched
+  onto `collections.Counter`, such as `__missing__`, are not run by the
+  walker's own counts, which write the tally dict directly. Hooks patched onto
+  the copy classes (`TruncatedValue`, `FakeClass`, and `FakeDict`, `FakeList`,
+  `FakeTuple`, `FakeSet`, `FakeFrozenSet`, `FakeStr`, `FakeBytes`, `FakeInt`,
+  `FakeFloat`: `__new__`, `__init__`, `__setattr__`, `__getattribute__`, a
+  `__dict__` descriptor, another `_type_key`) do not run, nor are seen, when
+  the walker builds a copy, with the builtin base's `__new__`
+  (`object.__new__`, `dict.__new__`, ...), the instance-dict descriptor and the
+  `_type_key` the class had at import. The Python walk calls the class, which
+  runs `__new__` and `__init__`, sets a placeholder's fields through
+  `__setattr__`, and reads a copy's `__dict__`, a list or set copy's `append`
+  or `add`, through its `__getattribute__` (a `FakeClass`'s once, and twice
+  more for an object with an instance dict); so those hooks run there alone,
+  and a planted `__dict__` descriptor sends the copy's attributes where it
+  points. Hooks that read a captured `FakeClass` (its `__repr__`, a
+  `__getattribute__`) or the options (a `__getattribute__` or property on
+  `DumpOptions`) do run as in the Python walk: the walker hands such a call
+  back, or retires the context.
 - Introspection of the entry points: once the extension is imported,
   `SnapshotContext.value` and `_mapping` are `Dispatch` descriptors for
   every context, whatever `PYDUMPLING_NATIVE` says when it is created, so
@@ -806,14 +968,11 @@ Each of these is a difference from the Python walk that remains by design.
 - From a stack deeper than `min((limit - 97) / 2, 1024)` frames, counting
   the calling frame (451 at the default limit of 1000), each call the
   walker starts raises one `sys._getframe` audit event, from the start
-  check; a call handed back before it starts (a keyword argument, a
+  check; a call handed back before it starts (the value by keyword, a
   non-int depth) raises none, nor does the Python walk.
 - If an audit hook refuses `sys._getframe` when `values` is imported,
   frame namespaces (`FrameLocalsProxy`, 3.13+) capture in the Python walk
   for the life of the process (see "The transaction").
-- With a colliding instance-dict key, the Python walk's own hook count can
-  change over its first runs as `LOAD_ATTR` specializes; after a few
-  warm-up runs the counts match.
 - A str-subclass keyword *name* in `**kwargs` has its `__hash__` run
   before the walker hands the call back, where the Python walk runs none:
   once while PyO3 collects `**kwargs`, and through a native context's
@@ -872,24 +1031,49 @@ at which the pickles differ and the reproducing command. Outcomes that do
 not pickle compare by type and parts; `test_parity_check_detects_differences`
 checks that the comparison itself catches perturbations.
 
-Beyond the random cases, each design decision above has a targeted
-regression test: hand-back points with hook counts equal to the Python
-walk's, class and state changes between calls, copies and pickles, hooks
-and signals, re-entry, recursion and small thread stacks (in child
-processes), dict changes between calls, no import during a call or a
-release, and the release paths per CPython version (fresh classes, since
-the release order depends on a class's first instance; cycles collected
-where no Python frame fits; a builtin in place of `_Walker.__del__` to
-check that nothing writes when the finalizer does not). Each accepted
-difference above has a test that pins it in both walks, so that changing
-either walk's behaviour fails it; those no other test covers are in
-`tests/test_native_differences.py`. Each rule is meant to fail a test when
-it is reverted, on the versions it applies to; recheck that when changing
-a test, since a test can stop guarding its rule without failing (a later
-helper of the same name in its module can shadow the one it uses). A
-context let go guards the traversal of owed originals, a rule a revert
-does not make fail outright: it fails only if the walker hides them from
-the collector.
+Beyond the random cases, each design decision above has a targeted regression
+test: hand-back points with hook counts equal to the Python walk's, class and
+state changes between calls, copies and pickles, hooks and signals, re-entry,
+recursion and small thread stacks (in child processes), dict changes between
+calls, no import during a call or a release, and the release paths per CPython
+version (fresh classes, since the release order depends on a class's first
+instance; cycles collected where no Python frame fits; a builtin in place of
+`_Walker.__del__` to check that nothing writes when the finalizer does not).
+Accepted differences are pinned in both walks, so that changing either walk's
+behaviour fails a test; those no other test covers are in
+`tests/test_native_differences.py`. Three are not pinned in full: of the
+"Before 3.14 only" consequences, only the owed writes and the second collection
+that a weak reference to the context kept elsewhere needs (the tests of the
+lost copies run from 3.14, where nothing is lost); of the C recursion limit,
+only the direction of the shifts (both directions on 3.12 and 3.13), as their
+size depends on the value and the stack's layout; and the spent C stack,
+reached only on some versions and layouts (below). A context's instance dict
+with a colliding key retires the context, and no test counts the Python walk's
+hooks there: its own `__eq__` count changes over its first runs as `LOAD_ATTR`
+specializes.
+
+A mutation run on 3.13 checks that the rules fail a test when reverted: 191
+mutants of `mirror.rs`, `flush.rs`, `release.rs`, `transaction.rs`,
+`State::remember`, the builds of `TruncatedValue` and `FakeClass` copies,
+the plain reads of a placeholder's `reason` and the subclass check in
+`types.rs`, and the `_mapping` memo hit on one (a negated or dropped
+condition, a changed comparison, a skipped or moved statement or call). 177
+fail a test. Of the 14 that pass, ten change nothing observable: each
+changes a check another one already implies, repeats a flush, rebuild or
+adoption that finds nothing new, keeps state that is reset before it is
+read, takes in a list equal to the one it has, or notes an entry that is no
+placeholder, which the next recheck lets go of. Three differ only after a
+failure no test provokes: a placeholder build that overflows the C stack,
+or a sync or write cut short. Failures of that kind can be provoked on
+purpose (a key an unnoticed removal let in that raises from `__eq__`, the C
+recursion limit beneath nested comparisons), and tests provoke them where a
+rule of the recheck depends on them. The last, arming the owner reference
+from 3.14 too, fails nine tests on 3.14 and 3.15. A test can stop guarding
+its rule without failing (a later helper of the same name in its module can
+shadow the one it uses), so rerun the mutants a changed test covers. A
+context let go guards the traversal of owed originals, a rule a revert does
+not make fail outright: it fails only if the walker hides them from the
+collector.
 
 The collection tests are order-independent: the `DEBUG_SAVEALL` case
 collects first and finds its context in `gc.garbage` by id, and the test of
@@ -1007,8 +1191,8 @@ with `-Cprofile-use=FILE`.
   differences. Moving to a single Python-side memo, written through, would
   remove much of it (an estimated 400-500 lines of Rust). A review
   measured the cost with eager mode as a proxy (CPython 3.13, one machine,
-  median of 3 rounds): the capture speed-up against the original walk
-  falls from 7.05x to 4.25x as a sum and from 3.50x to 2.78x as a
+  median of 3 rounds): the capture speed-up against the current Python
+  walk falls from 7.05x to 4.25x as a sum and from 3.50x to 2.78x as a
   geometric mean, and the peak RSS of `b2_heavy_nolimits` rises from 65.5
   to 79.2 MB, above the Python walk's 72.2 MB. Removing the release and
   finalizer writes while keeping the lazy memo would bring back lost
@@ -1018,5 +1202,8 @@ with `-Cprofile-use=FILE`.
   written into dicts the collector does not track, which would keep the
   cycle alive until a later collection. Dropping them would remove about
   150-200 lines and the "Before 3.14 only" differences, at the cost of
-  such cycles being freed a collection later; that cost has not been
-  measured.
+  such cycles being freed a collection later. A review measured that cost
+  on 3.13 for 300 such contexts of 200 items each: the first collection
+  took about 73 ms instead of about 15 ms, and about 17 MB stayed until
+  the second; 9 cases of 6 collected-cycle tests on 3.12 and 3.13 would
+  change. Not reproduced here.

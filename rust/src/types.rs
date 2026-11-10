@@ -9,10 +9,11 @@
 
 use std::sync::Arc;
 
+use pyo3::exceptions::{PyKeyError, PyTypeError};
 use pyo3::gc::PyVisit;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyDict, PyString, PyTuple, PyType};
 use pyo3::PyTraverseError;
 
 use crate::statics::{address, type_address, Statics};
@@ -163,20 +164,199 @@ impl TypeInfo {
     }
 }
 
-impl Layout {
-    /// Converts `(members, fields)` from `ValuesMixin._layout`.
-    pub(crate) fn from_python(py: Python<'_>, pair: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let mut members = Vec::new();
-        for member in pair.get_item(0)?.try_iter()? {
-            let member = member?;
-            let getter = member.get_item(1)?.getattr(intern!(py, "__get__"))?;
-            members.push((member.get_item(0)?.unbind(), getter.unbind()));
+/// Bound `__get__` of the instance-dict descriptor of `cls`, a copy class:
+/// the first `__dict__` along its MRO, read at import, before application
+/// code could give the class another.
+pub(crate) fn dict_getter<'py>(cls: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let py = cls.py();
+    for base in cls.getattr(intern!(py, "__mro__"))?.try_iter()? {
+        let namespace = base?.getattr(intern!(py, "__dict__"))?;
+        let descriptor = namespace.call_method1(intern!(py, "get"), (intern!(py, "__dict__"),))?;
+        if !descriptor.is_none() {
+            return descriptor.getattr(intern!(py, "__get__"));
         }
-        let fields = pair
-            .get_item(1)?
-            .try_iter()?
-            .map(|field| field.map(Bound::unbind))
-            .collect::<PyResult<_>>()?;
-        Ok(Self { members, fields })
     }
+    Err(PyTypeError::new_err("a copy class has no instance dict"))
+}
+
+/// The instance dict of `made`, a copy the walker built, through `getter`,
+/// from [`dict_getter`]: the descriptor its class had at import, with no
+/// hook application code gave the class since.
+pub(crate) fn fresh_dict<'py>(
+    getter: &Py<PyAny>,
+    made: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    Ok(getter
+        .bind(made.py())
+        .call1((made,))?
+        .cast_into::<PyDict>()?)
+}
+
+/// Whether reading the attribute `name` of an instance of `ty` looks first
+/// in the instance dict, and runs no code while it finds it there: every key
+/// of a class dict along the MRO is an exact str, and no class holds `name`
+/// or a `__getattribute__` but `object`'s. (A `__getattr__` runs only for a
+/// name the instance dict lacks.)
+pub(crate) fn reads_plainly(
+    py: Python<'_>,
+    s: &Statics,
+    ty: &Bound<'_, PyAny>,
+    name: &Bound<'_, PyString>,
+) -> PyResult<bool> {
+    let mro = s.class_mro.bind(py).call1((ty, ty.get_type()))?;
+    for cls in mro.try_iter()? {
+        let cls = cls?;
+        // Iterating a class dict yields its keys and runs nothing else.
+        let namespace = s.class_dict.bind(py).call1((&cls, cls.get_type()))?;
+        for key in namespace.try_iter()? {
+            if type_address(&key?) != s.str_ {
+                return Ok(false);
+            }
+        }
+        // An entry of any value, `None` too, is the class's own.
+        let object = s.object_getattribute.bind(py);
+        let getattribute = namespace.call_method1(
+            intern!(py, "get"),
+            (intern!(py, "__getattribute__"), object),
+        )?;
+        if !getattribute.is(object) || namespace.contains(name)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `value` is a `TruncatedValue`, of a subclass too, as the Python
+/// walk's `isinstance` finds from its type: the class's metaclass is `type`,
+/// which no code can change, so the check reads the MRO and runs nothing.
+pub(crate) fn placeholder_like(
+    py: Python<'_>,
+    s: &Statics,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    Ok(type_address(value) == s.truncated_type
+        || value.get_type().is_subclass(s.truncated.bind(py))?)
+}
+
+/// The `reason` a `TruncatedValue`'s instance dict holds, if it is an exact
+/// str in a dict of exact str keys, read through the descriptor the class
+/// had at import, as attribute lookup reads it: reading it so runs no code
+/// and compares only strs. `None` for any other.
+pub(crate) fn plain_reason<'py>(
+    py: Python<'py>,
+    s: &Statics,
+    placeholder: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let attributes = s.truncated_dict.bind(py).call1((placeholder,))?;
+    // A dict, or a dict subclass assigned as `__dict__`, which attribute
+    // lookup reads as a dict too.
+    let attributes = attributes.cast_into::<PyDict>()?;
+    if !s.str_keys(&attributes) {
+        return Ok(None);
+    }
+    let reason = attributes.get_item(intern!(py, "reason"))?;
+    Ok(reason.filter(|reason| type_address(reason) == s.str_))
+}
+
+/// One of pydumpling's classes as it was at import: the classes of its
+/// MRO, which assigning `__bases__` changes, and their dicts but `object`'s,
+/// read through `type.__dict__`. They held only exact str keys then, and
+/// `setattr` adds any name as one, so while the MRO holds the same classes,
+/// looking a name up there runs no code.
+pub(crate) struct OwnClass {
+    cls: Py<PyAny>,
+    mro: Vec<Py<PyAny>>,
+    namespaces: Vec<Py<PyAny>>,
+}
+
+impl OwnClass {
+    /// Reads `cls` through `class_mro` and `class_dict`, the bound `__get__`
+    /// of `type.__dict__["__mro__"]` and `["__dict__"]`.
+    pub(crate) fn new(
+        cls: &Bound<'_, PyAny>,
+        class_mro: &Bound<'_, PyAny>,
+        class_dict: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let py = cls.py();
+        let mro = class_mro
+            .call1((cls, cls.get_type()))?
+            .cast_into::<PyTuple>()?;
+        let mut namespaces = Vec::new();
+        for base in &mro {
+            if base.is(py.get_type::<PyAny>()) {
+                continue;
+            }
+            let namespace = class_dict.call1((&base, base.get_type()))?;
+            for key in namespace.try_iter()? {
+                if !key?.is_exact_instance_of::<PyString>() {
+                    return Err(PyTypeError::new_err("a class dict key is not a str"));
+                }
+            }
+            namespaces.push(namespace.unbind());
+        }
+        let (cls, mro) = (
+            cls.clone().unbind(),
+            mro.iter().map(Bound::unbind).collect(),
+        );
+        Ok(Self {
+            cls,
+            mro,
+            namespaces,
+        })
+    }
+
+    /// Whether the class's MRO holds the classes it held at import.
+    pub(crate) fn kept(&self, py: Python<'_>, s: &Statics) -> PyResult<bool> {
+        let cls = self.cls.bind(py);
+        let mro = s.class_mro.bind(py).call1((cls, cls.get_type()))?;
+        let mro = mro.cast_into::<PyTuple>().map_err(PyErr::from)?;
+        Ok(mro.len() == self.mro.len()
+            && mro
+                .iter()
+                .zip(&self.mro)
+                .all(|(now, then)| now.is(then.bind(py))))
+    }
+
+    /// What attribute access on an instance finds for each of `names` in
+    /// the class dicts but `object`'s, `None` where none holds it, if the
+    /// class keeps its MRO and none holds a `__getattribute__`: reading
+    /// the instance dict or that entry then runs no hook.
+    pub(crate) fn entries<'py, const N: usize>(
+        &self,
+        py: Python<'py>,
+        s: &Statics,
+        names: [&Bound<'py, PyString>; N],
+    ) -> PyResult<Option<[Option<Bound<'py, PyAny>>; N]>> {
+        if !self.kept(py, s)? {
+            return Ok(None);
+        }
+        let mut found = std::array::from_fn(|_| None);
+        for namespace in &self.namespaces {
+            let namespace = namespace.bind(py);
+            if namespace.contains(intern!(py, "__getattribute__"))? {
+                return Ok(None);
+            }
+            for (name, entry) in names.iter().zip(found.iter_mut()) {
+                if entry.is_none() {
+                    // One lookup where the name is, as the caller expects.
+                    *entry = match namespace.get_item(*name) {
+                        Ok(held) => Some(held),
+                        Err(err) if err.is_instance_of::<PyKeyError>(py) => None,
+                        Err(err) => return Err(err),
+                    };
+                }
+            }
+        }
+        Ok(Some(found))
+    }
+}
+
+/// Whether `FakeClass.__repr__`, as the Python walk calls it on a copied
+/// `FakeClass`, is the function the class had at import, and reading the
+/// instance's `__dict__` there runs no hook.
+pub(crate) fn plain_fake_class_repr(py: Python<'_>, s: &Statics) -> PyResult<bool> {
+    let Some([Some(repr)]) = s.fake_class_own.entries(py, s, [intern!(py, "__repr__")])? else {
+        return Ok(false);
+    };
+    Ok(repr.is(s.fake_class_repr.bind(py)))
 }

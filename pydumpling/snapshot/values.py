@@ -265,9 +265,16 @@ class ValuesMixin:
         overrides a walk method, attribute access, a state attribute or a
         copy hook, it hands the context to the Python walk for good.  Nothing here reads
         the context through its class's hooks, which the Python walk would
-        not run.
+        not run.  Under ``python -b`` the Python walk captures: comparing
+        bytes with str warns there, and the walker's own dict and set
+        lookups and inserts, which a call it hands back makes the Python
+        walk repeat, would warn where it does not, or twice.
         """
-        if _native is None or os.environ.get("PYDUMPLING_NATIVE") == "0":
+        if (
+            _native is None
+            or os.environ.get("PYDUMPLING_NATIVE") == "0"
+            or sys.flags.bytes_warning
+        ):
             return
         stock = object.__getattribute__(self, "_stock_walk")
         if stock is not None:

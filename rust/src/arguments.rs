@@ -4,7 +4,7 @@
 //! Python walk as it was made, so Python raises or converts as it would.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyFrozenSet, PyList, PySet, PyString, PyTuple};
+use pyo3::types::PyString;
 
 use crate::statics::{type_address, Statics};
 use crate::walker::Call;
@@ -63,12 +63,12 @@ pub(crate) fn parse<'py>(s: &Statics, call: &Call<'_, 'py>) -> PyResult<Option<P
                     Some(value) => depth = Some(value),
                     None => return Ok(None),
                 },
-                ("priority", true) if plain_keys(s, &item)? => priority = Some(item),
+                ("priority", true) if str_items(s, &item)? => priority = Some(item),
                 ("counted", true) if item.is(s.true_.bind(item.py())) => counted = true,
                 ("counted", true) if item.is(s.false_.bind(item.py())) => counted = false,
                 ("container", true)
                     if item.is(s.dict_cls.bind(item.py()))
-                        || item.is(s.fake_dict.bind(item.py())) =>
+                        || item.is(s.fake_dict.cls.bind(item.py())) =>
                 {
                     container = Some(item)
                 }
@@ -102,28 +102,21 @@ fn exact_depth(s: &Statics, value: &Bound<'_, PyAny>) -> Option<i64> {
     value
         .extract::<i64>()
         .ok()
-        .filter(|depth| depth.abs() <= DEPTH_LIMIT)
+        .filter(|depth| depth.unsigned_abs() <= DEPTH_LIMIT.unsigned_abs())
 }
 
-/// Whether `priority` is an exact tuple, list, set, or frozenset of keys
-/// whose hashing and comparison run only builtin code.
-fn plain_keys(s: &Statics, priority: &Bound<'_, PyAny>) -> PyResult<bool> {
-    let ty = type_address(priority);
-    if ty == s.tuple {
-        let items = priority.cast::<PyTuple>().map_err(PyErr::from)?;
-        return Ok(items.iter().all(|key| s.plain_key(&key)));
+/// Whether `priority` is an exact tuple, list, set, or frozenset of exact
+/// str names, which the str keys of a mapping are compared with, running
+/// only builtin code.
+fn str_items(s: &Statics, priority: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if ![s.tuple, s.list, s.set, s.frozenset].contains(&type_address(priority)) {
+        return Ok(false);
     }
-    if ty == s.list {
-        let items = priority.cast::<PyList>().map_err(PyErr::from)?;
-        return Ok(items.iter().all(|key| s.plain_key(&key)));
+    // Iterating an exact builtin container runs no code.
+    for item in priority.try_iter()? {
+        if type_address(&item?) != s.str_ {
+            return Ok(false);
+        }
     }
-    if ty == s.set {
-        let items = priority.cast::<PySet>().map_err(PyErr::from)?;
-        return Ok(items.iter().all(|key| s.plain_key(&key)));
-    }
-    if ty == s.frozenset {
-        let items = priority.cast::<PyFrozenSet>().map_err(PyErr::from)?;
-        return Ok(items.iter().all(|key| s.plain_key(&key)));
-    }
-    Ok(false)
+    Ok(true)
 }

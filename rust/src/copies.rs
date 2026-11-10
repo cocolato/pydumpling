@@ -8,8 +8,8 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use crate::statics::type_address;
-use crate::types::{Layout, Scalar};
+use crate::statics::{type_address, Statics};
+use crate::types::{dict_getter, fresh_dict, Base, Layout, Scalar};
 use crate::walk::{unless_exception, update};
 use crate::walker::{Halt, State, Walk};
 
@@ -85,9 +85,9 @@ impl State {
                 }
             }
         };
-        let copy = s.scalar_copy(py, scalar).call1((plain,))?;
-        let captured = self.remember(value, copy);
-        self.fill_copy(py, value, &captured, depth)?;
+        let class = s.scalar_copy(scalar);
+        let captured = self.remember(value, class.make(py, Some(&plain))?);
+        self.fill_copy(py, value, &captured, class, depth)?;
         Ok(captured)
     }
 
@@ -97,10 +97,11 @@ impl State {
         py: Python<'py>,
         value: &Bound<'py, PyAny>,
         copy: &Bound<'py, PyAny>,
+        class: &CopyClass,
         depth: i64,
     ) -> Walk<()> {
         self.enter(py)?;
-        let filled = self.fill_copy_body(py, value, copy, depth);
+        let filled = self.fill_copy_body(py, value, copy, class, depth);
         self.leave();
         filled
     }
@@ -110,21 +111,20 @@ impl State {
         py: Python<'py>,
         value: &Bound<'py, PyAny>,
         copy: &Bound<'py, PyAny>,
+        class: &CopyClass,
         depth: i64,
     ) -> Walk<()> {
-        let namespace = copy.getattr(intern!(py, "__dict__"))?;
-        let namespace = namespace.cast::<PyDict>().map_err(PyErr::from)?;
+        let namespace = &class.namespace(copy)?;
         let cls = value.get_type();
-        let copy_type = copy.get_type();
-        let own = cls.is(&copy_type);
-        let key = copy_type.getattr(intern!(py, "_type_key"))?;
+        let own = cls.is(class.cls.bind(py));
+        let key = class.key.bind(py).clone();
         let attrs = match self.attributes(py, value)? {
             Some(attrs) if !attrs.is_empty() => attrs,
             _ => PyDict::new(py),
         };
         let type_name = if own {
             // The lookup compares the name with every key of its hash.
-            if !self.s.plain_dict(&attrs) {
+            if !self.s.str_keys(&attrs) {
                 return Err(Halt::Bail);
             }
             attrs
@@ -194,5 +194,112 @@ impl State {
             }
         }
         Ok(false)
+    }
+}
+
+/// A snapshot copy class (`FakeDict`, `FakeStr`, ...) as at import: the
+/// walker builds its instances with the builtin base's `__new__`, as calling
+/// the class does while it holds no hook of its own, and reads their
+/// instance dict through the descriptor and their type name under the
+/// `_type_key` the class had then, so no hook application code gave the
+/// class since runs (the Python walk runs them).
+pub(crate) struct CopyClass {
+    pub cls: Py<PyAny>,
+    new: Py<PyAny>,
+    dict: Py<PyAny>,
+    key: Py<PyAny>,
+}
+
+impl CopyClass {
+    pub(crate) fn new(cls: Bound<'_, PyAny>, base: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let py = cls.py();
+        Ok(Self {
+            new: base.getattr(intern!(py, "__new__"))?.unbind(),
+            dict: dict_getter(&cls)?.unbind(),
+            key: cls.getattr(intern!(py, "_type_key"))?.unbind(),
+            cls: cls.unbind(),
+        })
+    }
+
+    /// `cls()`, or `cls(arg)`.
+    pub(crate) fn make<'py>(
+        &self,
+        py: Python<'py>,
+        arg: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (new, cls) = (self.new.bind(py), self.cls.bind(py));
+        match arg {
+            Some(arg) => new.call1((cls, arg)),
+            None => new.call1((cls,)),
+        }
+    }
+
+    /// `copy.__dict__`.
+    fn namespace<'py>(&self, copy: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
+        fresh_dict(&self.dict, copy)
+    }
+}
+
+impl Statics {
+    /// The copy type for exact instances of `base` and the snapshot subclass
+    /// for instances of its subclasses; every frozendict copy is a FakeDict.
+    pub(crate) fn copy_types<'py>(
+        &self,
+        py: Python<'py>,
+        base: Base,
+    ) -> (Bound<'py, PyAny>, &CopyClass) {
+        let snapshot = match base {
+            Base::Dict | Base::FrozenDict => &self.fake_dict,
+            Base::List => &self.fake_list,
+            Base::Tuple => &self.fake_tuple,
+            Base::Set => &self.fake_set,
+            Base::FrozenSet => &self.fake_frozen_set,
+        };
+        let plain = match base {
+            Base::FrozenDict => snapshot.cls.bind(py).clone(),
+            _ => self.base_cls(py, base),
+        };
+        (plain, snapshot)
+    }
+
+    /// The snapshot subclass for instances of a scalar subclass.
+    pub(crate) fn scalar_copy(&self, scalar: Scalar) -> &CopyClass {
+        match scalar {
+            Scalar::Str => &self.fake_str,
+            Scalar::Bytes => &self.fake_bytes,
+            Scalar::Int => &self.fake_int,
+            Scalar::Float => &self.fake_float,
+        }
+    }
+
+    /// `container()` for `container`, `dict` or `FakeDict`.
+    pub(crate) fn empty_mapping<'py>(
+        &self,
+        py: Python<'py>,
+        container: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if container.is(self.fake_dict.cls.bind(py)) {
+            self.fake_dict.make(py, None)
+        } else {
+            container.call0()
+        }
+    }
+}
+
+impl Layout {
+    /// Converts `(members, fields)` from `ValuesMixin._layout`.
+    pub(crate) fn from_python(py: Python<'_>, pair: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let mut members = Vec::new();
+        for member in pair.get_item(0)?.try_iter()? {
+            let member = member?;
+            let getter = member.get_item(1)?.getattr(intern!(py, "__get__"))?;
+            members.push((member.get_item(0)?.unbind(), getter.unbind()));
+        }
+        let fields = pair
+            .get_item(1)?
+            .try_iter()?
+            .map(|field| field.map(Bound::unbind))
+            .collect::<PyResult<_>>()?;
+        Ok(Self { members, fields })
     }
 }

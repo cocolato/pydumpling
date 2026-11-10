@@ -13,7 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple, PyType};
 
 use crate::statics::{address, type_address};
-use crate::types::{Base, Kind, TypeInfo};
+use crate::types::{fresh_dict, plain_fake_class_repr, Base, Kind, TypeInfo};
 use crate::walker::{Entry, Halt, Slot, State, Walk};
 
 /// Applies an `except Exception:` clause: `Ok(None)` for an `Exception`.
@@ -174,19 +174,23 @@ impl State {
         let exact = type_address(value) == address(&s.base_cls(py, base));
         // A subclass keeps its entries in a snapshot subclass of its base,
         // with its type name and attributes alongside.
-        let target = if exact { plain } else { snapshot.clone() };
-        let filled = target.is(&snapshot);
+        let target = if exact {
+            plain
+        } else {
+            snapshot.cls.bind(py).clone()
+        };
+        let filled = target.is(snapshot.cls.bind(py));
         if matches!(base, Base::Dict | Base::FrozenDict) {
             let captured = self.mapping(py, value, depth, None, true, &target)?;
             if filled {
-                self.fill_copy(py, value, &captured, depth)?;
+                self.fill_copy(py, value, &captured, snapshot, depth)?;
             }
             return Ok(captured);
         }
         let sequence = matches!(base, Base::List | Base::Tuple);
         let mutable = matches!(base, Base::List | Base::Set);
         let captured = match (mutable && !exact, sequence) {
-            (true, _) => target.call0()?,
+            (true, _) => snapshot.make(py, None)?,
             (false, true) => PyList::empty(py).into_any(),
             (false, false) => PySet::empty(py)?.into_any(),
         };
@@ -243,12 +247,15 @@ impl State {
         }
         let captured = if mutable {
             captured
+        } else if filled {
+            let finished = snapshot.make(py, Some(&captured))?;
+            self.remember(value, finished)
         } else {
             let finished = target.call1((captured,))?;
             self.remember(value, finished)
         };
         if filled {
-            self.fill_copy(py, value, &captured, depth)?;
+            self.fill_copy(py, value, &captured, snapshot, depth)?;
         }
         Ok(captured)
     }
@@ -296,14 +303,25 @@ impl State {
         depth: i64,
     ) -> Walk<Bound<'py, PyAny>> {
         let s = self.s;
+        // A `FakeClass` given other bases builds its copies through theirs,
+        // and before 3.15 refuses the instance-dict descriptor it had at
+        // import: checked before anything runs that the Python walk reruns.
+        if !s.fake_class_own.kept(py, s)? {
+            return Err(Halt::Bail);
+        }
         let fake_class = type_address(value) == s.fake_class_type;
         let representation = if fake_class {
-            // `FakeClass.__repr__` looks its text up in the instance dict,
-            // which runs no application code only in an exact dict of plain
-            // keys; the attribute copy below needs the same.
+            // The Python walk calls `FakeClass.__repr__` as the class has
+            // it then, which looks its text up in the instance dict: here,
+            // only the one it had at import, with no hook, in an exact dict
+            // of exact str keys, which the attribute copy below needs too.
+            // Reading the instance dict checks the class dicts' keys first.
             match self.attributes(py, value)? {
-                Some(attrs) if s.plain_dict(&attrs) => {}
+                Some(attrs) if s.str_keys(&attrs) => {}
                 _ => return Err(Halt::Bail),
+            }
+            if !plain_fake_class_repr(py, s)? {
+                return Err(Halt::Bail);
             }
             self.before_python(py)?;
             s.fake_class_repr.bind(py).call1((value,))?
@@ -312,17 +330,18 @@ impl State {
             self.snapshot_repr(py, &type_name)?
         };
         let private = intern!(py, "_FakeClass__repr");
-        // `FakeClass(representation, {})`, built as its `__init__` would.
+        // `FakeClass(representation, {})`, built as its `__init__` would,
+        // through the instance-dict descriptor the class had at import: no
+        // hook application code gave the class runs.
         let captured = s.object_new.bind(py).call1((s.fake_class.bind(py),))?;
-        let attributes = captured.getattr(intern!(py, "__dict__"))?;
-        let namespace = attributes.cast::<PyDict>().map_err(PyErr::from)?;
+        let namespace = fresh_dict(&s.fake_class_dict, &captured)?;
         namespace.set_item(private, &representation)?;
         self.remember(value, captured.clone());
         match self.attributes(py, value)? {
             Some(attrs) => {
                 let private = fake_class.then_some(private.as_any());
                 let converted = self.attribute_mapping(py, attrs.as_any(), depth + 1, private)?;
-                update(namespace, &converted)?;
+                update(&namespace, &converted)?;
                 namespace.set_item(intern!(py, "_FakeClass__repr"), &representation)?;
             }
             None => self.count(py, intern!(py, "unsupported_type"))?,
