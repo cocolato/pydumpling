@@ -331,6 +331,34 @@ def test_the_python_copy_shows_the_running_count(by, counted):
     assert attrs["_nodes"] == nodes + counted
 
 
+@pytest.mark.parametrize("by", ["itself", "its own frame"])
+def test_a_self_capture_counts_one_node_more_for_the_walker(by):
+    """The walker a native context shows when a walk captures it costs a
+    node and an ``unsupported_type`` count and takes an entry in each dict,
+    which the Python walk's context, holding no walker, does not have.  The
+    node count either copy shows is an int that costs a node of its own
+    unless the walk met that int before; here neither did."""
+    if _traced():
+        pytest.skip("a tracer hands the capture back to the Python walk")
+    counts = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_frames=1))
+        _check_walker(context, native)
+        context.value(list(range(1000, 1010)))
+        if by == "itself":
+            context.value(context)
+        else:
+            _held_by_a_frame(context)
+        counts[native] = (
+            context._nodes,
+            len(context.objects),
+            len(context._sources),
+            context._truncation["unsupported_type"],
+        )
+    assert counts[True] == tuple(count + 1 for count in counts[False])
+
+
 @pytest.mark.parametrize("by, counted", [("itself", 2), ("its own frame", 3)])
 def test_a_handed_back_self_capture_shows_no_walker(by, counted):
     previous = sys.getprofile()

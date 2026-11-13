@@ -43,8 +43,10 @@ and later), `#![forbid(unsafe_code)]`, and `stacker` for the thread's real
 stack bounds. The built extension is git-ignored, and the published wheel
 stays pure Python.
 
-The script builds with `--locked` and passes cargo a fingerprint of the
-crate's sources (`Cargo.toml`, `Cargo.lock`, `build.rs`, `src/`), which the
+The script builds with `--locked`, as CI's clippy and tests do, so a
+`Cargo.toml` changed without `Cargo.lock` fails the build until the lock is
+updated (`cargo update -p <crate>`, or any cargo command without the flag),
+and passes cargo a fingerprint of the crate's sources (`Cargo.toml`, `Cargo.lock`, `build.rs`, `src/`), which the
 extension carries as `pydumpling._native.fingerprint`. A build stays in the
 package across checkouts and edits of the crate, and one built from other
 sources still imports and captures as the crate no longer does, so
@@ -362,15 +364,17 @@ The Python walk memoizes each copy in `ctx.objects[id(original)]` and keeps
 the original alive in `ctx._sources[id(original)]`. So does the walker: it
 reads both dicts from the instance dict at the start of every call, looks a
 value up in `objects` before copying it, and writes the copy and then the
-original as the Python walk's `_remember` does, under one int object built
-once per value. An exact tuple or frozenset gets its `TruncatedValue`
+original as the Python walk's `_remember` does, each under an int object of
+its own, as that function's two `id()` calls make them: a walk that
+captures the dicts themselves copies every key as a value, and counts a
+node for each. An exact tuple or frozenset gets its `TruncatedValue`
 placeholder while it is filled and its copy afterwards, as in the Python
 walk. Whatever Python code does to the dicts between calls (adding,
 overwriting or removing entries, emptying or replacing a dict) the next
 call finds, since it reads nothing else.
 
 Why not a memo of the walker's own, written to the dicts lazily: an earlier
-version had one, which made capture about a sixth faster (see
+version had one, which made capture about a fifth faster (see
 "Performance") and cost a sync of the memo with the dicts at every call, a
 write of the pending copies before any Python code could read them (a
 hand-back, a copy, a pickle), a finalizer to write them when the context
@@ -404,8 +408,11 @@ it.
   started from; the Python walk then runs from that state.
 - After every call `objects` and `_sources` hold what the Python walk would
   leave in them, in its order: the walker makes the Python walk's lookups and
-  writes on the dicts themselves, the copy before its original as `_remember`
-  writes them, and a hand-back takes out exactly what the call put in.
+  writes on the dicts themselves, the copy before its original and each under
+  a key object of its own, as `_remember` writes them, and a hand-back takes
+  out exactly what the call put in. The one exception is a walk that captures
+  the context itself, which finds the walker there (see the accepted
+  differences).
 - The walker reads the context only after the class check, and only
   through its instance dict, `object.__getattribute__` and
   `object.__setattr__`. It holds the context, its instance dict, `objects`
@@ -517,7 +524,13 @@ Each of these is a difference from the Python walk that remains by design.
   nodes on through `value`, three through a frame namespace); captured by
   another context, the counts match. A self capture handed back to the
   Python walk, as under a profiler, shows `None` as `_walker` and is
-  otherwise as in the Python walk.
+  otherwise as in the Python walk. The capturing context spends a node and
+  an `unsupported_type` count on the walker's copy, which takes an entry in
+  each of its dicts, and a node on the count it shows unless the walk has
+  met that int already, as the Python walk does on its own, other count.
+  Under a node budget, the captures that follow such a one can therefore
+  be cut off a value sooner or later than in the Python walk. pydumpling
+  itself captures no frame that holds a context.
 - A call that passes the value or source by keyword runs in the Python
   walk: correct, without the speed-up. pydumpling passes them positionally.
 - `_walker` is the walker's own attribute, set with `object.__setattr__`: a
@@ -633,13 +646,18 @@ Beyond the random cases, each design decision above has a targeted regression
 test: hand-back points with hook counts equal to the Python walk's, a hand-back
 that starts from the dicts as the call found them, class and state changes
 between calls, copies and pickles, hooks and signals, re-entry, recursion and
-small thread stacks (in child processes), dict changes between calls, no import
-during a call, and the collection of a context that a class the walker met
-refers to. Accepted differences are pinned in both walks, so that changing
+small thread stacks (in child processes), dict changes between calls, a walk
+that captures the dicts themselves, no import during a call, and the collection
+of a context that a class the walker met refers to. Accepted differences are pinned in both walks, so that changing
 either walk's behaviour fails a test; those no other test covers are in
 `tests/test_native_differences.py`. One is not pinned in full: of the C
 recursion limit, only the direction of the shifts (both directions on 3.12 and
-3.13), as their size depends on the value and the stack's layout. A context's
+3.13), as their size depends on the value and the stack's layout. One rule has
+no test: that a hand-back takes the ids the call added out of `_namespaces`.
+The Python walk adds them again, but for the id of the dict the walker built
+for a snapshot copy's attributes, and the dict the Python walk builds in its
+place gets the freed one's address in every run tried, so the id is the same
+either way. A context's
 instance dict with a colliding key retires the context, and no test counts the
 Python walk's hooks there: its own `__eq__` count changes over its first runs as
 `LOAD_ATTR` specializes.
@@ -648,8 +666,11 @@ A mutation check on 3.13 covers the rules of the memo: no removal of a call's
 entries on a hand-back, a replaced copy not put back, the type cache hidden
 from the collector, the walker not put back after a hand-back, no placeholder
 while an immutable container fills, an out-of-nodes check that ignores the
-memo, an original not kept in `_sources`, and the node count not written.
-Each of the eight fails a test. A wider run (191 mutants) predates the removal
+memo, an original not kept in `_sources`, the node count not written, one key
+object for both dicts, and the journal of namespace ids not reset when a call
+starts. Each of the ten fails a test. Two more pass, for the rule without a
+test above: the ids a call added not taken out on a hand-back, and not
+journaled. A wider run (191 mutants) predates the removal
 of the walker's own memo, which most of it covered; the builds of copies and
 the plain reads of a placeholder's `reason` have not been mutated since. A
 test can stop guarding its rule without failing (a later helper of the same
@@ -669,7 +690,7 @@ the walker's own memo was removed.
 ## Performance
 
 Capture is about 2.9 times as fast as the Python walk, and a full
-`save_dumping` about 1.8 times (geometric means over six workloads). A
+`save_dumping` about twice (geometric means over six workloads). A
 throwaway context that captures a scalar or a short list of scalars is
 slower natively: the per-call class check and state reading cost more than
 the walk they save.
@@ -679,27 +700,31 @@ Environment: CPython 3.13, Apple M5 Pro (macOS, arm64),
 typical small failure, two heavy ones (one with value budgets off), a deep
 stack, a trace through `argparse` and `json` with whole files embedded, and
 a stack over 20 large module namespaces. A fat-LTO release build without
-PGO, on a copy of this branch alone, median of 3 rounds. Snapshots were
-byte-identical across implementations throughout.
+PGO, on a copy of this branch alone, median of 3 rounds, every build in one
+sitting; from one sitting to the next the Python walk's own times moved by
+up to 6%. Snapshots were byte-identical across implementations throughout.
 
 | Speed-up over the Python walk | Capture | save_dumping |
 | :-- | --: | --: |
-| Geometric mean of per-workload ratios | 2.90x | 1.84x |
-| Sum of per-workload medians | 4.42x | 2.40x |
+| Geometric mean of per-workload ratios | 2.87x | 1.96x |
+| Sum of per-workload medians | 3.97x | 2.39x |
 
-The sums are 71.86 ms to 16.25 ms for capture and 93.79 ms to 39.03 ms for
-`save_dumping`; per workload, capture is 1.5 to 6.0 times as fast. Peak RSS
-over the workloads is 69.8 MB natively and 72.6 MB in Python.
+The sums are 73.78 ms to 18.58 ms for capture and 98.90 ms to 41.37 ms for
+`save_dumping`; per workload, capture is 1.5 to 5.9 times as fast. Peak RSS
+over the workloads is 72.6 MB natively and 73.9 MB in Python.
 
 What the memo in the context's own dicts costs. The walker that kept a memo
-of its own, measured the same way in the same session, reached 3.40x and
-2.03x as geometric means, 6.98x and 2.87x as sums, and 62.1 MB. The
-difference is a dict lookup and two dict writes per value, so it shows most
+of its own, measured in the same sitting, reached 3.43x and 2.08x as
+geometric means, 7.16x and 2.91x as sums, and 60.2 MB. The difference is a
+dict lookup, two dict writes and two key objects per value, so it shows most
 on a large, flat graph: `b2_heavy_nolimits` (152,643 nodes) captures in
-12.2 ms, against 6.6 ms then and 59.3 ms in Python. An exact tuple or
-frozenset costs about 0.26 us, against 0.09 us then and 1.15 us in Python:
-the walker now builds its placeholder at once, as the Python walk does,
-where it built one only when something referred back to the tuple.
+14.6 ms, against 6.5 ms then and 60.7 ms in Python. The second key object,
+which keeps a walk over the dicts themselves in step with the Python walk,
+is about 3% of the geometric mean (2.96x with one key object for both
+dicts) and 4 MB on that workload. An exact tuple or frozenset costs about
+0.28 us, against 0.09 us then and 1.15 us in Python: the walker now builds
+its placeholder at once, as the Python walk does, where it built one only
+when something referred back to the tuple.
 
 Not measured again: the speed-up over the Python walk as it was before this
 work (`ed7ae81`), which was 7.4x for capture and 3.0x for `save_dumping`
@@ -714,7 +739,8 @@ Creating a context costs about 2.3 us natively and 1.75 us in Python.
 Creating one and capturing a single value costs, natively against Python:
 an int 4.9 us against 2.05 us, `[1, 2, 3]` 5.2 us against 3.5 us,
 `[1, {"a": "b"}, (2.5,)]` 6.5 us against 6.9 us, a 20-key dict 8.0 us
-against 20.6 us (medians of five rounds of 20,000 contexts, two runs).
+against 20.6 us (medians of five rounds of 20,000 contexts, two runs, before
+`_sources` got a key object of its own).
 The walker wins once a value holds containers or many items.
 
 To reproduce (results go to `rust/bench/results/`, which is git-ignored):

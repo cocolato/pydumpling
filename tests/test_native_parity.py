@@ -5209,3 +5209,67 @@ def test_a_context_a_class_its_walker_met_refers_to_is_collected(native):
     del context, Holder
     gc.collect()
     assert alive() is None
+
+
+def test_capturing_the_context_s_own_dicts():
+    """A walk that captures ``objects`` and ``_sources`` themselves copies
+    each key as a value. Both walks keep an entry under two int objects, one
+    in each dict, so both count the same nodes there, leave the same dicts,
+    and truncate a later capture at the same value under a node budget."""
+
+    def build():
+        return ([[index, str(index)] for index in range(5)],)
+
+    def calls(context, data):
+        def captured():
+            # The copies are keyed by ids, which differ from one run to the next.
+            copies = context.value([context.objects, context._sources])
+            return [
+                (len(copy), sorted(type(item).__name__ for item in copy.values()))
+                for copy in copies
+            ]
+
+        return [
+            lambda: context.value(data),
+            captured,
+            lambda: (context._nodes, len(context.objects), len(context._sources)),
+            lambda: context.value([[index, float(index)] for index in range(40)]),
+        ]
+
+    for nodes in (10000, 150):
+        native, _ = _same_in_both_modes(build, DumpOptions(max_nodes=nodes), calls)
+        assert native.results[2][0] > 2 * 16  # each key counted in both dicts
+
+
+def test_a_hand_back_keeps_the_namespaces_of_earlier_calls():
+    """A call the walker hands back takes out of ``_namespaces`` the ids it
+    added itself, which the Python walk then adds again, and only those:
+    the attribute dicts of objects earlier calls captured stay in it, as in
+    the Python walk."""
+
+    def build():
+        made = [_Plain() for _ in range(4)]
+        for index, instance in enumerate(made):
+            instance.field = index
+        return (made[0], made[1:])
+
+    def calls(context, earlier, later):
+        class Tally(int):
+            def __add__(self, other):
+                return int(self) + other
+
+        def handed_back():
+            context._truncation["max_items"] = Tally(0)
+            return context.value(later)
+
+        def namespaces():
+            held = [earlier, *later]
+            return (
+                [id(vars(instance)) in context._namespaces for instance in held],
+                len(context._namespaces),
+            )
+
+        return [lambda: context.value(earlier), handed_back, namespaces]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(max_items=2), calls)
+    assert native.results[2] == ([True, True, True, False], 3)

@@ -100,7 +100,10 @@ impl State {
         captured: Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
         self.objects(py)?.set_item(id, &captured)?;
-        self.sources(py)?.set_item(id, original)?;
+        // Under an int of its own, as the Python walk's second `id()` makes
+        // one: a walk that captures both dicts copies each key as a value.
+        self.sources(py)?
+            .set_item(crate::statics::id(original), original)?;
         Ok(captured)
     }
 
