@@ -52,8 +52,10 @@ package across checkouts and edits of the crate, and one built from other
 sources still imports and captures as the crate no longer does, so
 `tests/conftest.py` compares the fingerprint with the checkout's and refuses
 to run the suite on a stale build. An extension that lacks a name the crate
-reads from `values` when it is imported (one built for another version of
-that module) is not used: `values` warns and captures in Python.
+reads from `values` when it is imported, or whose walker or descriptors
+take other arguments (one built for another version of that module), is not
+used: `values` warns and captures in Python. The crate needs Rust 1.88
+(`rust-version`), the newest minimum among its locked dependencies.
 
 CI's `native` job builds the extension and runs the whole suite on it, on
 Linux for CPython 3.12 to 3.15 and on Windows and macOS for 3.14; its `rust`
@@ -66,8 +68,12 @@ there): on 3.11 C calls count toward the Python recursion limit, so a call
 handed back from native code would overflow earlier than the Python walk
 alone, at any limit. From 3.12 they count only toward CPython's own C
 recursion limit (see "Accepted, documented differences"). Free-threaded
-builds (3.13t, 3.14t) are not covered by abi3 and use the Python walk. The
-extension was developed, and its benchmarks run, on macOS arm64 only.
+builds use the Python walk: `values` does not import the extension where
+`Py_GIL_DISABLED` is set, as a stable-ABI build does not fit their object
+layout and the walker relies on the GIL, and `build_native.py` refuses to
+run on one, where PyO3 would build a version-specific extension under the
+stable-ABI name. The extension was developed, and its benchmarks run, on
+macOS arm64 only.
 
 ## When a context captures natively
 
@@ -75,12 +81,14 @@ A context gets a walker at the end of `SnapshotContext.__init__`
 (`ValuesMixin._start_walker`) when the extension imported, `PYDUMPLING_NATIVE`
 is not `"0"` when the context is created, and the class has a `_stock_walk`,
 which `context.py` records for `SnapshotContext` only; subclasses inherit it
-and face the per-call check. `values` imports the extension on CPython 3.12+
-when it is built, `PYDUMPLING_NATIVE` is not `"0"`, and Python does not run
-under `-b` (`sys.flags.bytes_warning`, fixed for the life of the process):
-there comparing bytes with str warns, and the walker's own dict and set
-lookups and inserts, which a call it hands back makes the Python walk
-repeat, would warn where the Python walk does not, or twice.
+and face the per-call check. `values` imports the extension on CPython 3.12+,
+not a free-threaded build, when it is built, `PYDUMPLING_NATIVE` is not
+`"0"`, and Python does not run under `-b` (`sys.flags.bytes_warning`, fixed
+for the life of the process): there comparing bytes with str warns, and the
+walker's own dict and set lookups and inserts, which a call it hands back
+makes the Python walk repeat, would warn where the Python walk does not, or
+twice. A build whose configuration does not load (`sysconfig`, as in a
+frozen application without its data) captures in Python too.
 
 Before every call the walker checks the context without running any of its
 code (see "The class check"). If the class or state is one only the Python
@@ -127,12 +135,13 @@ A single call goes to the Python walk (a *hand-back*), and the context
 stays native, when its arguments are not in a shape the walker reads
 without running code (listed below); when the walk reaches a point where
 the Python walk would run application code (listed under "The
-transaction"); when the Python walk would come within 64 frames of the
-recursion limit, any `RecursionError` is raised, or the native stack
-budget runs out; and when Python code is needed while a profiler, tracer
-or monitoring tool is set. `Walker.handbacks` counts them. These argument
-shapes hand a call back before the walk starts (`arguments.rs`), and the
-Python walk then raises or converts as it would:
+transaction"); when the walker cannot show from the stack that the
+Python walk would stay 64 frames clear of the recursion limit (see
+"Recursion and the native stack"), any `RecursionError` is raised, or the
+native stack budget runs out; and when Python code is needed while a
+profiler, tracer or monitoring tool is set. `Walker.handbacks` counts them.
+These argument shapes hand a call back before the walk starts
+(`arguments.rs`), and the Python walk then raises or converts as it would:
 
 - no positional argument after the context (as when the value or source
   is passed by keyword), or more than two;
@@ -155,8 +164,8 @@ Python walk then raises or converts as it would:
     walker.rs       Walker pyclass, State, per-call refresh of the state,
                     GC traverse and clear
     shadow.rs       per-call class check; finds the instance dict
-    transaction.rs  transaction, rollback, hand-back, retire, headroom,
-                    stack, hooks
+    transaction.rs  transaction, rollback, hand-back, retire, stack
+                    checks, hooks
     walk.rs         value(): exact scalars, containers, FakeClass objects
     copies.rs       _scalar, _fill_copy, _filled_slot, cached _layout calls
     mapping.rs      _mapping, _attribute_mapping, _root_value
@@ -314,18 +323,40 @@ that code twice. The points are:
 ### Recursion and the native stack
 
 The Python walk's result depends on the recursion limit (`_root_value`
-recovers from an overflow), so the walker hands back wherever the Python
-walk could come close to it. At the start of a call one
-`sys._getframe(min((limit - 97) / 2, 1024))` that fails proves the stack
-shallow enough for the first 32 walk levels, since a visible frame counts
-at most twice toward the limit (3.13+ runs `__init__` under a hidden shim
-frame). Otherwise, and whenever the walk needs more, the walker recurses
-into `values._headroom(n)` and lets `RecursionError` answer (doubling, then
-binary search), so the interpreter counts every frame, hidden or not. Each
-walk level must leave 64 frames of margin for helpers, generators and hash
-methods. The common case raises no audit event. An audit hook that refuses
-`sys._getframe` during a call only forces the probe; one that refused it
-at import also turned off the frame-locals fast path (above).
+recovers from an overflow), so the walker hands back wherever it cannot
+show that the Python walk stays clear of it, and never recurses toward the
+limit itself. `sys._getframe(n)` fails exactly when fewer than `n + 1`
+frames are visible, and a visible frame counts at most twice toward the
+limit (3.13+ runs `__init__` under a hidden shim frame), so one call that
+fails proves room. Only that failure counts: CPython raises it in C before
+any audit event, as a `ValueError` with no traceback. Each walk frame, a
+call of one of the Python walk's recursive methods, must leave 64 frames
+of margin for helpers, generators and hash methods. At the start of a call
+one look at `min((limit - 97) / 2, 1024)` makes room for 32 walk frames,
+about twice what a walk to the default `max_depth` of 5 needs (up to 15);
+if the frame is there, the stack is too deep to tell, and the call goes to
+the Python walk before the walker writes anything. A walk that goes deeper
+looks again for twice the frames, at `min((limit - 65 - frames) / 2,
+1024)`, and hands back if that frame is there; the native stack budget
+ends a walk after a few such looks. A limit too low for the frames leaves
+no room without a look, so a call made from C on a thread with no Python
+frame, where every look fails, still hands back. At the default limit of
+1000, then, a call from more than 451 visible frames runs in Python, and
+so does a walk past 32, 64 or 128 walk frames from more than 435, 403 or
+339; under a limit of 2145 or more, a call from more than 1024.
+
+A look that finds its frame raises the `sys._getframe` audit event, and the
+audit hooks run inside the native call. A hook that refuses the event,
+which it can only do on such a stack, hands the call back the same way,
+whatever it raises, except an exception that is not an `Exception`, such
+as a signal handler's `KeyboardInterrupt`, which goes on. One that refused
+it at import also turned off the frame-locals fast path (above).
+
+An earlier walker measured the room exactly, by recursing into a Python
+helper until `RecursionError`. From a deep stack that cost about 100 us per
+call, so a dump from 700 frames deep took about 11 ms against 0.7 ms in
+Python, and a signal handler that ran inside that recursion, close to the
+limit, could fail with a `RecursionError` the probe took for its own.
 
 The native stack budget is `min(256 KiB, (remaining - 64 KiB) / 4)`, from
 `stacker::remaining_stack()` at the start of the call. A fixed 256 KiB
@@ -335,16 +366,17 @@ and finalizers that run between two checks.
 
 ### Hooks and signals
 
-The walker runs Python code in a few places: the headroom probe and
-pydumpling's own helpers (`_text`, `_code_text`, `_bounded_bytes`,
-`_layout`, `FakeClass.__repr__`, and `FakeContainer.__hash__` through a
-set or dict insert). Before each it asks `sys.monitoring._all_events()`
-(about 10 ns), which shows every profile or trace function, including one
-set from C without an object as yappi does, and every tool's global events,
-from any thread; without `_all_events` it asks `sys.getprofile` and
-`sys.gettrace`. The six tool ids, for a tool with only per-code events, are
-asked once per call; asking them every time cost about 15% on calls that
-truncate many strings. If a hook is set, the call hands back, so the hook
+The walker runs Python code in a few places, pydumpling's own helpers
+(`_text`, `_code_text`, `_bounded_bytes`, `_layout`, `FakeClass.__repr__`,
+and `FakeContainer.__hash__` through a set or dict insert), and audit hooks
+from a stack check on a deep stack (see "Recursion and the native stack").
+Before each helper it asks `sys.monitoring._all_events()` (about 10 ns),
+which shows every profile or trace function, including one set from C
+without an object as yappi does, and every tool's global events, from any
+thread; without `_all_events` it asks `sys.getprofile` and `sys.gettrace`.
+The six tool ids, for a tool with only per-code events, are asked once per
+call; asking them every time cost about 15% on calls that truncate many
+strings. If a hook is set, the call hands back, so the hook
 runs exactly where the Python walk runs it (what it then sees is listed
 under the accepted differences). Strings that fit need no helper: an exact
 str whose length times four is within the limit, or an ASCII one
@@ -516,7 +548,7 @@ Each of these is a difference from the Python walk that remains by design.
   otherwise commits natively. A tool that takes an id during a call with
   only per-code events is seen from the next call; on 3.12 and 3.13, one
   that freed its id and kept only per-code events is seen by no check, and
-  sees the stack probe and helpers the walker calls.
+  sees the helpers the walker calls.
 - A context captured as a value (one a dumped frame holds, or one passed
   to `value`) shows its `_walker` attribute, an unsupported-type
   `FakeClass`. Captured through itself, it shows its node count as that
@@ -538,7 +570,7 @@ Each of these is a difference from the Python walk that remains by design.
   of that name makes the context capture in Python, and then holds `None`
   where a context that never had a walker leaves it unset.
 - The walker's table is built when `values` is imported: patching its globals
-  afterwards (`FakeClass`, `TruncatedValue`, `DumpOptions`, `_headroom`) is not
+  afterwards (`FakeClass`, `TruncatedValue`, `DumpOptions`) is not
   seen by any walker, and the walker never calls `_plain_key`. A call the
   walker hands back runs in the Python walk, which sees them, so one context
   can show a patch in some calls and not in others (under a tracer, an
@@ -574,7 +606,10 @@ Each of these is a difference from the Python walk that remains by design.
 - From a stack deeper than `min((limit - 97) / 2, 1024)` frames, counting
   the calling frame (451 at the default limit of 1000), each call the
   walker starts raises one `sys._getframe` audit event, from the start
-  check; a call handed back before it starts (the value by keyword, a
+  check, and goes to the Python walk; so does a walk deeper than 32 walk
+  frames from a stack deeper than its next look (see "Recursion and the
+  native stack"). The audit hooks run there, where the Python walk runs
+  none. A call handed back before it starts (the value by keyword, a
   non-int depth) raises none, nor does the Python walk.
 - If an audit hook refuses `sys._getframe` when `values` is imported,
   frame namespaces (`FrameLocalsProxy`, 3.13+) capture in the Python walk
@@ -628,8 +663,12 @@ pickles, the truncation counters in key order, the node counts, the kinds
 of what `objects` and `_sources` end up holding, in their order, and the
 application hooks run must match exactly; there is no tolerance, as values
 are copied, not computed. A first, discarded pure run materializes lazy
-state such as an exception's `__dict__`. Some cases run a few frames below
-the recursion limit, starting both walks at the same depth. While the tests
+state such as an exception's `__dict__`. No case starts near the
+recursion limit: the walker hands such calls back, and there the Python
+walk's own result depends on what the interpreter ran before, so the
+targeted tests below cover them. Deep chains (every seed ending in 9, and
+some others) still reach the limit through the walk's own depth, where the
+walker hands back and `_root_value` recovers. While the tests
 run, `TruncatedValue`, `FakeClass` and NaN `FakeFloat` copies hash by
 content, so sets iterate alike, and, so that no output carries an address,
 the harness lifts the int digit limit from 3.13 and drops the address from
@@ -743,6 +782,12 @@ against 20.6 us (medians of five rounds of 20,000 contexts, two runs, before
 `_sources` got a key object of its own).
 The walker wins once a value holds containers or many items.
 
+Deep stacks. A call from a stack too deep for the start check (see
+"Recursion and the native stack") goes to the Python walk and costs about
+2 us more than there, for the checks and the hand-back: 60 small calls from
+700 frames deep take 0.22 ms against 0.10 ms in Python, and
+`dump_current_traceback` from that depth 0.92 ms against 0.68 ms.
+
 To reproduce (results go to `rust/bench/results/`, which is git-ignored):
 
     python rust/build_native.py
@@ -778,12 +823,12 @@ with `-Cprofile-use=FILE`.
   per-platform abi3 wheels: a release decision.
 - Platforms. The extension has been built and run locally on macOS arm64
   only; Linux and Windows are left to CI's `native` job.
-- Free-threaded CPython. abi3 does not cover 3.13t and 3.14t, which use
-  the Python walk. Running `build_native.py` on such an interpreter has not
-  been tried.
+- Free-threaded CPython uses the Python walk (see "Build and supported
+  range"); the walker would need to work without the GIL.
 - Stack budget (see "Recursion and the native stack"): deep
   `max_depth=None` captures beyond roughly 90-220 levels run in Python, as
-  does any walk level fewer than 64 frames from the recursion limit.
+  does any capture from a stack too deep for the walker's looks to show
+  room.
 - Per-call overhead (see "Performance"): a memo hit costs about twenty
   times as much as in Python, so small contexts lose.
 - Placeholders of exact tuples and frozensets (see "Performance"). Building

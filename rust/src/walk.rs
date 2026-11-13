@@ -70,7 +70,7 @@ impl State {
             return Ok(self.node_marker.bind(py).clone());
         }
         self.nodes += 1;
-        if self.nodes % 4096 == 0 {
+        if self.nodes.is_multiple_of(4096) {
             py.check_signals()?;
         }
         let value_type = type_address(value);

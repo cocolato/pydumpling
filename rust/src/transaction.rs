@@ -11,7 +11,7 @@
 use std::ptr::addr_of;
 use std::sync::atomic::Ordering::Relaxed;
 
-use pyo3::exceptions::{PyRecursionError, PyReferenceError, PyValueError};
+use pyo3::exceptions::{PyException, PyReferenceError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -28,16 +28,16 @@ const STACK_RESERVE: usize = 64 * 1024;
 /// The share of the remaining native stack the walk may use: collections
 /// and finalizers that run between two checks need the rest.
 const STACK_SHARE: usize = 4;
-/// Walk frames below which the Python recursion limit cannot be near.
+/// Walk frames (calls of the Python walk's recursive methods) the start
+/// check makes room for: about twice what a walk to the default
+/// `max_depth` needs.
 const CHECK_FROM: u64 = 32;
 /// Python frames the Python walk may push beyond its recursive chain, for
 /// helpers, generators, and hash methods.
 const MARGIN: u64 = 64;
-/// Frames a probe asks for beyond what the walk needs now, at least.
-const PROBE_STEP: u64 = 256;
-/// The deepest frame the start check looks for: walking to it costs a
-/// microsecond, and a stack shallower than twice this depth is far from
-/// any recursion limit that high.
+/// The deepest frame a look goes to: walking to it costs a microsecond,
+/// and a stack shallower than twice this depth is far from any recursion
+/// limit that high.
 const LOOK_LIMIT: u64 = 1024;
 /// `sys.monitoring` tool ids, 0 to 5.
 const MONITORING_TOOLS: u8 = 6;
@@ -75,10 +75,14 @@ impl State {
         if self.origin.abs_diff(addr_of!(here) as usize) > self.stack_budget {
             return Err(Halt::Bail);
         }
-        let need = self.frames + MARGIN;
-        if need > self.headroom {
-            self.before_python(py)?;
-            self.headroom = self.probe(py, need)?;
+        if self.frames > self.room {
+            // Twice the room, from one more look: a few at most per call,
+            // as the native stack budget ends a deeper walk first.
+            let room = self.room * 2;
+            if !self.room_for(py, room)? {
+                return Err(Halt::Bail);
+            }
+            self.room = room;
         }
         Ok(())
     }
@@ -119,6 +123,13 @@ impl State {
         call: &Call<'_, 'py>,
         parsed: &Parsed<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Near its recursion limit the Python walk's result depends on the
+        // exact depth, which no cheap look tells: a call the walker cannot
+        // show to have room is the Python walk's from the start.
+        if !self.room_for(py, CHECK_FROM)? {
+            return self.hand_back(py, call);
+        }
+        self.room = CHECK_FROM;
         let truncation = self.truncation.bind(py).clone();
         let saved = truncation.copy()?;
         let nodes = self.nodes;
@@ -127,7 +138,6 @@ impl State {
         self.replaced.clear();
         self.added_namespaces.clear();
         self.frames = 0;
-        self.headroom = self.start_headroom(py)?;
         let origin = 0u8;
         self.origin = addr_of!(origin) as usize;
         self.stack_budget = match stacker::remaining_stack() {
@@ -255,61 +265,43 @@ impl State {
 }
 
 impl State {
-    /// Python frames the caller surely has room for, from one cheap look:
-    /// [`CHECK_FROM`] walk frames' worth unless the stack is deep enough
-    /// for the limit to be near, which [`State::probe`] then measures.
+    /// Whether the caller surely has room for `levels` walk frames, each
+    /// with [`MARGIN`] frames to spare, from one look that recurses nowhere.
     ///
     /// `sys._getframe(n)` fails exactly when fewer than `n + 1` frames are
     /// visible, and a visible frame counts at most twice toward the limit
-    /// (Python 3.13+ runs `__init__` beneath a hidden shim frame), so one
-    /// failed call answers for every call far from the limit, and raises
-    /// no audit event. If the stack is deeper than the look goes, or the
-    /// look fails, as when an audit hook refuses it, the probe measures.
-    fn start_headroom(&self, py: Python<'_>) -> PyResult<u64> {
+    /// (Python 3.13+ runs `__init__` beneath a hidden shim frame), so its
+    /// own failure proves the room. That failure is raised in C before any
+    /// audit hook runs, so it is exactly a `ValueError` with no traceback.
+    /// A look that succeeds runs the audit hooks, the only Python code a
+    /// look runs, and proves nothing, nor does a hook's refusal: either
+    /// hands the call back, though an exception that is not an `Exception`,
+    /// such as a signal handler's `KeyboardInterrupt`, goes on. A limit too
+    /// low for `levels` leaves no room, even on a thread that calls the
+    /// walker with no Python frame, where any look fails.
+    fn room_for(&self, py: Python<'_>, levels: u64) -> PyResult<bool> {
         let limit: u64 = self.s.recursion_limit.bind(py).call0()?.extract()?;
-        let probe = (limit.saturating_sub(CHECK_FROM + MARGIN + 1) / 2).min(LOOK_LIMIT);
-        Ok(match self.s.get_frame.bind(py).call1((probe,)) {
-            Err(err) if err.is_instance_of::<PyValueError>(py) => CHECK_FROM + MARGIN,
-            _ => 0,
-        })
-    }
-
-    /// How many more Python frames the caller has room for, at least
-    /// `need`, measured by recursing into `values._headroom`. The
-    /// interpreter does the counting, so every frame the limit counts is
-    /// included, visible or not. Hands the call back if `need` frames do
-    /// not fit.
-    fn probe(&self, py: Python<'_>, need: u64) -> Walk<u64> {
-        let fits = |frames: u64| -> Walk<bool> {
-            match self.s.headroom.bind(py).call1((frames,)) {
-                Ok(_) => Ok(true),
-                Err(err) if err.is_instance_of::<PyRecursionError>(py) => Ok(false),
-                Err(err) => Err(Halt::Py(err)),
-            }
+        let Some(spare) = limit.checked_sub(levels + MARGIN + 1) else {
+            return Ok(false);
         };
-        let ample = need.saturating_add(need.max(PROBE_STEP));
-        if fits(ample)? {
-            return Ok(ample);
-        }
-        if !fits(need)? {
-            return Err(Halt::Bail);
-        }
-        let (mut low, mut high) = (need, ample);
-        while high - low > 1 {
-            let middle = low + (high - low) / 2;
-            if fits(middle)? {
-                low = middle;
-            } else {
-                high = middle;
+        let look = (spare / 2).min(LOOK_LIMIT);
+        match self.s.get_frame.bind(py).call1((look,)) {
+            Ok(_) => Ok(false),
+            Err(err)
+                if err.get_type(py).is(py.get_type::<PyValueError>())
+                    && err.traceback(py).is_none() =>
+            {
+                Ok(true)
             }
+            Err(err) if err.is_instance_of::<PyException>(py) => Ok(false),
+            Err(err) => Err(err),
         }
-        Ok(low)
     }
 
-    /// Hands the call back before the walk runs Python code, the stack
-    /// probe or one of pydumpling's own helpers, if a profiler, tracer or
-    /// monitoring tool would see it: the hook is application code, which
-    /// the Python walk runs at its own calls instead.
+    /// Hands the call back before the walk runs one of pydumpling's own
+    /// helpers, if a profiler, tracer or monitoring tool would see it: the
+    /// hook is application code, which the Python walk runs at its own
+    /// calls instead.
     pub(crate) fn before_python(&self, py: Python<'_>) -> Walk<()> {
         match self.hooked(py)? {
             true => Err(Halt::Bail),

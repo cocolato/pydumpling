@@ -37,9 +37,16 @@ if (
     # does ``python -b``, a flag fixed for the life of the process: comparing
     # bytes with str warns there, and the walker's own dict and set lookups
     # and inserts, which a call it hands back makes this walk repeat, would
-    # warn where this walk does not, or twice.
+    # warn where this walk does not, or twice.  A free-threaded build is
+    # left out too: a stable-ABI extension does not fit its object layout,
+    # and one built for it would run without the GIL the walker relies on.
+    # A build whose configuration does not load, as a frozen application
+    # without its sysconfig data, captures in Python as well.
+    import sysconfig
+
     try:
-        from .. import _native
+        if not sysconfig.get_config_var("Py_GIL_DISABLED"):
+            from .. import _native
     except ImportError:
         pass
 
@@ -186,17 +193,6 @@ def _frame_locals_type():
         return type(frame.f_locals)
     finally:
         del frame
-
-
-def _headroom(frames):
-    """Recurse ``frames`` calls deep.
-
-    The native walker calls this to learn whether this walk would have room
-    for its recursion: the interpreter counts these frames exactly as it
-    counts the walk's own.
-    """
-    if frames:
-        _headroom(frames - 1)
 
 
 class ValuesMixin:
@@ -605,9 +601,19 @@ if _native is not None:
         # The walker's table of this module's classes and helpers, so a
         # reloaded or vendored copy of the package has its own.
         _STATICS = _native.Statics(globals(), _identity)
+        # A native descriptor sends each call to the context's walker, or to
+        # the method below when it has none, without adding a Python frame:
+        # the Python walk then overflows its recursion limit exactly where
+        # it would.  A walker is built once here as each context builds one.
+        _native.Walker(_STATICS, ())
+        _DISPATCH = (
+            _native.Dispatch(ValuesMixin.value, owner=ValuesMixin),
+            _native.Dispatch(ValuesMixin._mapping, mapping=True, owner=ValuesMixin),
+        )
     except Exception as error:
         # An extension built for another version of this module, which lacks
-        # what it reads here: the package it only speeds up still imports.
+        # what it reads here or takes other arguments: the package it only
+        # speeds up still imports.
         import warnings
 
         warnings.warn(
@@ -619,11 +625,5 @@ if _native is not None:
         )
         _native = None
     else:
-        # A native descriptor sends each call to the context's walker, or to
-        # the method below when it has none, without adding a Python frame:
-        # the Python walk then overflows its recursion limit exactly where
-        # it would.
-        ValuesMixin.value = _native.Dispatch(ValuesMixin.value, owner=ValuesMixin)
-        ValuesMixin._mapping = _native.Dispatch(
-            ValuesMixin._mapping, mapping=True, owner=ValuesMixin
-        )
+        ValuesMixin.value, ValuesMixin._mapping = _DISPATCH
+        del _DISPATCH

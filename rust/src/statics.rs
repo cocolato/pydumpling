@@ -119,8 +119,6 @@ pub(crate) struct Statics {
     /// access as a stock context's, without its class's hooks.
     pub object_getattribute: Py<PyAny>,
     pub object_setattr: Py<PyAny>,
-    /// `values._headroom`, which recurses as deep as it is asked to.
-    pub headroom: Py<PyAny>,
     /// `DumpOptions` and `collections.Counter`, the only options and
     /// truncation tally types the walker mirrors.
     pub dump_options: usize,
@@ -294,7 +292,6 @@ impl Statics {
             get_tool: sys.getattr("monitoring")?.getattr("get_tool")?.unbind(),
             object_getattribute: method("object", "__getattribute__")?.unbind(),
             object_setattr: method("object", "__setattr__")?.unbind(),
-            headroom: global("_headroom")?.unbind(),
             dump_options: address(&options),
             counter: address(&py.import("collections")?.getattr("Counter")?),
             walk_keys,

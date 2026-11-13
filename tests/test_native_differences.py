@@ -593,6 +593,8 @@ def test_hooks_patched_onto_the_container_and_scalar_copy_classes(monkeypatch, n
     and not at all in the walker, which builds each with its builtin base's
     ``__new__`` and reads its instance dict through the descriptor the
     class had at import."""
+    if native and _traced():
+        pytest.skip("under a tracer the walker hands the capture back")
     with _mode(native):
         context = SnapshotContext(DumpOptions())
     _check_walker(context, native)
@@ -853,12 +855,15 @@ def test_bound_method_introspection():
 # ``sys._getframe`` audit event only when it succeeds. From a stack of more
 # visible frames than that, counting the frame that makes the call (201, 451
 # and 1024 at recursion limits of 500, 1000 and 4000), each native ``value`` or
-# ``_mapping`` call raises exactly one event, including a call whose headroom
-# probe then recurses into ``values._headroom``; from that many frames or fewer
-# it raises none. A call the walker hands to Python before it starts, such as
-# one passing the value by keyword, raises none, and the Python walk raises
-# none at either depth. Audit hooks cannot be removed, so each limit runs in a
-# child interpreter.
+# ``_mapping`` call raises exactly one event and goes to the Python walk; from
+# that many frames or fewer it raises none, unless the walk goes deeper than 32
+# walk frames. Each time it does, the walker looks again for twice the room,
+# at ``min((limit - 1 - 64 - room) // 2, 1024)``: from the threshold of a limit
+# below 2,177 the first such look finds the stack too deep, raises one event
+# and hands the call to the Python walk. A call the walker hands to
+# Python before it starts, such as one passing the value by keyword, raises
+# none, and the Python walk raises none at either depth. Audit hooks cannot be
+# removed, so each limit runs in a child interpreter.
 
 
 _SCRIPT = """
@@ -916,10 +921,14 @@ print(json.dumps(outcomes))
 
 
 @pytest.mark.parametrize(
-    ("limit", "threshold"), [(500, 201), (1000, 451), (4000, 1024)]
+    ("limit", "threshold", "looks_again"),
+    [(500, 201, True), (1000, 451, True), (4000, 1024, False)],
 )
-def test_deep_stack_raises_one_frame_audit_event_per_native_call(limit, threshold):
-    """Only the native walk, and only from beyond the threshold, raises it."""
+def test_deep_stack_raises_one_frame_audit_event_per_native_call(
+    limit, threshold, looks_again
+):
+    """Only the native walk raises it, from beyond the threshold, or at it
+    for a walk deep enough to look again."""
     process = subprocess.run(
         [sys.executable, "-c", _SCRIPT, str(limit), str(threshold)],
         capture_output=True,
@@ -928,8 +937,9 @@ def test_deep_stack_raises_one_frame_audit_event_per_native_call(limit, threshol
         timeout=60,
     )
     assert process.returncode == 0, process.stderr
+    at = [[0, 1, 0], 2] if looks_again else [[0, 0, 0], 1]
     assert json.loads(process.stdout) == {
-        "native": {"at": [[0, 0, 0], 1], "deeper": [[1, 1, 0], 1]},
+        "native": {"at": at, "deeper": [[1, 1, 0], 3]},
         "python": {"at": [[0, 0, 0], None], "deeper": [[0, 0, 0], None]},
     }
 
@@ -1163,7 +1173,8 @@ def test_a_namespaces_element_is_compared_again_after_a_hand_back():
     """An element of ``_namespaces`` that hashes like the id of a dict the
     call captures is compared with that id by the walker, and again by the
     Python walk the walker hands the call back to after it, where the
-    Python walk alone compares it once."""
+    Python walk alone compares it once.  How often one lookup meets it
+    depends on the id's bits, so each lookup's count is measured first."""
     found = {}
     for native in (False, True):
         with _mode(native):
@@ -1172,10 +1183,13 @@ def test_a_namespaces_element_is_compared_again_after_a_hand_back():
         source = {"a": 1}
         planted = _Hashing(hash(id(source)))
         context._namespaces.add(planted)
+        assert id(source) not in context._namespaces
+        per_lookup, planted.compared = planted.compared, 0
+        assert per_lookup >= 1
         context.value([source, _Odd()])
         if native:
             assert context._walker.handbacks == 1
-        found[native] = planted.compared
+        found[native] = planted.compared / per_lookup
     assert found == {False: 1, True: 2}
 
 
@@ -1198,11 +1212,17 @@ def test_a_key_planted_in_dump_options_class_dict_is_compared_at_each_call():
     del DumpOptions._planted
     found = {}
     try:
+        # How often one lookup meets it depends on the str hash, and so on
+        # ``PYTHONHASHSEED``.
+        planted.compared = 0
+        namespace.get("max_items")
+        per_lookup = planted.compared
+        assert per_lookup >= 1
         for native, context in contexts.items():
             planted.compared = 0
             context.value(None)
             context.value(None)
-            found[native] = planted.compared
+            found[native] = planted.compared / per_lookup
     finally:
         del namespace[planted]
         DumpOptions._planted = None

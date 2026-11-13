@@ -2,7 +2,7 @@
 name = "pydumpling-native"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Optional native value walker for pydumpling's bounded snapshots"
 license = "MIT"
 publish = false

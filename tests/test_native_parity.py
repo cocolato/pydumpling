@@ -8,9 +8,7 @@ node count, and the kinds of what ``objects`` and ``_sources`` end up holding,
 in their order, must match byte for byte, and the native walk must run exactly
 the application hooks the pure one runs: none, outside contrived calls.  A
 first, discarded pure run materializes lazily created state, such as an
-exception's instance dict, that changes every later capture.  Some cases run
-a few frames below the recursion limit, where the result depends on the stack
-depth, so both walks start from the same depth.
+exception's instance dict, that changes every later capture.
 
 A captured set iterates in hash order, and ``TruncatedValue``, ``FakeClass``
 and NaN ``FakeFloat`` copies hash by identity, so while these tests run they
@@ -29,6 +27,7 @@ import functools
 import gc
 import gzip
 import inspect
+import json
 import os
 import pickle
 import random
@@ -1511,7 +1510,6 @@ class _Case:
     seed: int
     options: DumpOptions
     ops: list
-    margin: object  # Frames left below the recursion limit, or None.
     stacks: list
 
     def close(self):
@@ -1613,11 +1611,7 @@ def _case(seed):
     if chain is not None:
         target = rng.choice((chain, {"deep": chain, "kept": graph.leaf()}, [chain]))
         ops.insert(rng.randint(0, len(ops)), ("value", target, rng.choice((0, 0, 1))))
-    margin = None
-    if seed % 10 == 3:
-        # Near enough that even a shallow walk overflows, or only a deep one.
-        margin = rng.randint(4, 40) if rng.random() < 0.5 else rng.randint(40, 160)
-    return _Case(seed, options, ops, margin, [stack])
+    return _Case(seed, options, ops, [stack])
 
 
 # --- Running both walks ----------------------------------------------------
@@ -1776,22 +1770,13 @@ def _descend(depth, run):
     return _descend(depth - 1, run)
 
 
-def _below_limit(margin, run):
-    """Call ``run`` ``margin`` frames below the recursion limit, or directly."""
-    if margin is None:
-        return run()
-    return _descend(sys.getrecursionlimit() - _stack_depth() - margin, run)
-
-
 def _run(case, native):
     """Replay the case's operations on a fresh context in the given mode."""
     with _mode(native):
         context = SnapshotContext(case.options)
         _check_walker(context, native)
         with _armed() as calls:
-            results = _below_limit(
-                case.margin, lambda: [_apply(context, op) for op in case.ops]
-            )
+            results = [_apply(context, op) for op in case.ops]
         hooks = list(calls)
     return _Outcome(
         results,
@@ -1822,13 +1807,25 @@ def _assert_parity(case, native, pure):
             f"pickles first differ at byte {_first_byte(native.blob, pure.blob)} "
             f"(native {len(native.blob)} bytes, pure {len(pure.blob)})"
         )
+    # The test running, as pytest names it: its node id, then the phase.
+    test = os.environ.get("PYTEST_CURRENT_TEST", __file__).rsplit(" ", 1)[0]
+    command = f"pytest '{test}'"
+    if "::test_walk_parity[" in test:
+        command = f"PYDUMPLING_PARITY_SEEDS={case.seed + 1} {command}"
+    hash_seed = os.environ.get("PYTHONHASHSEED")
+    if hash_seed is None:
+        reproduce = (
+            f"reproduce: {command} (PYTHONHASHSEED was unset, so the hash seed "
+            "was random: set it to fix one)"
+        )
+    else:
+        reproduce = f"reproduce: PYTHONHASHSEED={hash_seed} {command}"
     raise AssertionError(
         f"native and pure walks differ for seed {case.seed}\n"
         f"options: {case.options}\n"
         f"{pickles}\n"
         f"application hooks ran: native {native.hooks}, pure {pure.hooks}\n"
-        f"reproduce: PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED', '<unset>')} "
-        f"pytest {__file__} -k 'test_walk_parity and [{case.seed}]'"
+        f"{reproduce}"
     )
 
 
@@ -2052,7 +2049,7 @@ def _items_case(shape, priority, fail_on=None, collect=False, max_items=None):
         ("value", [shared, source, entries], 0),
         ("mapping", source, 1, priority, False, dict),
     ]
-    return _Case(0, options, ops, None, [])
+    return _Case(0, options, ops, [])
 
 
 @pytest.mark.parametrize("shape", _ITEMS_SHAPES)
@@ -2106,7 +2103,7 @@ def test_odd_type_names():
         slotted.value = [1]
         values = [odd_name(), slotted, no_module(), odd_name, [odd_module]]
         options = DumpOptions(max_depth=None, max_string_bytes=8)
-        return _Case(0, options, [("value", values, 0)], None, [])
+        return _Case(0, options, [("value", values, 0)], [])
 
     first = case()
     _assert_parity(first, _run(first, native=True), _run(case(), native=False))
@@ -2895,9 +2892,9 @@ def test_application_code_behind_builtin_lookups(planted):
 
 
 def test_deep_caller_stack_under_a_raised_limit():
-    """A capture far below a raised recursion limit stays native however
-    deep the caller's stack is, and matches the Python walk.  The graph is
-    shallow enough for the native stack budget of any build."""
+    """A capture from a stack deeper than the walker looks, 1024 frames,
+    goes to the Python walk however far below a raised recursion limit it
+    is, and matches it."""
     nested = None
     for _ in range(12):
         nested = [nested, {"k": (nested,)}]
@@ -2910,7 +2907,7 @@ def test_deep_caller_stack_under_a_raised_limit():
                 context = SnapshotContext(DumpOptions(max_depth=None, max_nodes=None))
                 captured = _descend(5000, lambda: context.value(nested))
                 if native:
-                    assert context._walker.handbacks == 0 or _traced()
+                    assert context._walker.handbacks == 1
                 outcomes[native] = pickle.dumps(
                     (captured, dict(context._truncation), context._nodes), protocol=5
                 )
@@ -2920,46 +2917,155 @@ def test_deep_caller_stack_under_a_raised_limit():
 
 
 _AUDIT_SCRIPT = """
-import os, pickle, sys
-from pydumpling import _native
+import json, os, pickle, sys
 from pydumpling.options import DumpOptions
 from pydumpling.snapshot import SnapshotContext
 
+refusal = {
+    "RuntimeError": RuntimeError,
+    "ValueError": ValueError,
+    "KeyboardInterrupt": KeyboardInterrupt,
+}[sys.argv[1]]
+armed = [False]
+
 def deny(event, arguments):
-    if event == "sys._getframe":
-        raise RuntimeError("denied")
+    if armed[0] and event == "sys._getframe":
+        raise refusal("denied")
 
 sys.addaudithook(deny)
-nested = None
-for _ in range(15):
-    nested = [nested, {"k": nested}]
-outcomes = {}
+
+def stack():
+    frame, count = sys._getframe(1), 0
+    while frame is not None:
+        count, frame = count + 1, frame.f_back
+    return count
+
+def descend(frames, run):
+    return run() if frames <= 0 else descend(frames - 1, run)
+
+def build():
+    nested = None
+    for _ in range(15):
+        nested = [nested, {"k": nested}]
+    return nested
+
+nested, other = build(), build()
+outcomes, blobs = {}, {}
 for native in (True, False):
     os.environ["PYDUMPLING_NATIVE"] = "1" if native else "0"
     context = SnapshotContext(DumpOptions(max_depth=None, max_nodes=None))
-    captured = context.value({"deep": nested})
     walker = vars(context).get("_walker")
-    outcomes[native] = pickle.dumps(
-        (captured, dict(context._truncation), context._nodes), protocol=5
-    )
-    if native:
-        print("walker", isinstance(walker, _native.Walker), walker.handbacks)
-print("same" if outcomes[True] == outcomes[False] else "different")
+    # 20 frames below the limit, short of what the walk needs.
+    frames = sys.getrecursionlimit() - stack() - 20
+    armed[0] = True
+    shallow = context.value({"deep": nested})
+    after_shallow = None if walker is None else walker.handbacks
+    shallow = pickle.dumps(shallow, protocol=5)
+    try:
+        deep = descend(frames, lambda: context.value({"deep": other}))
+    except KeyboardInterrupt:
+        deep = "KeyboardInterrupt"
+    else:
+        deep = pickle.dumps((deep, dict(context._truncation)), protocol=5)
+    armed[0] = False
+    mode = "native" if native else "python"
+    handbacks = None if walker is None else walker.handbacks
+    outcomes[mode] = [after_shallow, handbacks, sorted(context._truncation)]
+    blobs[native] = (shallow, deep)
+outcomes["same"] = [left == right for left, right in zip(*blobs.values())]
+print(json.dumps(outcomes))
 """
 
 
-def test_audit_hook_refusing_frame_access():
-    """An audit hook that refuses ``sys._getframe`` costs the native walk
-    nothing but a measured start: the capture stays native and the same."""
+@pytest.mark.parametrize("refusal", ["RuntimeError", "ValueError", "KeyboardInterrupt"])
+def test_audit_hook_refusing_frame_access(refusal):
+    """An audit hook that refuses ``sys._getframe`` never sees the walker's
+    looks from a shallow stack, which fail before the event, so the capture
+    stays native and the same. From a deep stack a look succeeds and the
+    hook runs: a refusal, even with the ``ValueError`` a failed look raises,
+    proves no room and hands the call back, which overflows as in Python,
+    and an exception that is not an ``Exception``, as a signal handler might
+    raise there, goes on."""
     process = subprocess.run(
-        [sys.executable, "-c", _AUDIT_SCRIPT],
+        [sys.executable, "-c", _AUDIT_SCRIPT, refusal],
         capture_output=True,
         text=True,
         env=_child_environment(),
         timeout=120,
     )
     assert process.returncode == 0, process.stderr
-    assert process.stdout.split() == ["walker", "True", "0", "same"]
+    outcomes = json.loads(process.stdout)
+    assert "recursion" in outcomes["python"][2]
+    if refusal == "KeyboardInterrupt":
+        assert outcomes["native"][:2] == [0, 0]
+        assert outcomes["same"] == [True, False]
+    else:
+        assert outcomes["native"] == [0, 1, outcomes["python"][2]]
+        assert outcomes["same"] == [True, True]
+
+
+_FRAMELESS_SCRIPT = """
+import _thread, itertools, json, os, sys
+from pydumpling.options import DumpOptions
+from pydumpling.snapshot import SnapshotContext
+
+raised, done = [], _thread.allocate_lock()
+
+def report(unraisable):
+    raised.append(type(unraisable.exc_value).__name__)
+    done.release()
+
+sys.unraisablehook = report
+outcomes = {}
+for limit, levels in ((60, 80), (90, 95), (150, 160)):
+    nested = None
+    for _ in range(levels):
+        nested = [nested]
+    for native in (True, False):
+        os.environ["PYDUMPLING_NATIVE"] = "1" if native else "0"
+        options = DumpOptions(max_depth=None, max_nodes=None, max_items=None)
+        context = SnapshotContext(options)
+        walker = vars(context).get("_walker")
+        raised.clear()
+        results = []
+        done.acquire()
+        sys.setrecursionlimit(limit)
+        # C calls C down to the walker on a new thread, with no Python frame
+        # beneath it, and releases the lock after, or reports what it raised.
+        captures = map(context.value, [nested])
+        _thread.start_new_thread(
+            results.extend, (itertools.chain(captures, iter(done.release, None)),)
+        )
+        assert done.acquire(timeout=60)
+        done.release()
+        sys.setrecursionlimit(1000)
+        outcome = [list(raised), len(results), len(context.objects), context._nodes]
+        outcome.append(sorted(context._truncation.items()))
+        if walker is not None:
+            outcome.append(walker.handbacks)
+        outcomes.setdefault(f"{limit}/{levels}", {})[
+            "native" if native else "python"
+        ] = outcome
+print(json.dumps(outcomes))
+"""
+
+
+def test_a_call_from_a_thread_with_no_python_frame():
+    """A call made from C on a thread with no Python frame, under a limit
+    too low for the walk, hands back where the walker's looks all fail and
+    so prove nothing, and overflows as in Python."""
+    process = subprocess.run(
+        [sys.executable, "-c", _FRAMELESS_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=_child_environment(),
+        timeout=120,
+    )
+    assert process.returncode == 0, process.stderr
+    for case, outcome in json.loads(process.stdout).items():
+        native, python = outcome["native"], outcome["python"]
+        assert python[0] == ["RecursionError"], (case, outcome)
+        assert native == [*python, 1], (case, outcome)
 
 
 def test_placeholders_replaced_in_place():
@@ -3153,7 +3259,7 @@ def test_capture_reentered_by_a_collection():
 
 
 _REENTRY_AUDIT_SCRIPT = """
-import copy, sys, threading
+import copy, pickle, sys, threading
 from pydumpling.options import DumpOptions
 from pydumpling.snapshot import SnapshotContext
 
@@ -3168,6 +3274,10 @@ def capture_same():
     try:
         if mode == 'copy':
             copy.copy(context)
+        elif mode == 'deepcopy':
+            assert copy.deepcopy(context)._walker is None
+        elif mode == 'pickle':
+            assert pickle.loads(pickle.dumps(context))._walker is None
         else:
             context.value([1])
     except RuntimeError as error:
@@ -3208,7 +3318,7 @@ if mode == 'other':
 assert fired
 if mode == 'separate':
     assert independent == [[1]]
-elif mode == 'copy':
+elif mode in ('copy', 'deepcopy', 'pickle'):
     assert errors == []
 else:
     assert len(errors) == 1 and 'already capturing' in errors[0], errors
@@ -3216,10 +3326,12 @@ print('ok')
 """
 
 
-@pytest.mark.parametrize("mode", ["same", "other", "copy", "separate"])
+@pytest.mark.parametrize(
+    "mode", ["same", "other", "copy", "deepcopy", "pickle", "separate"]
+)
 def test_unanticipated_capture_reentry(mode):
     """Unknown same-context reentry fails closed; independent contexts work,
-    and so does copying the context, which captures nothing."""
+    and so does copying or pickling the context, which captures nothing."""
     process = subprocess.run(
         [sys.executable, "-c", _REENTRY_AUDIT_SCRIPT, mode],
         capture_output=True,
@@ -3481,29 +3593,26 @@ def _recording(kind, seen, callers=None):
 
 
 @pytest.mark.parametrize("kind", ["profile", "trace", "monitoring"])
-def test_tracing_hooks_never_see_the_stack_probe(kind):
-    """Under a profiler, tracer or monitoring tool a shallow capture stays
-    native and runs no Python code; a deep one, which needs the Python stack
-    probe, goes to the Python walk before the probe runs."""
+def test_tracing_hooks_never_see_the_stack_checks(kind):
+    """Under a profiler, tracer or monitoring tool a capture that needs no
+    Python helper stays native and runs no Python code, shallow or deep
+    enough to look at the stack again: the walker looks from C."""
     options = DumpOptions(max_depth=None, max_items=None, max_nodes=None)
     deep = [0]
-    for level in range(200):
+    for level in range(80):
         deep = [level, deep]
     with _mode(False):
         expected = pickle.dumps(SnapshotContext(options).value(deep), protocol=5)
     with _mode(True):
         context = SnapshotContext(options)
-    shallow, nested = [], []
-    with _recording(kind, shallow):
+    seen = []
+    with _recording(kind, seen):
         assert context.value([[1, "a"], {"k": (2.5,)}]) == [[1, "a"], {"k": (2.5,)}]
-    with _recording(kind, nested):
         captured = context.value(deep)
-    assert context._walker.handbacks == 1
+    assert context._walker.handbacks == 0
     assert pickle.dumps(captured, protocol=5) == expected
     walk_files = {values_module.__file__, context_module.__file__}
-    assert not [code for code in shallow if code.co_filename in walk_files]
-    assert values_module._headroom.__code__ not in nested
-    assert SnapshotContext.value.__wrapped__.__code__ in nested
+    assert not [code for code in seen if code.co_filename in walk_files]
 
 
 @pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="SIGUSR1 is unavailable")

@@ -25,8 +25,9 @@ use crate::types::TypeInfo;
 pub(crate) enum Halt {
     /// A Python exception, raised as the Python walk would raise it.
     Py(PyErr),
-    /// The Python walk would run application code or near its recursion
-    /// limit here, so the whole call must run there instead.
+    /// The Python walk would run application code here, or the walker
+    /// cannot show it room clear of its recursion limit, or the native
+    /// stack runs short, so the whole call must run there instead.
     Bail,
 }
 
@@ -70,8 +71,8 @@ pub(crate) struct State {
     pub types: AddressMap<TypeInfo>,
     /// Python frames the Python walk would have on the stack right now.
     pub(crate) frames: u64,
-    /// Python frames the caller is known to have room for beyond its own.
-    pub(crate) headroom: u64,
+    /// How many of those the caller is known to have room for.
+    pub(crate) room: u64,
     /// Stack address where the current call entered the walker, and how
     /// much native stack the call may use below it.
     pub(crate) origin: usize,
@@ -124,7 +125,7 @@ impl State {
             nodes: 0,
             types: AddressMap::default(),
             frames: 0,
-            headroom: 0,
+            room: 0,
             origin: 0,
             stack_budget: 0,
             toolless: AtomicBool::new(false),
@@ -270,15 +271,18 @@ impl Walker {
     }
 
     /// How many calls went to the Python walk, because it would have run
-    /// application code or neared its recursion limit.
+    /// application code, or the walker could not show it room clear of its
+    /// recursion limit.
     #[getter]
     fn handbacks(&self) -> u64 {
         self.state.handbacks
     }
 
     /// Pickles and deep-copies as `None`, which a context that captures in
-    /// Python holds.
-    fn __reduce__<'py>(&self, py: Python<'py>) -> (Bound<'py, PyType>, Bound<'py, PyTuple>) {
+    /// Python holds. It reads no state, so it borrows none, and works
+    /// during the walker's own call too.
+    fn __reduce__<'py>(slf: &Bound<'py, Self>) -> (Bound<'py, PyType>, Bound<'py, PyTuple>) {
+        let py = slf.py();
         (py.None().into_bound(py).get_type(), PyTuple::empty(py))
     }
 

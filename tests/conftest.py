@@ -1,6 +1,7 @@
 """Suite-wide checks."""
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,9 +17,11 @@ def pytest_configure(config):
     ``rust/build_native.py`` builds the extension into the package and leaves
     it there, git-ignored, across checkouts and edits of the crate.  One built
     from other sources still imports, and captures as the crate no longer
-    does, so every test would exercise the wrong walker.
+    does, so every test would exercise the wrong walker; or ``values`` drops
+    it with a warning, and every native test would be skipped.
     """
-    native = values._native
+    # The module ``values`` imported, whether it kept it or not.
+    native = sys.modules.get("pydumpling._native")
     script = _ROOT / "rust" / "build_native.py"
     if native is None or not script.is_file():
         return
@@ -32,4 +35,9 @@ def pytest_configure(config):
             f"{native.__file__} was not built from the sources in rust/: "
             "rebuild it with `python rust/build_native.py`, or set "
             "PYDUMPLING_NATIVE=0 to run the Python walk alone"
+        )
+    if values._native is None:
+        raise pytest.UsageError(
+            f"{native.__file__} matches the sources in rust/, but "
+            "pydumpling.snapshot.values does not use it: see its RuntimeWarning"
         )

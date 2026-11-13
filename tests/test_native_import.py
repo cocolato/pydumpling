@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -123,11 +124,19 @@ _MISMATCH_SCRIPT = """
 import sys, types, warnings
 
 native = types.ModuleType("pydumpling._native")
+if sys.argv[1] == "statics":
+    def statics(namespace, identity):
+        raise KeyError("values has no _gone")
 
-def statics(namespace, identity):
-    raise KeyError("values has no _gone")
+    native.Statics = statics
+else:
+    # An older build's walker, which took the table alone.
+    def walker(statics):
+        return object()
 
-native.Statics = statics
+    native.Statics = lambda namespace, identity: object()
+    native.Walker = walker
+    native.Dispatch = lambda function, **options: function
 sys.modules["pydumpling._native"] = native
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
@@ -143,12 +152,28 @@ assert context.value([1, {"a": 2}]) == [1, {"a": 2}]
 print("ok")
 """
 
+_FREE_THREADED_SCRIPT = """
+import sys, sysconfig, types, warnings
 
-@pytest.mark.skipif(sys.version_info < (3, 12), reason="3.11 never imports it")
-def test_an_extension_that_does_not_match_leaves_the_python_walk():
-    """An extension built for another version of ``values``, which lacks a
-    name it reads there, is not used: the package still imports, warns once,
-    and captures in Python."""
+real = sysconfig.get_config_var
+sysconfig.get_config_var = lambda name: 1 if name == "Py_GIL_DISABLED" else real(name)
+# Imported, this lacks everything ``values`` reads and would warn.
+sys.modules["pydumpling._native"] = types.ModuleType("pydumpling._native")
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    from pydumpling.snapshot import SnapshotContext, values
+from pydumpling.options import DumpOptions
+
+assert values._native is None
+assert not [w for w in caught if w.category is RuntimeWarning], caught
+context = SnapshotContext(DumpOptions())
+assert context._walker is None
+assert context.value([1, {"a": 2}]) == [1, {"a": 2}]
+print("ok")
+"""
+
+
+def _run_script(script, *arguments):
     root = Path(__file__).resolve().parents[1]
     environment = dict(os.environ)
     environment.pop("PYDUMPLING_NATIVE", None)
@@ -156,7 +181,7 @@ def test_an_extension_that_does_not_match_leaves_the_python_walk():
         str(root) + os.pathsep + environment.get("PYTHONPATH", "")
     )
     process = subprocess.run(
-        [sys.executable, "-B", "-c", _MISMATCH_SCRIPT],
+        [sys.executable, "-B", "-c", script, *arguments],
         cwd=root,
         env=environment,
         capture_output=True,
@@ -165,3 +190,23 @@ def test_an_extension_that_does_not_match_leaves_the_python_walk():
     )
     assert process.returncode == 0, process.stderr
     assert process.stdout.strip() == "ok"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="3.11 never imports it")
+@pytest.mark.skipif(
+    bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
+    reason="a free-threaded build never imports it",
+)
+@pytest.mark.parametrize("mismatch", ["statics", "walker"])
+def test_an_extension_that_does_not_match_leaves_the_python_walk(mismatch):
+    """An extension built for another version of ``values``, which lacks a
+    name it reads there or whose walker takes other arguments, is not used:
+    the package still imports, warns once, and captures in Python."""
+    _run_script(_MISMATCH_SCRIPT, mismatch)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="3.11 never imports it")
+def test_a_free_threaded_build_never_imports_the_extension():
+    """On a free-threaded build ``values`` leaves the extension out, as the
+    stable ABI does not fit it, and captures in Python without a warning."""
+    _run_script(_FREE_THREADED_SCRIPT)

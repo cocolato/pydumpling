@@ -3,7 +3,8 @@
     python rust/build_native.py [--debug] [cargo build arguments...]
 
 The extension is built against the running interpreter with the stable ABI
-(Python 3.12+) and copied to ``pydumpling/_native<suffix>``, where
+(Python 3.12+, not a free-threaded build, which ``values`` never loads it
+on) and copied to ``pydumpling/_native<suffix>``, where
 ``pydumpling.snapshot.values`` imports it.  ``RUSTFLAGS`` and any extra cargo
 arguments pass through, so the same script builds instrumented,
 profile-guided, and plain binaries; the build is a release build unless
@@ -24,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path
 
@@ -104,6 +106,13 @@ def _build(argv):
 
 
 def main(argv):
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        # PyO3 would build a version-specific extension for it instead, and
+        # write it where the stable-ABI build of other interpreters goes.
+        raise SystemExit(
+            "free-threaded Python captures in Python: build the extension "
+            "with a GIL-enabled Python 3.12+"
+        )
     library = _build(argv)
     destination = PACKAGE / ("_native" + _suffix())
     # Copy beside the destination and rename over it, so an interrupted
