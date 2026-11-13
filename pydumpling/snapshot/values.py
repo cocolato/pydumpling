@@ -25,34 +25,23 @@ from . import identity as _identity
 from .identity import _CLASS_DICT, _CLASS_MRO, _derives, _type_mro
 
 _native = None
-if sys.version_info >= (3, 12) and os.environ.get("PYDUMPLING_NATIVE") != "0":
+if (
+    sys.version_info >= (3, 12)
+    and os.environ.get("PYDUMPLING_NATIVE") != "0"
+    and not sys.flags.bytes_warning
+):
     # The optional native walker; this module stays the reference walk.  On
     # Python 3.11, C calls count toward the recursion limit, so a call the
     # walker hands back here could overflow where this walk alone would not.
-    # ``PYDUMPLING_NATIVE=0`` at import leaves the module out entirely.
+    # ``PYDUMPLING_NATIVE=0`` at import leaves the module out entirely.  So
+    # does ``python -b``, a flag fixed for the life of the process: comparing
+    # bytes with str warns there, and the walker's own dict and set lookups
+    # and inserts, which a call it hands back makes this walk repeat, would
+    # warn where this walk does not, or twice.
     try:
         from .. import _native
     except ImportError:
         pass
-
-if _native is not None:
-
-    class _Walker(_native.Walker):
-        """A native walker that writes its copies before it is freed.
-
-        The walker holds copies ``objects`` and ``_sources`` may still lack.
-        CPython runs ``__del__`` before it frees an object, and, for objects
-        in a reference cycle, such as a context and a captured object that
-        refers back to it, before it clears any of them, so the copies reach
-        a dict that outlives the context, as the Python walk put them there.
-        ``release`` is a native method: the finalizer pushes no Python frame,
-        so neither the Python recursion limit nor a signal or tracer can stop
-        it, though a spent C stack can, and its copies are then lost.
-        """
-
-        __slots__ = ()
-
-        __del__ = _native.Walker.release
 
 
 # The reason of an immutable container's placeholder.  One shared object, so
@@ -167,39 +156,13 @@ _NATIVE_STATE = (
 )
 
 
-# How a copy or pickle of the context reads it.  A context class with one of
-# these of its own may build a state from the instance dict, where the walker
-# comes after ``objects``, or give a shallow copy the walker itself, so the
-# context captures in Python, whose memo a copy always reads complete.
-# ``object.__reduce_ex__`` reads ``__getnewargs_ex__`` or ``__getnewargs__``
-# before the state, ``copy.replace`` (3.13+) calls the ``__replace__``,
-# which ``@dataclass`` adds, of the class ``__class__`` names, which a class
-# attribute of that name can answer, and a ``__getattr__`` can answer
-# ``__deepcopy__`` for an instance.  The walker also refuses an instance
-# attribute of one of these names, and a metaclass ``__copy__``,
-# ``__replace__``, ``__getattr__`` or ``__getattribute__``, which can answer
-# the class lookups of ``copy.copy`` and ``copy.replace``.
-_COPY_PROTOCOL = (
-    "__reduce_ex__",
-    "__reduce__",
-    "__getstate__",
-    "__copy__",
-    "__deepcopy__",
-    "__getnewargs_ex__",
-    "__getnewargs__",
-    "__replace__",
-    "__class__",
-    "__getattr__",
-)
-
-
 def _walk_methods(cls):
     """The class attributes of ``cls`` the native walker relies on.
 
-    For each walk method, attribute access hook, state name and copy hook,
-    the class attribute an instance of ``cls`` finds, or None, read from the
-    class dicts along the MRO without calling its ``__get__`` or any
-    metaclass hook, as the native walker reads them before every call.
+    For each walk method, attribute access hook and state name, the class
+    attribute an instance of ``cls`` finds, or None, read from the class
+    dicts along the MRO without calling its ``__get__`` or any metaclass
+    hook, as the native walker reads them before every call.
     """
     namespaces = [
         _CLASS_DICT.__get__(base, type(base))
@@ -207,7 +170,7 @@ def _walk_methods(cls):
     ]
     return tuple(
         next((namespace[name] for namespace in namespaces if name in namespace), None)
-        for name in _NATIVE_WALK + _STATE_ACCESS + _NATIVE_STATE + _COPY_PROTOCOL
+        for name in _NATIVE_WALK + _STATE_ACCESS + _NATIVE_STATE
     )
 
 
@@ -236,15 +199,6 @@ def _headroom(frames):
         _headroom(frames - 1)
 
 
-def _detached(state):
-    """The default state ``object.__getstate__`` builds, without the live
-    instance dict in it, which gets a native walker back after a copy."""
-    if isinstance(state, tuple):
-        namespace, slots = state
-        return (None if namespace is None else namespace.copy(), slots)
-    return None if state is None else state.copy()
-
-
 class ValuesMixin:
     """Value capture shared by the composed :class:`SnapshotContext`."""
 
@@ -256,53 +210,24 @@ class ValuesMixin:
     def _start_walker(self):
         """Capture through the native walker when it is built.
 
-        The walker mirrors this module step for step; ``PYDUMPLING_NATIVE=0``
-        keeps the Python walk.  Before every call the walker checks, without
-        running application code, that this context's state is one it
-        mirrors and its class runs the stock walk; otherwise, as for an
-        unlimited snapshot, where probing each original with the serializer
-        dominates the cost, an options subclass, or a context class that
-        overrides a walk method, attribute access, a state attribute or a
-        copy hook, it hands the context to the Python walk for good.  Nothing here reads
-        the context through its class's hooks, which the Python walk would
-        not run.  Under ``python -b`` the Python walk captures: comparing
-        bytes with str warns there, and the walker's own dict and set
-        lookups and inserts, which a call it hands back makes the Python
-        walk repeat, would warn where it does not, or twice.
+        The walker mirrors this module step for step, on this context's own
+        ``objects`` and ``_sources``; ``PYDUMPLING_NATIVE=0`` keeps the
+        Python walk.  Before every call the walker checks, without running
+        application code, that this context's state is one it mirrors and
+        its class runs the stock walk; otherwise, as for an unlimited
+        snapshot, where probing each original with the serializer dominates
+        the cost, an options subclass, or a context class that overrides a
+        walk method, attribute access or a state attribute, it hands the
+        context to the Python walk for good.  Nothing here reads the context
+        through its class's hooks, which the Python walk would not run.  The
+        walker keeps nothing of the context between calls: a shallow copy
+        shares it, and a pickle or deep copy holds ``None`` in its place.
         """
-        if (
-            _native is None
-            or os.environ.get("PYDUMPLING_NATIVE") == "0"
-            or sys.flags.bytes_warning
-        ):
+        if _native is None or os.environ.get("PYDUMPLING_NATIVE") == "0":
             return
         stock = object.__getattribute__(self, "_stock_walk")
         if stock is not None:
-            object.__setattr__(self, "_walker", _Walker(_STATICS, stock))
-
-    def __getstate__(self):
-        # A copy captures in Python, sharing the memo as a copy of a context
-        # that captures in Python does, once the walker has written its own
-        # copies into it; from then on the walker writes each call's copies
-        # at once, so a shallow copy, which shares the memo, sees them.
-        # The walker is read, left out and put back without the class's
-        # attribute hooks, so the default state is built as for a context
-        # that never had one, running the hooks that one would run.
-        try:
-            walker = object.__getattribute__(self, "_walker")
-        except AttributeError:
-            return _detached(object.__getstate__(self))
-        if walker is not None:
-            walker.flush()
-        try:
-            object.__delattr__(self, "_walker")
-        except AttributeError:
-            # Only the class's own default: a context built without one.
-            return _detached(object.__getstate__(self))
-        try:
-            return _detached(object.__getstate__(self))
-        finally:
-            object.__setattr__(self, "_walker", walker)
+            object.__setattr__(self, "_walker", _native.Walker(_STATICS, stock))
 
     def _layout(self, value):
         """Member descriptors and named tuple fields of ``type(value)``, cached."""
@@ -676,13 +601,29 @@ class ValuesMixin:
 
 
 if _native is not None:
-    # The walker's table of this module's classes and helpers, so a reloaded
-    # or vendored copy of the package has its own.
-    _STATICS = _native.Statics(globals(), _identity)
-    # A native descriptor sends each call to the context's walker, or to the
-    # method below when it has none, without adding a Python frame: the
-    # Python walk then overflows its recursion limit exactly where it would.
-    ValuesMixin.value = _native.Dispatch(ValuesMixin.value, owner=ValuesMixin)
-    ValuesMixin._mapping = _native.Dispatch(
-        ValuesMixin._mapping, mapping=True, owner=ValuesMixin
-    )
+    try:
+        # The walker's table of this module's classes and helpers, so a
+        # reloaded or vendored copy of the package has its own.
+        _STATICS = _native.Statics(globals(), _identity)
+    except Exception as error:
+        # An extension built for another version of this module, which lacks
+        # what it reads here: the package it only speeds up still imports.
+        import warnings
+
+        warnings.warn(
+            "pydumpling's native walker does not match this version of "
+            f"pydumpling and is not used ({error!r}); rebuild it with "
+            "rust/build_native.py",
+            RuntimeWarning,
+            stacklevel=1,
+        )
+        _native = None
+    else:
+        # A native descriptor sends each call to the context's walker, or to
+        # the method below when it has none, without adding a Python frame:
+        # the Python walk then overflows its recursion limit exactly where
+        # it would.
+        ValuesMixin.value = _native.Dispatch(ValuesMixin.value, owner=ValuesMixin)
+        ValuesMixin._mapping = _native.Dispatch(
+            ValuesMixin._mapping, mapping=True, owner=ValuesMixin
+        )

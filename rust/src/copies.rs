@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyInt, PyTuple};
 
 use crate::statics::{type_address, Statics};
 use crate::types::{dict_getter, fresh_dict, Base, Layout, Scalar};
@@ -37,12 +37,13 @@ impl State {
     pub(crate) fn scalar<'py>(
         &mut self,
         py: Python<'py>,
+        id: &Bound<'py, PyInt>,
         value: &Bound<'py, PyAny>,
         scalar: Scalar,
         depth: i64,
     ) -> Walk<Bound<'py, PyAny>> {
         self.enter(py)?;
-        let captured = self.scalar_body(py, value, scalar, depth);
+        let captured = self.scalar_body(py, id, value, scalar, depth);
         self.leave();
         captured
     }
@@ -50,6 +51,7 @@ impl State {
     fn scalar_body<'py>(
         &mut self,
         py: Python<'py>,
+        id: &Bound<'py, PyInt>,
         value: &Bound<'py, PyAny>,
         scalar: Scalar,
         depth: i64,
@@ -62,7 +64,7 @@ impl State {
                     let bits: u64 = s.int_bit_length.bind(py).call1((value,))?.extract()?;
                     if u128::from(bits) > u128::from(limit) * 8 {
                         let omitted = self.omit(py, intern!(py, "max_string_bytes"), value)?;
-                        return Ok(self.remember(value, omitted));
+                        return self.remember(py, id, value, omitted);
                     }
                 }
                 s.int_int.bind(py).call1((value,))?
@@ -86,7 +88,7 @@ impl State {
             }
         };
         let class = s.scalar_copy(scalar);
-        let captured = self.remember(value, class.make(py, Some(&plain))?);
+        let captured = self.remember(py, id, value, class.make(py, Some(&plain))?)?;
         self.fill_copy(py, value, &captured, class, depth)?;
         Ok(captured)
     }

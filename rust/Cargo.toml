@@ -10,7 +10,7 @@ publish = false
 [lib]
 # The extension module is imported as ``pydumpling._native``.
 name = "_native"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 # CPython 3.12+: on 3.11, C calls share the recursion limit with Python
@@ -22,9 +22,6 @@ stacker = "=0.1.25"
 
 [build-dependencies]
 pyo3-build-config = "=0.30.1"
-
-[dev-dependencies]
-proptest = "1"
 
 [profile.release]
 opt-level = 3

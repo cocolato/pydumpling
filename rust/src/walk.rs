@@ -3,18 +3,20 @@
 //! and the attributes of subclass copies are in [`crate::copies`].
 //!
 //! Every step follows the Python walk in order, because the order of memo
-//! entries, node counts, and truncation counters is part of the snapshot.
+//! entries, node counts, and truncation counters is part of the snapshot;
+//! the memo is the context's own `objects`, read and written as the Python
+//! walk reads and writes it.
 
 use std::collections::hash_map;
 
 use pyo3::exceptions::PyException;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PyInt, PyList, PySet, PyString, PyTuple, PyType};
 
-use crate::statics::{address, type_address};
+use crate::statics::{address, id, type_address};
 use crate::types::{fresh_dict, plain_fake_class_repr, Base, Kind, TypeInfo};
-use crate::walker::{Entry, Halt, Slot, State, Walk};
+use crate::walker::{Halt, State, Walk};
 
 /// Applies an `except Exception:` clause: `Ok(None)` for an `Exception`.
 pub(crate) fn unless_exception<T>(py: Python<'_>, result: PyResult<T>) -> Walk<Option<T>> {
@@ -59,11 +61,9 @@ impl State {
         depth: i64,
     ) -> Walk<Bound<'py, PyAny>> {
         let s = self.s;
-        let key = address(value);
-        match self.memo.get(key).map(|entry| &entry.slot) {
-            Some(Slot::Value(captured)) => return Ok(captured.bind(py).clone()),
-            Some(Slot::Recursive) => return self.placeholder(py, key),
-            None => {}
+        let id = &id(value);
+        if let Some(captured) = self.objects(py)?.get_item(id)? {
+            return Ok(captured);
         }
         if !self.has_nodes() {
             self.count(py, intern!(py, "max_nodes"))?;
@@ -80,22 +80,22 @@ impl State {
             || value_type == s.float
             || value_type == s.complex
         {
-            return Ok(self.remember(value, value.clone()));
+            return self.remember(py, id, value, value.clone());
         }
         if value_type == s.int {
             if self.int_too_long(py, value)? {
                 let omitted = self.omit(py, intern!(py, "max_string_bytes"), value)?;
-                return Ok(self.remember(value, omitted));
+                return self.remember(py, id, value, omitted);
             }
-            return Ok(self.remember(value, value.clone()));
+            return self.remember(py, id, value, value.clone());
         }
         if value_type == s.str_ {
             let text = self.text(py, value)?;
-            return Ok(self.remember(value, text));
+            return self.remember(py, id, value, text);
         }
         if value_type == s.bytes || value_type == s.bytearray {
             let bytes = self.bounded_bytes(py, value)?;
-            return Ok(self.remember(value, bytes));
+            return self.remember(py, id, value, bytes);
         }
         let kind = match TypeInfo::exact_kind(s, value_type) {
             Some(kind) => kind,
@@ -103,15 +103,15 @@ impl State {
         };
         if let Kind::Scalar(scalar) = kind {
             // Like an exact scalar, the value is kept at any depth.
-            return self.scalar(py, value, scalar, depth);
+            return self.scalar(py, id, value, scalar, depth);
         }
         if self.depth_reached(depth) {
             let omitted = self.omit(py, intern!(py, "max_depth"), value)?;
-            return Ok(self.remember(value, omitted));
+            return self.remember(py, id, value, omitted);
         }
         match kind {
-            Kind::Container(base) => self.container(py, value, base, depth),
-            _ => self.object(py, value, depth),
+            Kind::Container(base) => self.container(py, id, value, base, depth),
+            _ => self.object(py, id, value, depth),
         }
     }
 
@@ -165,6 +165,7 @@ impl State {
     fn container<'py>(
         &mut self,
         py: Python<'py>,
+        id: &Bound<'py, PyInt>,
         value: &Bound<'py, PyAny>,
         base: Base,
         depth: i64,
@@ -195,18 +196,13 @@ impl State {
             (false, false) => PySet::empty(py)?.into_any(),
         };
         if mutable {
-            self.remember(value, captured.clone());
-        } else if exact {
-            let entry = Entry {
-                slot: Slot::Recursive,
-                original: value.clone().unbind(),
-            };
-            self.memo.insert(address(value), entry);
+            self.remember(py, id, value, captured.clone())?;
         } else {
+            // What a reference back to it finds until it is filled.
             let type_name = self.type_name(py, value)?;
             let reason = s.recursive_immutable.bind(py).clone();
             let placeholder = self.truncated(py, &reason, &type_name)?;
-            self.remember(value, placeholder);
+            self.remember(py, id, value, placeholder)?;
         }
         let mut count = 0;
         // Iterate through the base type: a subclass `__iter__` must be
@@ -249,10 +245,10 @@ impl State {
             captured
         } else if filled {
             let finished = snapshot.make(py, Some(&captured))?;
-            self.remember(value, finished)
+            self.remember(py, id, value, finished)?
         } else {
             let finished = target.call1((captured,))?;
-            self.remember(value, finished)
+            self.remember(py, id, value, finished)?
         };
         if filled {
             self.fill_copy(py, value, &captured, snapshot, depth)?;
@@ -273,7 +269,7 @@ impl State {
             self.count(py, intern!(py, "max_items"))?;
             return Ok(false);
         }
-        if !self.has_nodes() && !self.memo.contains(address(item)) {
+        if !self.has_nodes() && !self.objects(py)?.contains(id(item))? {
             self.count(py, intern!(py, "max_nodes"))?;
             return Ok(false);
         }
@@ -299,6 +295,7 @@ impl State {
     fn object<'py>(
         &mut self,
         py: Python<'py>,
+        id: &Bound<'py, PyInt>,
         value: &Bound<'py, PyAny>,
         depth: i64,
     ) -> Walk<Bound<'py, PyAny>> {
@@ -336,7 +333,7 @@ impl State {
         let captured = s.object_new.bind(py).call1((s.fake_class.bind(py),))?;
         let namespace = fresh_dict(&s.fake_class_dict, &captured)?;
         namespace.set_item(private, &representation)?;
-        self.remember(value, captured.clone());
+        self.remember(py, id, value, captured.clone())?;
         match self.attributes(py, value)? {
             Some(attrs) => {
                 let private = fake_class.then_some(private.as_any());

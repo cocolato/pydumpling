@@ -9,7 +9,7 @@
 //! package, a reloaded one or a vendored copy, gets its own classes.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString, PyTuple};
+use pyo3::types::{PyDict, PyInt, PyString, PyTuple};
 
 use crate::copies::CopyClass;
 use crate::types::{dict_getter, Base, OwnClass, Scalar};
@@ -17,6 +17,14 @@ use crate::types::{dict_getter, Base, OwnClass, Scalar};
 /// An object's address: its `id()`, and the identity types are compared by.
 pub(crate) fn address(object: &Bound<'_, PyAny>) -> usize {
     object.as_ptr() as usize
+}
+
+/// `id(object)`: the key the walk memoizes the object under.
+pub(crate) fn id<'py>(object: &Bound<'py, PyAny>) -> Bound<'py, PyInt> {
+    match address(object).into_pyobject(object.py()) {
+        Ok(id) => id,
+        Err(never) => match never {},
+    }
 }
 
 /// The address of an object's type.
@@ -111,9 +119,6 @@ pub(crate) struct Statics {
     /// access as a stock context's, without its class's hooks.
     pub object_getattribute: Py<PyAny>,
     pub object_setattr: Py<PyAny>,
-    /// Whether the collector leaves a dict untracked while it holds nothing
-    /// it tracks, as before CPython 3.14: see [`crate::release`].
-    pub untracked_dicts: bool,
     /// `values._headroom`, which recurses as deep as it is asked to.
     pub headroom: Py<PyAny>,
     /// `DumpOptions` and `collections.Counter`, the only options and
@@ -121,17 +126,13 @@ pub(crate) struct Statics {
     pub dump_options: usize,
     pub counter: usize,
     /// `values._NATIVE_WALK`, the context methods the walker stands in
-    /// for, then `values._STATE_ACCESS`, `values._NATIVE_STATE` and
-    /// `values._COPY_PROTOCOL`, the class attributes the context must hold
-    /// as the stock class does, interned.
+    /// for, then `values._STATE_ACCESS` and `values._NATIVE_STATE`, the
+    /// class attributes the context must hold as the stock class does,
+    /// interned.
     pub walk_keys: Vec<Py<PyString>>,
-    /// How many of [`Statics::walk_keys`] are `_NATIVE_WALK`, and where
-    /// `_COPY_PROTOCOL` starts: the names an instance attribute may shadow.
+    /// How many of [`Statics::walk_keys`] are `_NATIVE_WALK`: the names an
+    /// instance attribute may shadow.
     pub walk_count: usize,
-    pub copy_from: usize,
-    /// The names a metaclass may answer the class lookups of `copy.copy`
-    /// and `copy.replace` with; `type` holds none of its own.
-    pub meta_keys: Vec<Py<PyString>>,
     /// The type of a function frame's `f_locals`: `FrameLocalsProxy` on
     /// Python 3.13+, whose `items()` runs no application code. Zero when
     /// frame inspection is unavailable, so proxies use the Python walk.
@@ -190,16 +191,10 @@ impl Statics {
         let walk: Vec<String> = global("_NATIVE_WALK")?.extract()?;
         let access: Vec<String> = global("_STATE_ACCESS")?.extract()?;
         let state: Vec<String> = global("_NATIVE_STATE")?.extract()?;
-        let copy: Vec<String> = global("_COPY_PROTOCOL")?.extract()?;
-        let names: Vec<&String> = walk
+        let walk_keys = walk
             .iter()
             .chain(&access)
             .chain(&state)
-            .chain(&copy)
-            .collect();
-        let copy_from = names.len() - copy.len();
-        let walk_keys = names
-            .iter()
             .map(|name| PyString::intern(py, name).unbind())
             .collect();
         let type_dict = builtin("type")?.getattr("__dict__")?;
@@ -299,20 +294,11 @@ impl Statics {
             get_tool: sys.getattr("monitoring")?.getattr("get_tool")?.unbind(),
             object_getattribute: method("object", "__getattribute__")?.unbind(),
             object_setattr: method("object", "__setattr__")?.unbind(),
-            untracked_dicts: !py
-                .import("gc")?
-                .getattr("is_tracked")?
-                .call1((PyDict::new(py),))?
-                .is_truthy()?,
             headroom: global("_headroom")?.unbind(),
             dump_options: address(&options),
             counter: address(&py.import("collections")?.getattr("Counter")?),
             walk_keys,
             walk_count: walk.len(),
-            copy_from,
-            meta_keys: ["__copy__", "__replace__", "__getattr__", "__getattribute__"]
-                .map(|name| PyString::intern(py, name).unbind())
-                .into(),
             frame_locals,
             true_: builtin("True")?.unbind(),
             false_: builtin("False")?.unbind(),
@@ -327,12 +313,6 @@ impl Statics {
             Ok(items) if type_address(key) == self.tuple => items.iter().all(|item| plain(&item)),
             _ => plain(key),
         }
-    }
-
-    /// Whether every key of `dict` is plain, so looking a key up in it
-    /// compares with builtin keys only.
-    pub(crate) fn plain_dict(&self, dict: &Bound<'_, PyDict>) -> bool {
-        dict.iter().all(|(key, _)| self.plain_key(&key))
     }
 
     /// Whether every key of `dict` is an exact str, so looking a str up in

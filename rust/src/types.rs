@@ -226,18 +226,6 @@ pub(crate) fn reads_plainly(
     Ok(true)
 }
 
-/// Whether `value` is a `TruncatedValue`, of a subclass too, as the Python
-/// walk's `isinstance` finds from its type: the class's metaclass is `type`,
-/// which no code can change, so the check reads the MRO and runs nothing.
-pub(crate) fn placeholder_like(
-    py: Python<'_>,
-    s: &Statics,
-    value: &Bound<'_, PyAny>,
-) -> PyResult<bool> {
-    Ok(type_address(value) == s.truncated_type
-        || value.get_type().is_subclass(s.truncated.bind(py))?)
-}
-
 /// The `reason` a `TruncatedValue`'s instance dict holds, if it is an exact
 /// str in a dict of exact str keys, read through the descriptor the class
 /// had at import, as attribute lookup reads it: reading it so runs no code

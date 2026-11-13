@@ -10,8 +10,14 @@ profile-guided, and plain binaries; the build is a release build unless
 ``--debug``, ``--release``, or ``--profile`` says otherwise.  The previous
 build stays in place until the new one is complete, and other builds of the
 extension are removed so that none shadows it.
+
+The extension carries a fingerprint of the sources it was built from, as
+``pydumpling._native.fingerprint``.  The test suite compares it with
+``fingerprint()`` of the checkout it runs in, so a build older than the crate
+fails the run instead of capturing as the crate no longer does.
 """
 
+import hashlib
 import importlib.machinery
 import json
 import os
@@ -23,6 +29,18 @@ from pathlib import Path
 
 CRATE = Path(__file__).resolve().parent
 PACKAGE = CRATE.parent / "pydumpling"
+
+
+def fingerprint():
+    """A digest of everything in the crate that a build reads."""
+    sources = [CRATE / "Cargo.toml", CRATE / "Cargo.lock", CRATE / "build.rs"]
+    sources += sorted((CRATE / "src").rglob("*.rs"))
+    digest = hashlib.sha256()
+    for source in sources:
+        digest.update(source.relative_to(CRATE).as_posix().encode() + b"\0")
+        # Line endings differ between checkouts of the same commit.
+        digest.update(source.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    return digest.hexdigest()[:16]
 
 
 def _suffix():
@@ -52,12 +70,17 @@ def _build(argv):
         "--manifest-path",
         str(CRATE / "Cargo.toml"),
         "--lib",
+        # The fingerprint covers Cargo.lock, so the build must not rewrite it.
+        "--locked",
         "--message-format=json-render-diagnostics",
     ]
     if not debug and not profile:
         command.append("--release")
     environment = dict(
-        os.environ, PYO3_PYTHON=sys.executable, PYO3_BUILD_EXTENSION_MODULE="1"
+        os.environ,
+        PYO3_PYTHON=sys.executable,
+        PYO3_BUILD_EXTENSION_MODULE="1",
+        PYDUMPLING_NATIVE_FINGERPRINT=fingerprint(),
     )
     process = subprocess.run(
         command + extra, check=True, env=environment, stdout=subprocess.PIPE, text=True

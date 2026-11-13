@@ -5,10 +5,8 @@
 //! as a method; on any other context, the Python method bound as usual; on
 //! the class, the descriptor itself, which routes
 //! `SnapshotContext.value(ctx, ...)` and `SnapshotContext.value(self=ctx,
-//! ...)` the same way: the Python function must not run on a context whose
-//! walker holds copies `objects` lacks. No Python
-//! frame is added, so the Python walk overflows its recursion limit exactly
-//! where it would without the walker.
+//! ...)` the same way. No Python frame is added, so the Python walk
+//! overflows its recursion limit exactly where it would without the walker.
 //!
 //! The walker takes only the argument shapes [`crate::arguments`] reads.
 
@@ -168,8 +166,8 @@ impl Dispatch {
         };
         // A finalizer, collection callback, audit hook or signal handler
         // that runs while this walker captures, or another thread: the
-        // copies of the call in progress are in no state the Python walk
-        // can share.
+        // call in progress keeps its node count, and what a hand-back would
+        // undo, where the Python walk cannot share them.
         let Ok(mut walker) = walker.try_borrow_mut() else {
             return Err(PyRuntimeError::new_err(
                 "this SnapshotContext is already capturing: a native context \

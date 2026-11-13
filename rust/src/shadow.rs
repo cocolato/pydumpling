@@ -4,26 +4,20 @@
 //! The Python walk calls `self.value(...)`, `self._omit(...)` and the rest
 //! of `values._NATIVE_WALK`, and reads and writes its state,
 //! `values._NATIVE_STATE`, through the class's `__getattribute__`,
-//! `__setattr__` and `__delattr__`; copies and pickles read the context
-//! through `values._COPY_PROTOCOL`, on the instance, its class, and for
-//! the class lookups of `copy.copy` and `copy.replace` the metaclass. A
-//! class attribute of any of these names set, replaced or removed after the
-//! context was made, such as a property in place of a state attribute, a
-//! slot for `_walker`, which the instance releases before its dict, or a
-//! reducer of the class's own, an instance attribute of a walk or copy
-//! name, or a metaclass `__copy__`, `__replace__`, `__getattr__` or
-//! `__getattribute__` but `type`'s, changes what the Python walk runs or
-//! what a copy reads, and the walker then gives the context to it for good.
-//! Otherwise the stock attribute access reads the state from the instance
-//! dict, and so does the walker, without any hook.
+//! `__setattr__` and `__delattr__`. A class attribute of any of these names
+//! set, replaced or removed after the context was made, such as a property
+//! in place of a state attribute or a slot for `_walker`, or an instance
+//! attribute of a walk name, changes what the Python walk runs, and the
+//! walker then gives the context to it for good. Otherwise the stock
+//! attribute access reads the state from the instance dict, and so does
+//! the walker, without any hook.
 //!
 //! The check runs before every call and runs no application code. Class
 //! dicts are read through the `type.__dict__` descriptors, never through a
 //! metaclass, and a lookup finds the raw class attribute, as an instance
 //! attribute lookup does, without calling its `__get__`. Only the classes
 //! in front of each name's owner are searched, and no immutable builtin
-//! class such as `object`, which nothing can change. A metaclass dict, like
-//! a class dict, holds only exact str keys, whose lookup runs no `__eq__`.
+//! class such as `object`, which nothing can change.
 
 use pyo3::exceptions::{PyException, PyKeyError};
 use pyo3::gc::PyVisit;
@@ -51,10 +45,6 @@ pub(crate) struct ContextType {
     owners: Vec<Option<(usize, Py<PyAny>)>>,
     /// Whether every name resolved as on the stock class when computed.
     stock: bool,
-    /// The metaclass, its MRO and the dicts of its classes but `type` and
-    /// `object`, where none of [`Statics::meta_keys`] may appear; `None`
-    /// for `type`, which no class can trade for another.
-    meta: Option<Meta>,
     /// Bound `__get__` of the instance-dict descriptor, if the type has a
     /// plain one and no class dict key whose own methods a lookup may run.
     dict_get: Option<Py<PyAny>>,
@@ -70,32 +60,10 @@ impl ContextType {
         stock: &Bound<'_, PyTuple>,
     ) -> PyResult<Self> {
         let (mro, namespaces) = class_dicts(py, s, ty)?;
-        let (metaclass, types) = (ty.get_type(), py.get_type::<PyType>());
-        let mut plain_meta = true;
-        let meta = match metaclass.is(&types) {
-            true => None,
-            false => {
-                let (meta_mro, classes) = class_dicts(py, s, &metaclass)?;
-                let mut dicts = Vec::new();
-                for (cls, namespace, _) in classes {
-                    if cls.is(&types) || cls.is(py.get_type::<PyAny>()) {
-                        continue;
-                    }
-                    for key in namespace.try_iter()? {
-                        plain_meta &= type_address(&key?) == s.str_;
-                    }
-                    dicts.push(namespace.unbind());
-                }
-                Some((metaclass.unbind(), meta_mro.unbind(), dicts))
-            }
-        };
         let info = TypeInfo::compute(py, s, ty)?;
         // In a class dict with a key other than an exact str, looking a
         // name up may run that key's own `__eq__`: the Python walk must.
-        let mut stock_names = !info.hostile
-            && plain_meta
-            && stock.len() == s.walk_keys.len()
-            && !meta_answers(py, s, &meta)?;
+        let mut stock_names = !info.hostile && stock.len() == s.walk_keys.len();
         let mut owners = Vec::with_capacity(s.walk_keys.len());
         for (index, name) in s.walk_keys.iter().enumerate() {
             if !stock_names {
@@ -128,24 +96,12 @@ impl ContextType {
                 .collect(),
             owners,
             stock: stock_names,
-            meta,
             dict_get: info.dict_get.filter(|_| !info.hostile),
         })
     }
 
     /// Whether every class still holds what it held when computed.
     fn unchanged(&self, py: Python<'_>, s: &Statics) -> PyResult<bool> {
-        if let Some((metaclass, mro, _)) = &self.meta {
-            let ty = self.ty.bind(py);
-            let current = s
-                .class_mro
-                .bind(py)
-                .call1((metaclass, metaclass.bind(py).get_type()))?;
-            if !ty.get_type().is(metaclass) || !current.is(mro) || meta_answers(py, s, &self.meta)?
-            {
-                return Ok(false);
-            }
-        }
         for (name, owner) in s.walk_keys.iter().zip(&self.owners) {
             let name = name.bind(py);
             let (front, held) = match owner {
@@ -205,8 +161,7 @@ impl ContextType {
                 return Ok(None);
             }
         }
-        let names = s.walk_keys[..s.walk_count].iter();
-        for name in names.chain(&s.walk_keys[s.copy_from..]) {
+        for name in &s.walk_keys[..s.walk_count] {
             if attributes.contains(name.bind(py))? {
                 return Ok(None);
             }
@@ -227,19 +182,9 @@ impl ContextType {
         if let Some(getter) = &self.dict_get {
             visit.call(getter)?;
         }
-        if let Some((metaclass, mro, dicts)) = &self.meta {
-            visit.call(metaclass)?;
-            visit.call(mro)?;
-            for namespace in dicts {
-                visit.call(namespace)?;
-            }
-        }
         Ok(())
     }
 }
-
-/// A metaclass, its MRO and its classes' dicts but `type`'s and `object`'s.
-type Meta = (Py<PyType>, Py<PyAny>, Vec<Py<PyAny>>);
 
 /// Each class in an MRO, its dict, and whether the class is mutable.
 type Dicts<'py> = Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>, bool)>;
@@ -272,18 +217,6 @@ fn mutable(py: Python<'_>, s: &Statics, cls: &Bound<'_, PyAny>) -> PyResult<bool
     Ok(flags & IMMUTABLE_TYPE == 0)
 }
 
-/// Whether a metaclass class dict holds one of [`Statics::meta_keys`].
-fn meta_answers(py: Python<'_>, s: &Statics, meta: &Option<Meta>) -> PyResult<bool> {
-    for namespace in meta.iter().flat_map(|(_, _, dicts)| dicts) {
-        for name in &s.meta_keys {
-            if namespace.bind(py).contains(name.bind(py))? {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
 /// The instance dict of `ctx`, the state the walker mirrors, if `ctx` runs
 /// the stock walk methods; `cached` is reused while the context's type and
 /// MRO stay the same.
@@ -306,20 +239,6 @@ pub(crate) fn unshadowed<'py>(
         *cached = Some(ContextType::compute(py, s, &ty, stock)?);
     }
     match cached.as_ref() {
-        Some(current) if current.stock => current.attributes(py, s, ctx),
-        _ => Ok(None),
-    }
-}
-
-/// The instance dict of `ctx` through the type last checked, as after a
-/// hand-back, without checking the classes again.
-pub(crate) fn attributes<'py>(
-    py: Python<'py>,
-    s: &Statics,
-    cached: &Option<ContextType>,
-    ctx: &Bound<'py, PyAny>,
-) -> PyResult<Option<Bound<'py, PyDict>>> {
-    match cached {
         Some(current) if current.stock => current.attributes(py, s, ctx),
         _ => Ok(None),
     }

@@ -62,7 +62,10 @@ def test_context_copy_preserves_slots(monkeypatch, native, context_type, clone):
     assert not hasattr(copied, "unset")
     if isinstance(context, _ChildContext):
         assert copied.extra == "inherited slots"
-    assert getattr(copied, "_walker", None) is None
+    # A shallow copy shares the walker with ``objects``; a deep copy or a
+    # pickle, which has its own ``objects``, captures in Python.
+    shared = walker if clone is copy.copy else None
+    assert getattr(copied, "_walker", None) is shared
     assert getattr(context, "_walker", None) is walker
     assert context.objects[id(source)] is captured
     if clone is copy.copy:

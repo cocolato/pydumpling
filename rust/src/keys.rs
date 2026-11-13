@@ -9,7 +9,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyIterator, PySet, PyTuple};
 
-use crate::memo::AddressMap;
+use crate::address::AddressMap;
 use crate::statics::address;
 use crate::walk::{is_exact_str, str_equals};
 use crate::walker::{Halt, State, Walk};
@@ -78,7 +78,7 @@ impl<'py> Chosen<'py> {
         let next = self.entries.len();
         if let std::collections::hash_map::Entry::Vacant(slot) = self.slots.entry(address(&key)) {
             slot.insert(next);
-            crate::memo::push(&mut self.entries, (key, value));
+            crate::address::push(&mut self.entries, (key, value));
         }
     }
 }

@@ -10,12 +10,12 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySet};
 
+use crate::address::AddressMap;
 use crate::keys::{pair, Chosen};
-use crate::memo::AddressMap;
-use crate::statics::{address, type_address};
+use crate::statics::{address, id, type_address};
 use crate::types::{plain_reason, reads_plainly, Base, Kind};
 use crate::walk::is_exact_str;
-use crate::walker::{Halt, Slot, State, Walk};
+use crate::walker::{Halt, State, Walk};
 
 impl State {
     /// `ValuesMixin._mapping`.
@@ -44,45 +44,48 @@ impl State {
         container: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
         let s = self.s;
-        let key = address(source);
-        let cached = self.memo.get(key).map(|entry| match &entry.slot {
-            Slot::Recursive => None,
-            Slot::Value(cached) => Some(cached.bind(py).clone()),
-        });
+        let id = &id(source);
+        // Looked up twice, as the Python walk's `in` and subscript do.
+        let cached = match self.objects(py)?.contains(id)? {
+            true => self.objects(py)?.get_item(id)?,
+            false => None,
+        };
         if let Some(cached) = cached {
+            let cached_type = type_address(&cached);
+            if cached_type == s.dict || cached_type == s.fake_dict_type {
+                return Ok(cached);
+            }
             // A mapping root may fit even when a deeper reference was omitted.
             let mut reusable = false;
-            if let Some(cached) = cached {
-                let cached_type = type_address(&cached);
-                if cached_type == s.dict || cached_type == s.fake_dict_type {
-                    return Ok(cached);
-                }
-                if cached_type == s.truncated_type {
-                    // Reading an application's placeholder's `reason` may
-                    // run its class's code, raise, or run the reason's own
-                    // `__ne__`: only an exact str the read finds in the
-                    // instance dict is read here.
-                    let name = intern!(py, "reason");
-                    if !reads_plainly(py, s, cached.get_type().as_any(), name)? {
-                        return Err(Halt::Bail);
-                    }
-                    let Some(reason) = plain_reason(py, s, &cached)? else {
-                        return Err(Halt::Bail);
-                    };
-                    reusable = reason.eq(intern!(py, "max_depth"))?;
-                } else if !s.plain_keys.contains(&cached_type)
-                    && ![s.bytearray, s.list, s.tuple, s.set, s.frozenset].contains(&cached_type)
-                {
-                    // The Python walk's `isinstance` reads any other entry's
-                    // `__class__`, which its class may answer with its own
-                    // code, and a placeholder's `reason`: it runs them once.
+            if cached_type == s.truncated_type {
+                // Reading an application's placeholder's `reason` may run
+                // its class's code, raise, or run the reason's own
+                // `__ne__`: only an exact str the read finds in the
+                // instance dict is read here.
+                let name = intern!(py, "reason");
+                if !reads_plainly(py, s, cached.get_type().as_any(), name)? {
                     return Err(Halt::Bail);
                 }
+                let Some(reason) = plain_reason(py, s, &cached)? else {
+                    return Err(Halt::Bail);
+                };
+                reusable = reason.eq(intern!(py, "max_depth"))?;
+            } else if !s.plain_keys.contains(&cached_type)
+                && ![s.bytearray, s.list, s.tuple, s.set, s.frozenset].contains(&cached_type)
+            {
+                // The Python walk's `isinstance` reads any other entry's
+                // `__class__`, which its class may answer with its own
+                // code, and a placeholder's `reason`: it runs them once.
+                return Err(Halt::Bail);
             }
             if !reusable {
                 self.count(py, intern!(py, "unsupported_type"))?;
                 return Ok(PyDict::new(py).into_any());
             }
+            // The copy below goes in its place, where a hand-back puts the
+            // placeholder back.
+            self.replaced
+                .push((id.clone().into_any().unbind(), cached.unbind()));
         }
         if !counted {
             if !self.has_nodes() {
@@ -94,13 +97,13 @@ impl State {
         if self.depth_reached(depth) {
             self.count(py, intern!(py, "max_depth"))?;
             let empty = self.s.empty_mapping(py, container)?;
-            return Ok(self.remember(source, empty));
+            return self.remember(py, id, source, empty);
         }
         let empty = self.s.empty_mapping(py, container)?;
-        let captured = self.remember(source, empty);
+        let captured = self.remember(py, id, source, empty)?;
         // Frame variable names are identifiers, not application string
         // values, so a string budget must not rewrite them.
-        let names = self.namespaces.bind(py).contains(key)?;
+        let names = self.namespaces.bind(py).contains(id)?;
         let preferred = PySet::empty(py)?;
         if let Some(priority) = priority {
             for name in priority.try_iter()? {

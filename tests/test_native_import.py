@@ -117,3 +117,51 @@ def test_frame_probe_does_not_hide_locals_errors(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="locals failed"):
         values_module._frame_locals_type()
+
+
+_MISMATCH_SCRIPT = """
+import sys, types, warnings
+
+native = types.ModuleType("pydumpling._native")
+
+def statics(namespace, identity):
+    raise KeyError("values has no _gone")
+
+native.Statics = statics
+sys.modules["pydumpling._native"] = native
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    from pydumpling.snapshot import SnapshotContext, values
+from pydumpling.options import DumpOptions
+
+assert values._native is None
+messages = [str(w.message) for w in caught if w.category is RuntimeWarning]
+assert len(messages) == 1 and "rust/build_native.py" in messages[0], messages
+context = SnapshotContext(DumpOptions())
+assert context._walker is None
+assert context.value([1, {"a": 2}]) == [1, {"a": 2}]
+print("ok")
+"""
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="3.11 never imports it")
+def test_an_extension_that_does_not_match_leaves_the_python_walk():
+    """An extension built for another version of ``values``, which lacks a
+    name it reads there, is not used: the package still imports, warns once,
+    and captures in Python."""
+    root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment.pop("PYDUMPLING_NATIVE", None)
+    environment["PYTHONPATH"] = (
+        str(root) + os.pathsep + environment.get("PYTHONPATH", "")
+    )
+    process = subprocess.run(
+        [sys.executable, "-B", "-c", _MISMATCH_SCRIPT],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert process.returncode == 0, process.stderr
+    assert process.stdout.strip() == "ok"

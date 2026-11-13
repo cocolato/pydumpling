@@ -1,9 +1,9 @@
 //! Native value walker for pydumpling's bounded snapshots.
 //!
 //! The pure-Python walk in `pydumpling/snapshot/values.py` is the reference
-//! implementation, and [`walker::Walker`] mirrors it step for step: the same
-//! memo, node budget, truncation counters, and copies, so a snapshot pickles
-//! to the same bytes whichever walk produced it. The walker never runs
+//! implementation, and [`walker::Walker`] mirrors it step for step, on the
+//! context's own memo, node budget and truncation counters, so a snapshot
+//! pickles to the same bytes whichever walk produced it. The walker never runs
 //! application code: where the Python walk would, or where its result would
 //! depend on its own recursion limit, the walker undoes what the call did
 //! and hands the whole call back to Python before any such code runs, so
@@ -13,15 +13,12 @@
 //! `PYDUMPLING_NATIVE=0`, pydumpling captures with the Python walk alone.
 #![forbid(unsafe_code)]
 
+mod address;
 mod arguments;
 mod copies;
 mod dispatch;
-mod flush;
 mod keys;
 mod mapping;
-pub mod memo;
-mod mirror;
-mod release;
 mod shadow;
 mod statics;
 mod text;
@@ -42,5 +39,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<StaticsHandle>()?;
     module.add_class::<Walker>()?;
     module.add_class::<Dispatch>()?;
+    // What `rust/build_native.py` built this from: see its `fingerprint`.
+    module.add("fingerprint", option_env!("PYDUMPLING_NATIVE_FINGERPRINT"))?;
     Ok(())
 }

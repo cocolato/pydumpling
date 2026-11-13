@@ -4,11 +4,11 @@
 
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString};
+use pyo3::types::{PyDict, PyInt, PyString};
 
-use crate::statics::{address, type_address, Statics};
+use crate::statics::{type_address, Statics};
 use crate::types::fresh_dict;
-use crate::walker::{Entry, Halt, Slot, State, Walk};
+use crate::walker::{Halt, State, Walk};
 
 /// Whether `chars` code points surely fit in `limit` UTF-8 bytes: each takes
 /// at most four, so the Python helper's encode-and-compare returns the
@@ -91,29 +91,17 @@ impl State {
         self.before_python(py)
     }
 
-    /// `SnapshotContext._remember`.
+    /// `SnapshotContext._remember`, for the original whose id is `id`.
     pub(crate) fn remember<'py>(
-        &mut self,
+        &self,
+        py: Python<'py>,
+        id: &Bound<'py, PyInt>,
         original: &Bound<'py, PyAny>,
         captured: Bound<'py, PyAny>,
-    ) -> Bound<'py, PyAny> {
-        let key = address(original);
-        if type_address(&captured) == self.s.truncated_type {
-            self.truncated.push(key);
-        }
-        let entry = Entry {
-            slot: Slot::Value(captured.clone().unbind()),
-            original: original.clone().unbind(),
-        };
-        if self
-            .memo
-            .insert(key, entry)
-            .is_some_and(|slot| slot < self.mirrored)
-        {
-            // `ctx.objects` still holds the copy this one replaces.
-            self.dirty.push(key);
-        }
-        captured
+    ) -> Walk<Bound<'py, PyAny>> {
+        self.objects(py)?.set_item(id, &captured)?;
+        self.sources(py)?.set_item(id, original)?;
+        Ok(captured)
     }
 
     /// `SnapshotContext._text` for an exact str.
@@ -253,23 +241,6 @@ impl State {
         }
         // A lone surrogate does not convert; Python formats it.
         Ok(PyString::new(py, "<%s snapshot>").rem(type_name)?)
-    }
-
-    /// The placeholder of an exact tuple or frozenset met again while it is
-    /// still being filled, built on first use and then memoized.
-    pub(crate) fn placeholder<'py>(
-        &mut self,
-        py: Python<'py>,
-        key: usize,
-    ) -> Walk<Bound<'py, PyAny>> {
-        let Some(entry) = self.memo.get(key) else {
-            unreachable!("a placeholder is only built for a memoized original");
-        };
-        let original = entry.original.bind(py).clone();
-        let type_name = self.type_name(py, &original)?;
-        let reason = self.s.recursive_immutable.bind(py).clone();
-        let placeholder = self.truncated(py, &reason, &type_name)?;
-        Ok(self.remember(&original, placeholder))
     }
 }
 

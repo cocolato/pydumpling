@@ -77,8 +77,6 @@ class SnapshotContext(ValuesMixin, FramesMixin, ExceptionsMixin):
             if options.is_unlimited
             else (_CODE_TEXT_LIMIT, _CODE_BYTES_LIMIT)
         )
-        # Last, so that ``_walker`` is the instance dict's last key and the
-        # walker is released after ``objects`` and ``_sources``.
         self._start_walker()
 
     def metadata(self):

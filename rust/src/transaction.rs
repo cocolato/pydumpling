@@ -9,16 +9,15 @@
 //! good.
 
 use std::ptr::addr_of;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 
 use pyo3::exceptions::{PyRecursionError, PyReferenceError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple, PyType};
+use pyo3::types::PyDict;
 
 use crate::arguments::{parse, Parsed};
 use crate::dispatch::prepend;
-use crate::shadow::attributes;
 use crate::walker::{Call, Halt, State, Walk};
 
 /// Native stack the walk may use before handing a call back to Python.
@@ -43,35 +42,27 @@ const LOOK_LIMIT: u64 = 1024;
 /// `sys.monitoring` tool ids, 0 to 5.
 const MONITORING_TOOLS: u8 = 6;
 
-/// What `ctx._walker` holds while the Python walk takes a call from the
-/// walker: the context then captures in Python, as with `None`, and a copy
-/// of it, which shares the dicts the walker wrote before the call, makes
-/// the walker write each later call's copies at once.
-#[pyclass(module = "pydumpling._native", frozen)]
-#[derive(Default)]
-pub struct HandBack {
-    copied: AtomicBool,
-}
-
-#[pymethods]
-impl HandBack {
-    /// Notes a copy of the context: the walker's copies are written.
-    fn flush(&self) {
-        self.copied.store(true, Relaxed);
-    }
-
-    /// Pickles and copies as `None`, as the walker does.
-    fn __reduce__<'py>(&self, py: Python<'py>) -> (Bound<'py, PyType>, Bound<'py, PyTuple>) {
-        self.flush();
-        (py.None().into_bound(py).get_type(), PyTuple::empty(py))
-    }
-}
-
 impl State {
     /// The snapshot context of the call in progress.
     pub(crate) fn ctx<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         match &self.ctx {
             Some(ctx) => Ok(ctx.bind(py).clone()),
+            None => Err(PyReferenceError::new_err("the walker is not capturing")),
+        }
+    }
+
+    /// `ctx.objects`, as the call in progress read it.
+    pub(crate) fn objects<'a, 'py>(&'a self, py: Python<'py>) -> PyResult<&'a Bound<'py, PyDict>> {
+        match &self.objects {
+            Some(objects) => Ok(objects.bind(py)),
+            None => Err(PyReferenceError::new_err("the walker is not capturing")),
+        }
+    }
+
+    /// `ctx._sources`, as the call in progress read it.
+    pub(crate) fn sources<'a, 'py>(&'a self, py: Python<'py>) -> PyResult<&'a Bound<'py, PyDict>> {
+        match &self.sources {
+            Some(sources) => Ok(sources.bind(py)),
             None => Err(PyReferenceError::new_err("the walker is not capturing")),
         }
     }
@@ -106,22 +97,19 @@ impl State {
     ) -> PyResult<Bound<'py, PyAny>> {
         self.ctx = Some(ctx.clone().unbind());
         self.toolless.store(false, Relaxed);
-        let result = self
-            .arm(ctx)
-            .and_then(|()| self.refresh(py))
-            .and_then(|usable| {
-                if !usable {
-                    return self.retire(py, call);
-                }
-                match parse(self.s, call)? {
-                    Some(parsed) => self.transaction(py, call, &parsed),
-                    // An argument the walker cannot read without running
-                    // application code: Python takes the call as it was made.
-                    None => self.hand_back(py, call),
-                }
-            });
-        self.ctx = None;
-        self.attributes = None;
+        let result = self.refresh(py).and_then(|usable| {
+            if !usable {
+                return self.retire(py, call);
+            }
+            match parse(self.s, call)? {
+                Some(parsed) => self.transaction(py, call, &parsed),
+                // An argument the walker cannot read without running
+                // application code: Python takes the call as it was made.
+                None => self.hand_back(py, call),
+            }
+        });
+        (self.ctx, self.attributes) = (None, None);
+        (self.objects, self.sources) = (None, None);
         result
     }
 
@@ -134,8 +122,9 @@ impl State {
         let truncation = self.truncation.bind(py).clone();
         let saved = truncation.copy()?;
         let nodes = self.nodes;
-        let dirty = self.dirty.len();
-        self.memo.begin();
+        let (objects, sources) = (self.objects(py)?.clone(), self.sources(py)?.clone());
+        self.marks = (objects.len(), sources.len());
+        self.replaced.clear();
         self.added_namespaces.clear();
         self.frames = 0;
         self.headroom = self.start_headroom(py)?;
@@ -168,8 +157,7 @@ impl State {
                 Err(err)
             }
             Err(Halt::Bail) => {
-                self.memo.rollback();
-                self.dirty.truncate(dirty);
+                self.rollback(py, &objects, &sources)?;
                 self.nodes = nodes;
                 truncation.clear();
                 truncation.update(saved.as_mapping())?;
@@ -182,19 +170,42 @@ impl State {
         }
     }
 
-    /// Keeps what the call did: its copies, and the node count, written to
-    /// the instance dict as stock attribute access writes it.
+    /// Keeps what the call did: its copies are in `objects` already, and
+    /// the node count is written to the instance dict as stock attribute
+    /// access writes it.
     fn commit(&mut self, py: Python<'_>) -> PyResult<()> {
-        self.memo.commit();
+        self.replaced.clear();
         if let Some(attributes) = &self.attributes {
             attributes
                 .bind(py)
                 .set_item(intern!(py, "_nodes"), self.nodes)?;
         }
-        if self.eager {
-            // Python code the walk ran, as a collection's callbacks, may have
-            // changed the dicts since the call's sync checked them.
-            self.flush(py, false)?;
+        Ok(())
+    }
+
+    /// Takes out of `objects` and `_sources` what the call wrote there, so
+    /// the Python walk starts from the dicts as the call found them: each
+    /// copy the call replaced goes back where it was, and the entries it
+    /// added, which a dict keeps after its older ones, are removed.
+    fn rollback(
+        &mut self,
+        py: Python<'_>,
+        objects: &Bound<'_, PyDict>,
+        sources: &Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        for (key, copy) in self.replaced.drain(..).rev() {
+            objects.set_item(key, copy)?;
+        }
+        for (dict, mark) in [(objects, self.marks.0), (sources, self.marks.1)] {
+            let added = dict.len().saturating_sub(mark);
+            let newest_first = dict.call_method0(intern!(py, "__reversed__"))?;
+            let keys: Vec<_> = newest_first
+                .try_iter()?
+                .take(added)
+                .collect::<PyResult<_>>()?;
+            for key in keys {
+                dict.del_item(key)?;
+            }
         }
         Ok(())
     }
@@ -212,8 +223,9 @@ impl State {
         Ok(())
     }
 
-    /// Runs `call` in the Python walk from the walker's state, then adopts
-    /// the state the Python walk leaves, whether it returned or raised.
+    /// Runs `call` in the Python walk, from the state the call found. The
+    /// context holds no walker meanwhile, so it captures in Python
+    /// throughout, as does a copy made of it then.
     fn hand_back<'py>(
         &mut self,
         py: Python<'py>,
@@ -221,69 +233,24 @@ impl State {
     ) -> PyResult<Bound<'py, PyAny>> {
         self.handbacks += 1;
         let ctx = self.ctx(py)?;
-        // The Python walk must see every copy the walker holds, in the dicts
-        // this call synced with. The node count needs no write:
-        // `ctx._nodes` already holds it, as a transaction publishes it on
-        // commit and a rollback restores it.
-        self.flush(py, false)?;
-        // Without its walker the context captures in Python throughout.
         let name = intern!(py, "_walker");
         let walker = self.s.object_getattribute.bind(py).call1((&ctx, name))?;
-        let lent = Bound::new(py, HandBack::default())?;
-        self.set_walker(py, &ctx, lent.as_any())?;
+        self.set_walker(py, &ctx, &py.None().into_bound(py))?;
         let result = prepend(&ctx, call.args).and_then(|args| call.pure.call(args, call.kwargs));
-        let restored = self.set_walker(py, &ctx, &walker);
-        if lent.get().copied.load(Relaxed) {
-            // A copy shares the dicts from now on.
-            self.eager = true;
-        }
-        // Until a sync rechecks, which this resync may not reach.
-        self.unchecked = true;
-        let synced = self.resync(py, &ctx);
-        restored?;
-        synced?;
+        self.set_walker(py, &ctx, &walker)?;
         result
     }
 
-    /// Gives the context to the Python walk for good, with every copy the
-    /// walker made where the Python walk would have put it, in the dicts
-    /// last synced with, and runs `call` there.
+    /// Gives the context to the Python walk for good, and runs `call`
+    /// there.
     fn retire<'py>(
         &mut self,
         py: Python<'py>,
         call: &Call<'_, 'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ctx = self.ctx(py)?;
-        self.flush(py, false)?;
-        self.memo.clear();
-        self.mirror = None;
-        self.mirrored = 0;
-        self.sources_mirrored = 0;
-        self.sources_last = None;
         self.set_walker(py, &ctx, &py.None().into_bound(py))?;
         call.pure.call(prepend(&ctx, call.args)?, call.kwargs)
-    }
-
-    /// [`State::sync`] with the dicts the context holds after a hand-back,
-    /// read from its instance dict; `false` if they are not exact dicts or
-    /// the context is no longer one the walker mirrors, which the next
-    /// call's refresh then reports.
-    pub(crate) fn resync(&mut self, py: Python<'_>, ctx: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let Some(attributes) = attributes(py, self.s, &self.ctx_type, ctx)? else {
-            return Ok(false);
-        };
-        let objects = attributes.get_item(intern!(py, "objects"))?;
-        let sources = attributes.get_item(intern!(py, "_sources"))?;
-        match (
-            objects.map(Bound::cast_into_exact::<PyDict>),
-            sources.map(Bound::cast_into_exact::<PyDict>),
-        ) {
-            (Some(Ok(objects)), Some(Ok(sources))) => {
-                self.sync(py, objects, sources)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
     }
 }
 
