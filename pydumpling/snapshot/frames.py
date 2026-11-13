@@ -3,6 +3,7 @@
 import builtins
 import itertools
 import linecache
+import sys
 from collections import deque
 
 from ..fake_types import FakeCode, FakeFrame, FakeTraceback
@@ -15,7 +16,7 @@ class FramesMixin:
         limit = self.options.max_items
         if limit is None:
             return tuple(values)
-        items = tuple(itertools.islice(values, limit + 1))
+        items = tuple(itertools.islice(values, min(limit + 1, sys.maxsize)))
         if len(items) > limit:
             self._truncation["max_items"] += 1
         return items[:limit]

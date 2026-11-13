@@ -17,7 +17,7 @@ from ..options import DumpOptions
 from .exceptions import ExceptionsMixin
 from .frames import FramesMixin
 from .identity import _CLASS_MODULE, _CLASS_QUALNAME
-from .values import ValuesMixin
+from .values import ValuesMixin, _walk_methods
 
 # Code metadata (file names, function and class names, variable and name
 # tables) is diagnostic structure, not application data. Truncating it yields
@@ -77,6 +77,7 @@ class SnapshotContext(ValuesMixin, FramesMixin, ExceptionsMixin):
             if options.is_unlimited
             else (_CODE_TEXT_LIMIT, _CODE_BYTES_LIMIT)
         )
+        self._start_walker()
 
     def metadata(self):
         return {
@@ -200,3 +201,7 @@ class SnapshotContext(ValuesMixin, FramesMixin, ExceptionsMixin):
             return True
         except Exception:
             return False
+
+
+# The native walker stands in for exactly these methods; see _start_walker.
+SnapshotContext._stock_walk = _walk_methods(SnapshotContext)

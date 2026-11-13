@@ -38,6 +38,50 @@ jobs:
       - name: Test with coverage
         run: uv run --locked pytest --cov=pydumpling --cov-report=term-missing --cov-fail-under=85
 
+  native:
+    name: Native walker, Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {python: '3.12', os: ubuntu-latest}
+          - {python: '3.13', os: ubuntu-latest}
+          - {python: '3.14', os: ubuntu-latest}
+          - {python: '3.15', os: ubuntu-latest}
+          - {python: '3.14', os: windows-latest}
+          - {python: '3.14', os: macos-latest}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked --dev --python python
+      - name: Build the extension
+        run: uv run --locked python rust/build_native.py
+      - name: Verify the walker captures
+        run: uv run --locked python -c "from pydumpling import DumpOptions; from pydumpling.snapshot import SnapshotContext; context = SnapshotContext(DumpOptions()); assert context._walker is not None; assert context.value([1, (2,)]) == [1, (2,)]; assert context._walker.handbacks == 0"
+      - name: Test with the native walker
+        run: uv run --locked pytest
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
   quality:
     runs-on: ubuntu-latest
     steps:

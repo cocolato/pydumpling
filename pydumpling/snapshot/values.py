@@ -2,6 +2,8 @@
 
 import builtins
 import itertools
+import os
+import sys
 import types
 from collections import OrderedDict
 
@@ -18,7 +20,40 @@ from ..fake_types import (
     FakeTuple,
     TruncatedValue,
 )
-from .identity import _CLASS_DICT, _derives, _type_mro
+from ..options import DumpOptions  # noqa: F401  # the native walker's table reads it
+from . import identity as _identity
+from .identity import _CLASS_DICT, _CLASS_MRO, _derives, _type_mro
+
+_native = None
+if (
+    sys.version_info >= (3, 12)
+    and os.environ.get("PYDUMPLING_NATIVE") != "0"
+    and not sys.flags.bytes_warning
+):
+    # The optional native walker; this module stays the reference walk.  On
+    # Python 3.11, C calls count toward the recursion limit, so a call the
+    # walker hands back here could overflow where this walk alone would not.
+    # ``PYDUMPLING_NATIVE=0`` at import leaves the module out entirely.  So
+    # does ``python -b``, a flag fixed for the life of the process: comparing
+    # bytes with str warns there, and the walker's own dict and set lookups
+    # and inserts, which a call it hands back makes this walk repeat, would
+    # warn where this walk does not, or twice.  A free-threaded build is
+    # left out too: a stable-ABI extension does not fit its object layout,
+    # and one built for it would run without the GIL the walker relies on.
+    # A build whose configuration does not load, as a frozen application
+    # without its sysconfig data, captures in Python as well.
+    import sysconfig
+
+    try:
+        if not sysconfig.get_config_var("Py_GIL_DISABLED"):
+            from .. import _native
+    except ImportError:
+        pass
+
+
+# The reason of an immutable container's placeholder.  One shared object, so
+# the native walker's placeholders pickle to the same bytes as these.
+_RECURSIVE_IMMUTABLE = "recursive immutable reference"
 
 # Each builtin container base maps to the copy type of its exact instances and
 # the snapshot subclass for instances of its subclasses.
@@ -83,9 +118,112 @@ def _scalar_copy_type(value):
 # The value memo legitimately stores None; only this sentinel means "new".
 _UNMEMOIZED = object()
 
+# The context methods the native walker carries out itself.  A context class
+# that overrides any of them captures in Python, which calls the override.
+_NATIVE_WALK = (
+    "value",
+    "_mapping",
+    "_attribute_mapping",
+    "_root_value",
+    "_fill_copy",
+    "_filled_slot",
+    "_scalar",
+    "_layout",
+    "_attributes",
+    "_remember",
+    "_has_nodes",
+    "_omit",
+    "_type_name",
+    "_bounded_text",
+    "_bounded_bytes",
+    "_text",
+    "_code_text",
+)
+
+
+# How the Python walk reads and writes the context's own state.
+_STATE_ACCESS = ("__getattribute__", "__setattr__", "__delattr__")
+
+# The context state the native walker, and the helpers it calls, read or
+# write.  The walker reads it from the instance dict; a class attribute of
+# one of these names, such as a property, is what the Python walk reads
+# instead, so the context then captures in Python.
+_NATIVE_STATE = (
+    "options",
+    "_code_text_limit",
+    "_unlimited",
+    "_truncation",
+    "_namespaces",
+    "objects",
+    "_sources",
+    "_nodes",
+    "_node_marker",
+    "_layouts",
+    "_walker",
+)
+
+
+def _walk_methods(cls):
+    """The class attributes of ``cls`` the native walker relies on.
+
+    For each walk method, attribute access hook and state name, the class
+    attribute an instance of ``cls`` finds, or None, read from the class
+    dicts along the MRO without calling its ``__get__`` or any metaclass
+    hook, as the native walker reads them before every call.
+    """
+    namespaces = [
+        _CLASS_DICT.__get__(base, type(base))
+        for base in _CLASS_MRO.__get__(cls, type(cls))
+    ]
+    return tuple(
+        next((namespace[name] for namespace in namespaces if name in namespace), None)
+        for name in _NATIVE_WALK + _STATE_ACCESS + _NATIVE_STATE
+    )
+
+
+def _frame_locals_type():
+    """A function's locals type, if the runtime permits frame inspection."""
+    try:
+        frame = sys._getframe()
+    except Exception:
+        # Audit policies can forbid frame access. Only the locals-proxy fast
+        # path needs this type; other values can still be captured natively.
+        return None
+    try:
+        return type(frame.f_locals)
+    finally:
+        del frame
+
 
 class ValuesMixin:
     """Value capture shared by the composed :class:`SnapshotContext`."""
+
+    # The native walker capturing for this context, if any.
+    _walker = None
+    # The walk methods of the composed context class, which records them.
+    _stock_walk = None
+
+    def _start_walker(self):
+        """Capture through the native walker when it is built.
+
+        The walker mirrors this module step for step, on this context's own
+        ``objects`` and ``_sources``; ``PYDUMPLING_NATIVE=0`` keeps the
+        Python walk.  Before every call the walker checks, without running
+        application code, that this context's state is one it mirrors and
+        its class runs the stock walk; otherwise, as for an unlimited
+        snapshot, where probing each original with the serializer dominates
+        the cost, an options subclass, or a context class that overrides a
+        walk method, attribute access or a state attribute, it hands the
+        context to the Python walk for good.  Nothing here reads the context
+        through its class's hooks, which the Python walk would not run.  The
+        walker keeps nothing of the context between calls: a shallow copy
+        shares it, and a pickle or deep copy holds ``None`` in its place.
+        """
+        if _native is None or os.environ.get("PYDUMPLING_NATIVE") == "0":
+            return
+        stock = object.__getattribute__(self, "_stock_walk")
+        if stock is not None:
+            object.__setattr__(self, "_walker", _native.Walker(_STATICS, stock))
 
     def _layout(self, value):
         """Member descriptors and named tuple fields of ``type(value)``, cached."""
@@ -246,9 +384,7 @@ class ValuesMixin:
                 value,
                 captured
                 if mutable
-                else TruncatedValue(
-                    "recursive immutable reference", self._type_name(value)
-                ),
+                else TruncatedValue(_RECURSIVE_IMMUTABLE, self._type_name(value)),
             )
             count = 0
             # Iterate through the base type: a subclass ``__iter__`` must be
@@ -401,7 +537,9 @@ class ValuesMixin:
             # One extra key lets the loop below report truncation.
             chosen = dict.fromkeys(
                 id(key)
-                for key in itertools.islice(keys, None if limit is None else limit + 1)
+                for key in itertools.islice(
+                    keys, None if limit is None else min(limit + 1, sys.maxsize)
+                )
             )
             remaining = len(chosen)
             for key, item in view:
@@ -456,3 +594,36 @@ class ValuesMixin:
             for identity in list(itertools.islice(self.objects, mark, None)):
                 del self.objects[identity]
             return self._remember(item, self._omit("recursion", item))
+
+
+if _native is not None:
+    try:
+        # The walker's table of this module's classes and helpers, so a
+        # reloaded or vendored copy of the package has its own.
+        _STATICS = _native.Statics(globals(), _identity)
+        # A native descriptor sends each call to the context's walker, or to
+        # the method below when it has none, without adding a Python frame:
+        # the Python walk then overflows its recursion limit exactly where
+        # it would.  A walker is built once here as each context builds one.
+        _native.Walker(_STATICS, ())
+        _DISPATCH = (
+            _native.Dispatch(ValuesMixin.value, owner=ValuesMixin),
+            _native.Dispatch(ValuesMixin._mapping, mapping=True, owner=ValuesMixin),
+        )
+    except Exception as error:
+        # An extension built for another version of this module, which lacks
+        # what it reads here or takes other arguments: the package it only
+        # speeds up still imports.
+        import warnings
+
+        warnings.warn(
+            "pydumpling's native walker does not match this version of "
+            f"pydumpling and is not used ({error!r}); rebuild it with "
+            "rust/build_native.py",
+            RuntimeWarning,
+            stacklevel=1,
+        )
+        _native = None
+    else:
+        ValuesMixin.value, ValuesMixin._mapping = _DISPATCH
+        del _DISPATCH

@@ -3,6 +3,7 @@
 import builtins
 import itertools
 import reprlib
+import sys
 import traceback
 from dataclasses import replace
 
@@ -70,7 +71,10 @@ class ExceptionsMixin:
         # Basic exception information has a small reserved budget: exhausting
         # the application's value graph must not erase the reason it failed.
         converted = []
-        for arg in itertools.islice(args, self.options.max_items):
+        limit = self.options.max_items
+        for arg in itertools.islice(
+            args, None if limit is None else min(limit, sys.maxsize)
+        ):
             if type(arg) is str:
                 converted.append(self._text(arg))
             elif type(arg) is bool or type(arg) is float or arg is None:
