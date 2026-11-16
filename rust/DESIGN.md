@@ -118,7 +118,8 @@ Python walk reproduces: an argument shape pydumpling's callers never pass
 (a depth that is not an exact int or exceeds 2**62 in magnitude, a
 `priority` that is not an exact tuple, list, set or frozenset of exact
 strs, `counted` other than `True` or `False`, a `container` other than
-`dict` or `FakeDict`); `objects`, `_nodes` or `options` missing,
+`dict` or `FakeDict`); a class that could not be judged ("How Python
+hooks in"); `objects`, `_nodes` or `options` missing,
 `objects` not an exact dict, or `_nodes` not an exact int from 0 to
 2**64 - 1; options the walker does not read ("State reads"), or a budget
 missing or not `None` or a positive exact int; `_unlimited` other than
@@ -161,8 +162,9 @@ instance's own `True` is not kept; on a class judged `False`, where
 nothing in pydumpling sets one, the context then captures in Python.
 While the flag is false every call in the subtree runs the reference body:
 no native frames, no extra Python frames, no C stack per level, and no
-child returns to the walker. `ValuesMixin.value` is the one Python
-function the walker calls. A node goes there, decided from the stack or
+child returns to the walker. `ValuesMixin.value` is the one walk function
+the walker calls (besides `_choose_walk`, where an entry judges a class).
+A node goes there, decided from the stack or
 its type before it has done anything, when it is:
 
 - met past the native stack budget, since the native walk's recursion
@@ -220,12 +222,18 @@ walk alone would.
 An entry first checks that the context's class was judged: the class
 `_stock` named, or one whose `_native_walk_class` names itself, read
 through the MRO, or from the class's own dict under a metaclass other than
-`type`; otherwise it judges the class with `_choose_walk`, and gives the
-call to the Python walk if the class does not keep the native walk, or if
-the stack has no room for that one Python call (the class is then judged
-at a later call). On a class not judged, that read runs the code of a key
-or descriptor planted under the name, which the Python walk never reads
-("Accepted differences"). It
+`type`; otherwise it judges the class with `_choose_walk` and gives the
+call to the Python walk if the class does not keep the native walk. Where
+judging fails (an exception, such as a `RecursionError` where the stack
+has no room for `_choose_walk`'s frames, or a metaclass descriptor that
+keeps the verdict from the class dict), it retires the context ("Per
+instance"), whose calls then run as the Python walk runs them, raising
+where it raises, and judge nothing again; another instance judges the
+class. Where the extension is not loaded, `_judge_in_python` stands in
+for both entries and chooses the Python walk for such a class. On a class
+not judged, the read and the judging run the code of a key or descriptor
+planted under `_native_walk_class` or `_native_walk`, which the Python
+walk never reads ("Accepted differences"). It
 returns the copy, raises what the Python walk would raise, or returns
 `_IN_PYTHON` before the call has done anything. When an exception ends a
 call, the walker writes `_nodes` and raises, keeping what it did, as the
@@ -242,11 +250,12 @@ starts; `_sources`, `_truncation`, `_namespaces`, `_node_marker`,
 each, which is where the Python walk first reads it. Each is read once per
 call, and only `_nodes` again: after Python code, and for a captured dict
 that holds a `_nodes` key while the context does not hold the walk's count
-(below). On a judged class these reads run no code. Where Python code
-deleted `_nodes`, the walker reads it again where the Python walk next
-reads it (the node check under `max_nodes`, or the next count), so the
-capture raises the same `AttributeError` there, and it writes no count
-that would make the attribute again.
+(below). On a judged class these reads run no code. Where Python code the
+walker runs at a synced point (`application`, Python mode) deleted
+`_nodes`, the walker reads it again where the Python walk next reads it
+(the node check under `max_nodes`, or the next count), so the capture
+raises the same `AttributeError` there, and it writes no count that would
+make the attribute again.
 
 A captured dict may be the context's own instance dict ("Capturing again
 from inside a call"), whose `_nodes` the Python walk reads as the running
@@ -498,7 +507,8 @@ program and every server with a SIGTERM handler.
   except for the finalizers and weak reference callbacks of objects the
   walker lets go of, the key comparisons of objects planted in `objects`,
   `_sources`, `_namespaces` or `_layouts`, a key or descriptor planted
-  under `_native_walk_class` on a class not judged, and what a signal
+  under `_native_walk_class` or `_native_walk` on a class not judged, or a
+  data descriptor its metaclass defines under either, and what a signal
   handler or a collection runs while `FakeContainer.__hash__` runs. Types
   are compared by address, class attributes read through `type.__dict__`
   descriptors, containers through their builtin base's unbound methods,
@@ -526,7 +536,7 @@ Each goes beyond the approved contract and waits for the owner ("Open
 problems").
 
 - **The walk is chosen when a context class is created** (or at its first
-  instance). A walk method or state attribute changed on the class
+  native call, for a class created past `ValuesMixin.__init_subclass__`). A walk method or state attribute changed on the class
   afterwards, or a walk method set on an instance, is not seen by a native
   context: a method patched onto `SnapshotContext` after import runs under
   `PYDUMPLING_NATIVE=0` only. A state property or attribute hook patched on
@@ -538,14 +548,18 @@ problems").
   restores the stock attributes. To have a change run, set
   `PYDUMPLING_NATIVE=0` or `_native_walk = False`, or subclass after it.
   To tell whether a class was judged, pydumpling reads its private
-  `_native_walk_class` from it, natively only: at each native entry, and
-  judging a class created past `ValuesMixin.__init_subclass__` at its first
-  native call writes the name. A key planted in the dict of such a class,
-  or of a base ahead
-  of `SnapshotContext`, that hashes like the name runs its `__eq__` there,
-  once to three times, and a descriptor defined under the name its
-  `__get__`, once (at an entry, under the metaclass `type` only). The
-  Python walk never reads the name; the capture is the same.
+  `_native_walk_class` from it, natively only, at each native entry, and
+  judging a class created past `ValuesMixin.__init_subclass__`, at its
+  first native call, reads `_native_walk` from its dict and writes both
+  names. A key planted in the dict of such a class, or of a base ahead of
+  `SnapshotContext`, that hashes like either name runs its `__eq__` there,
+  a number of times that varies with the version (up to 9 on 3.14), a
+  descriptor defined under `_native_walk_class` its `__get__` (at an entry,
+  under the metaclass `type` only), and a data descriptor the metaclass
+  defines under either name its `__set__`. The Python walk runs none of
+  them. Where such code raises, the entry retires the context and the
+  capture is the Python walk's; where it captures through the context, it
+  does so inside that first call, and the snapshot differs.
 - **Options are judged once per type, budgets read once per call.** A
   property or `__getattribute__` patched onto `DumpOptions` or a subclass
   after its verdict, or a key planted in its class dict that hashes like a
@@ -564,10 +578,12 @@ problems").
   call's copies, where the Python walk puts them in the new dicts, so a
   later call captures those values again and counts their nodes again.
   Changes to the same dicts are seen at once. `_nodes` rebound to an exact
-  int from 0 to 2**64 - 1 is read back at once; rebound to anything else
-  (a negative int or a larger one, a float, an int subclass), the walker
-  counts on from its own count and writes it there at its next sync, where
-  the Python walk counts on from that value.
+  int from 0 to 2**64 - 1 is read back at once; rebound to anything else,
+  the walker counts on from its own count and writes it there at its next
+  sync, where the Python walk counts on from that value (a negative int or
+  a larger one, a float, an int subclass) or raises `TypeError` at its next
+  read (`None`, a str, any other value that does not compare with or add
+  to an int).
 - **The count is stale between synced points.** Code that runs there runs
   as often as in the Python walk but sees `_nodes` as of the last sync: a
   finalizer or weak reference callback run as the walker lets go of a value
@@ -578,7 +594,9 @@ problems").
   another thread that runs while `FakeContainer.__hash__` runs. A capture
   through the same context from there starts from that count, and the
   walker then writes its own count over the one it left, so its nodes
-  count toward no budget. pydumpling writes only ids there. Such a key of
+  count toward no budget; a deletion of `_nodes` from there is undone the
+  same way, where the Python walk raises `AttributeError` at its next read
+  of it. pydumpling writes only ids there. Such a key of
   `_layouts` also runs less often: the walker looks a class's layout up
   once and keeps it until it next syncs, where the Python walk looks it up
   for every value that needs it. For three instances of one tuple subclass
@@ -774,111 +792,84 @@ workloads of `workloads.py`.
 
 ### Native against pure
 
-Gate run of 2026-11-16, 00:52 to 01:13 UTC, from an isolated copy (tree
-`cfb27f5659fd1945`): macOS 27 arm64, Apple M5 Pro, fat-LTO release build
-without PGO, CPython 3.13.18 and 3.14.10, load average 0.9 to 1.5. All 49
-scenarios pass on 3.13 and 48 on 3.14, where `call_live_bytes` failed the
-sweep at 1.052 but gives 1.003 alone over 15 rounds (0.989 in a later run);
-both modes run the same Python code for exact bytes. Contents match but
-where the native walk captures more near the limit. Native/pure:
+Gate run of 2026-11-16, 11:31 to 11:58 local time, at c4cc1d2, from an
+isolated copy (tree `73c4c38138d548d0`): macOS 27 arm64, Apple M5 Pro,
+fat-LTO release build without PGO, CPython 3.13.18 and 3.14.10, load
+average 2.5 to 5.7 (other processes busy). All 51 scenarios pass on 3.14,
+and on 3.13 all but `call_new_int`, at 1.024 over 15 rounds: a new context
+then checked in `__init__` whether its class was judged, which made
+`SnapshotContext()` 1.5% slower natively (1.79 against 1.76 us, median of
+9 alternating rounds). e47e264 moved that check into the native entry;
+there `SnapshotContext()` takes 0.99 of the Python walk's time, and the
+per-call and context-subclass scenarios, rerun from a clean clone of that
+commit (12:42 to 12:52, load 2.4 to 3.6), pass on both versions:
+`call_new_int` at 1.008 on 3.13 and 0.998 on 3.14 over 15 rounds, the
+other per-call paths answered before the entry at 0.977 to 1.011, and the
+context subclasses at 0.992 to 1.003. Contents match but where the native
+walk captures more near the limit. Native/pure at c4cc1d2, but for the
+row marked e47e264:
 
                                              3.13          3.14
-    six workloads, geometric mean            0.32          0.36
-      per workload                           0.16-0.68     0.19-0.71
-      b2, no budgets, ms native / pure       13.6 / 57.0   13.8 / 48.6
-    _mapping of a typical frame, any depth   0.16          0.19-0.20
-    from_frame, 20 / 700 frames deep         0.42 / 0.47   0.45 / 0.51
-    dump_current_traceback, 20 / 700         0.68 / 0.70   0.69 / 0.71
-    no hook                                  0.42          0.50
-    settrace / setprofile / cProfile         0.27/0.17/0.14  0.27/0.18/0.15
-    sys.monitoring / coverage sysmon, ctrace 0.38/0.41/0.16  0.44/0.49/0.17
-    dense frames                             0.18-0.25     0.21-0.30
-    options subclasses                       0.16-0.17     0.20-0.22
-    context subclass, unlimited (Python)     0.996-1.006   1.004-1.007
-    new context and a small dict             0.48          0.51
-    _mapping({}) on a live context           0.27          0.27
-    other per-call, answered before entry    0.975-1.012   0.981-1.052
-    2,000-level list, main / 512 KiB thread  0.74 / 0.96   0.73 / 0.92
-    300-object chain, main / 512 KiB thread  0.19 / 0.81   0.22 / 0.81
-    max_depth=100 frame, main / 512 KiB      0.18 / 0.21   0.20 / 0.24
-    except RecursionError                    0.31          0.35
-    near_limit_nodes                         0.35          0.44
-
-After the review's fixes 20 scenarios (the per-call ones, the workloads,
-`dense_scalar`, options and context subclasses) were run again from an
-isolated copy (tree `07c65e18b9473edb`, 06:38 to 06:51 UTC, load 4.0 to
-5.6): all pass on both versions, the workloads' geometric means are 0.32
-and 0.36, and every other ratio is within 0.02 of the table.
-
-After the second round, 28 scenarios (the per-call ones, the two added for
-`_layouts`, the dense frames, `hooks_none`, `mapping_d20`, `from_frame_*`,
-`dump_current_*` and the workloads) were run from an isolated copy (tree
-`85a2ae4fa973dfd0`, 08:19 to 08:33 UTC, load 3.7 to 6.8): all pass on both
-versions. `call_live_subclass` gives 0.70 and 0.86, `record_stack_d2000`
-0.56 and 0.63, the workloads' geometric means 0.32 and 0.37, and no other
-ratio is more than 0.03 above the table.
+    six workloads, geometric mean            0.31          0.36
+      per workload                           0.16-0.62     0.19-0.67
+      b2, no budgets, ms native / pure       15.3 / 61.2   19.2 / 56.0
+    _mapping of a typical frame, any depth   0.15-0.16     0.18-0.19
+    from_frame, 20 / 700 frames deep         0.41 / 0.46   0.46 / 0.50
+    dump_current_traceback, 20 / 700         0.65 / 0.69   0.74 / 0.70
+    no hook                                  0.42          0.49
+    settrace / setprofile / cProfile         0.27/0.16/0.13  0.27/0.17/0.14
+    sys.monitoring / coverage sysmon, ctrace 0.37/0.41/0.16  0.43/0.50/0.16
+    dense frames                             0.18-0.24     0.21-0.30
+    2,000-frame record stack                 0.55          0.65
+    options subclasses                       0.16-0.17     0.19-0.22
+    context subclass, unlimited (Python)     0.986-1.009   0.995-1.002
+    new context and a small dict             0.43          0.47
+    _mapping({}) on a live context           0.27          0.28
+    a live context's subclass instance       0.67          0.81
+    other per-call, answered before entry,
+      e47e264                                0.977-1.011   0.979-1.007
+    2,000-level list, main / 512 KiB thread  0.80 / 0.92   0.80 / 0.93
+    300-object chain, main / 512 KiB thread  0.19 / 0.82   0.22 / 0.84
+    max_depth=100 frame, main / 512 KiB      0.18 / 0.23   0.20 / 0.25
+    except RecursionError                    0.31          0.34
+    near_limit_nodes                         0.34          0.43
 
 ### Pure mode against main
 
-Run of 2026-11-16, 01:13 to 02:07 UTC, same copy, `--baseline` at main
-(`ed7ae81`, from `git archive`), load average 1.3 to 1.7: 43 of 49
-scenarios pass on 3.13 and 44 on 3.14, and all contents match main's (the
-branch's one intended change to the Python walk, that an `islice` bound
-past `sys.maxsize` no longer raises, shows in no scenario). Each FAIL was
-rerun alone and split by source with scratch trees: (a) HEAD against main,
-the PR's committed Python changes; (b) the uncommitted walker hunks
-against (a); (c) the owner's uncommitted hunks against (b). Medians of 15
-rounds, or of 3 at 1.05 or more:
-
-    scenario                 Python  alone  (a)    (b)    (c)
-    call_new_int             3.13    1.326  1.017  0.993  1.311
-                             3.14    1.301  1.008  0.991  1.320
-    call_new_dict            3.13    1.120  1.012  0.994  1.101
-                             3.14    1.110  1.000  0.997  1.113
-    workload_d_stdlib_...    3.13    1.181  1.002  0.999  1.162
-                             3.14    1.189  1.000  0.997  1.180
-    near_limit_nodes         3.13    1.021  0.998  1.016  1.022
-                             3.14    1.024  0.998  1.000  1.023
-    hooks_setprofile         3.13    1.021  1.005  0.999  1.019
-    mapping_d950             3.13    1.022  1.011  0.999  1.005
-    call_live_mapping        3.14    1.019 (passes alone)
-
-Most of it is (c): a new context reads `options.is_unlimited` once more for
-the command line's byte allowance (`SnapshotContext()` takes 2.42 us
-against 1.84 us on 3.13, 2.59 against 1.97 on 3.14), and source embedding
-reads each file again per capture instead of through `linecache`. With the
-allowance derived from `_code_text_limit` and the lines read kept in
-`linecache`, those scenarios come to 1.000 to 1.018 of main, but for
-`hooks_setprofile` on 3.13 at 1.022, whose unchanged control gave 1.018 in
-the same period (load 2.8 to 4.1).
-
-(a) cost `mapping_d950` 1.1% on 3.13: HEAD bounded `islice` with
-`min(limit + 1, sys.maxsize)`, a call per mapping, which the tree has
-replaced with a `ValueError` handler that costs nothing unless raised.
-
-The current tree was rerun against main (isolated copy
-`06a373342c873f0b`, 03:45 to 04:22 UTC, load 2.5 to 10). As it stands:
-`mapping_*` and `call_live_mapping` 1.003 to 1.009 on 3.13 and 1.016 to
-1.024 on 3.14 (four fail in one run, two in another), on 3.13 and 3.14
-`near_limit_nodes` 1.042 and 1.039 and `hooks_setprofile` 1.022 and 1.015,
-and the (c) scenarios as above. With
-the owner's two hunks changed as above, all of those pass on both versions
-but `call_live_mapping` on 3.14 (1.028, then 1.030) and `near_limit_nodes`
-on 3.13 (1.023, then 1.014). An A/A control (04:09 to 04:19, load 3.8 to
-4.9) gave 0.986 to 1.006 for main against a copy of itself, where the tree
-as it stands gave 1.008 to 1.019 for `mapping_d20`, `mapping_d900` and
-`call_live_mapping` and 1.037 to 1.038 for `near_limit_nodes`.
+Run of 2026-11-16, 12:02 to 12:31 local time, same copy, `--baseline` at
+main (`ed7ae81`, from `git archive`), CPython 3.13.18, load average 2.8 to
+3.9. 50 of 51 scenarios pass, 48 of them after 15 rounds at 0.978 to
+1.014 of main and 2 after 3 rounds (0.983 and 0.989), and all contents match main's (the branch's one intended
+change to the Python walk, that an `islice` bound past `sys.maxsize` no
+longer raises, shows in no scenario). `workload_b2_heavy_nolimits` failed
+its first three rounds (1.101, 1.056, 1.005), where the native run before
+it timed the same pure capture at 59.1 to 63.3 ms against main's 59.3 to
+63.1. Rerun at e47e264 from the clean clone (12:52 to 12:54, load 3.4 to
+4.5) it passes at 1.015 over 15 rounds, its single rounds ranging from
+0.924 to 1.295, with `call_new_int` at 0.999 and `call_new_dict` at
+1.009. On 3.14 the run was stopped after one round of
+40 scenarios, too few to judge (that round ranged from 0.961 to 1.135, at
+`mapping_d20`); earlier runs put `mapping_*` and `call_live_mapping` at
+1.016 to 1.024 of main there.
 
 What pure mode itself costs against main is the walker's hook in the
 Python walk: a load of `_native_walk` per `value` of a value that is not an
 exact scalar, a load and an `_unlimited is False` test per `_mapping`, and
 the `try` around `islice`. Counted with `sys.monitoring`, capturing a
 typical frame on a new context runs 37,228 bytecode instructions on main
-and 37,594 on the tree with the owner's hunks changed as above (1.0% more;
-37,724 as the tree stands); in time, up to about 1.5% on 3.13 and 3% on
-3.14 for calls dominated by `_mapping`'s entry. Removing it would take a
-second copy of the walk body or an extra Python frame, which the design
-rules out.
+and 37,594 on an earlier tree, with the owner's hunks changed as described
+below (1.0% more). Removing it would take a second copy
+of the walk body or an extra Python frame, which the design rules out.
+
+These runs leave out the owner's uncommitted changes to `context.py` and
+`frames.py`. Measured earlier against main, they cost both modes alike: a
+new context reads `options.is_unlimited` once more for the command line's
+byte allowance (`SnapshotContext()` took 2.42 us against 1.84 us on 3.13,
+2.59 against 1.97 on 3.14), and source embedding reads each file again per
+capture instead of through `linecache`, which made `call_new_int` 1.31,
+`call_new_dict` 1.10 to 1.11 and `workload_d_stdlib_embedall` 1.16 to 1.18
+of main. Deriving the allowance from `_code_text_limit` and keeping the
+lines read in `linecache` brought those to 1.000 to 1.018 of main.
 
 ### Reproducing
 
@@ -906,10 +897,11 @@ see its `--help`. A PGO build passes `-Cprofile-generate=DIR` through
 ## Open problems
 
 - For the owner: the accepted differences; the "never less" definition;
-  what pure mode costs against main (up to about 3% on 3.14 for calls
-  dominated by `_mapping`'s entry, over the 2% allowed); and the gate's
-  rule, under which one noisy sweep at 1.05 fails a scenario that passes
-  alone.
+  what pure mode costs against main (the walker's hook: 1.0% more
+  bytecode on a typical frame, measured before e47e264, and up to 1.024 of
+  main on 3.14 for calls dominated by `_mapping`'s entry in earlier runs,
+  over the 2% allowed and not measured again since); and the gate's rule,
+  under which one noisy sweep at 1.05 fails a scenario that passes alone.
 - The owner's uncommitted hunks cost both modes about 0.6 us per new
   context, and source embedding rereads files ("Pure mode against main").
 - Past the stack budget a deep value runs in Python mode at the Python

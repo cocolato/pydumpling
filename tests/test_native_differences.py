@@ -368,10 +368,10 @@ def test_a_dict_descriptor_planted_on_fake_class(native):
 
 # --- The walk is chosen when the class is created -----------------------------
 # Whether a context captures natively is decided when its class is created
-# (``ValuesMixin.__init_subclass__``, or the first ``SnapshotContext.__init__``
-# of a class created past it). A walk method patched onto its class afterwards,
-# or set on the instance, is not seen by a native context: the Python walk runs
-# it, the walker its own. The walker bounds strings and fills ``_layouts`` in
+# (``ValuesMixin.__init_subclass__``, or a native entry at the first native
+# call of a class created past it). A walk method patched onto its class
+# afterwards, or set on the instance, is not seen by a native context: the
+# Python walk runs it, the walker its own. The walker bounds strings and fills ``_layouts`` in
 # Rust, where the Python walk looks ``_text``, ``_code_text``,
 # ``_bounded_bytes`` and ``_layout`` up on the context, so no such hook runs for
 # them. The walker reads the context's state with attribute access, once per

@@ -44,6 +44,7 @@ import reprlib
 import signal
 import subprocess
 import sys
+import threading
 import types
 import warnings
 import weakref
@@ -6459,16 +6460,22 @@ def test_a_snapshot_copy_holding_the_context_s_dict(copy_class):
 
 
 @pytest.mark.parametrize("max_nodes", [None, 100], ids=["no budget", "max_nodes"])
-@pytest.mark.parametrize("after", ["a list", "a dict with a _nodes key", "nothing"])
+@pytest.mark.parametrize(
+    "after", ["a list", "a dict with a _nodes key", "a value captured", "nothing"]
+)
 def test_nodes_deleted_mid_call(after, max_nodes):
     """Application code the walker runs (here a tally's ``__add__``) that
     deletes ``_nodes``: the capture raises ``AttributeError`` where the
     Python walk next reads it (the node check under ``max_nodes``, otherwise
-    the next count), keeps what it did before, and leaves ``_nodes``
-    deleted, as in the Python walk."""
+    the next count, which a value captured before does not take), keeps
+    what it did before, and leaves ``_nodes`` deleted, as in the Python
+    walk."""
+    shared = [9]
+    heads = {"a value captured": [shared]}
     tails = {
         "a list": lambda: [[1, 2]],
         "a dict with a _nodes key": lambda: [{"_nodes": 0, "a": 1}],
+        "a value captured": lambda: [shared],
         "nothing": lambda: [],
     }
     found = {}
@@ -6486,7 +6493,7 @@ def test_nodes_deleted_mid_call(after, max_nodes):
 
         context._truncation["max_string_bytes"] = Tally(0)
         try:
-            captured = context.value(["x" * 50, *tails[after]()])
+            captured = context.value([*heads.get(after, []), "x" * 50, *tails[after]()])
         except AttributeError as error:
             captured = ("raised", str(error))
         found[native] = (
@@ -6497,7 +6504,44 @@ def test_nodes_deleted_mid_call(after, max_nodes):
         )
     assert found[True] == found[False]
     assert found[True][1] is False
-    assert (found[True][0][0] == "raised") is (after != "nothing")
+    raises = after != "nothing" and (after != "a value captured" or bool(max_nodes))
+    assert (found[True][0][0] == "raised") is raises
+
+
+def test_nodes_deleted_between_a_mapping_s_count_and_its_entries():
+    """Application code that deletes ``_nodes`` as a mapping holding the
+    interned ``"_nodes"`` key is remembered (here ``_sources.__setitem__``),
+    its keys and values captured before and no node budget: the Python walk
+    reads ``_nodes`` no more and completes, and so does the walker, which
+    then writes no count to the context."""
+    found = {}
+    for native in (False, True):
+        held, other = [1], [2]
+        mapping = {"_nodes": held, "a": other}
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_nodes=None))
+        _check_walker(context, native)
+
+        class Sources(dict):
+            def __setitem__(self, key, value):
+                if value is mapping and "_nodes" in vars(context):
+                    del context._nodes
+                dict.__setitem__(self, key, value)
+
+        context._sources = Sources()
+        try:
+            captured = context.value(["_nodes", "a", held, other, mapping])
+        except AttributeError as error:
+            captured = ("raised", str(error))
+        found[native] = (
+            captured,
+            "_nodes" in vars(context),
+            list(context._truncation.items()),
+            _memo(context),
+        )
+    assert found[True] == found[False]
+    assert found[True][1] is False
+    assert found[True][0][0] != "raised"
 
 
 def test_namespaces_after_application_code_mid_call():
@@ -6555,7 +6599,7 @@ def _unjudged(log):
 
 
 @pytest.mark.parametrize("how", ["__class__", "object.__new__", "copy"])
-def test_a_class_no_init_judged_captures_in_python(how):
+def test_a_class_nothing_judged_captures_in_python(how):
     """An instance that reaches a class nothing judged, by assigning
     ``__class__``, through ``object.__new__`` or as a copy, captures in
     Python, which calls the class's own walk method: the walker's entry
@@ -6589,48 +6633,215 @@ def test_a_class_no_init_judged_captures_in_python(how):
     assert "secret" in outcomes[True][1]
 
 
+def _late_class(override):
+    """A context class created past ``ValuesMixin.__init_subclass__``, by a
+    base ahead of it whose own does not call ``super()``, overriding a walk
+    method or not: nothing judged it."""
+
+    class Registering:
+        def __init_subclass__(cls, **kwargs):
+            pass
+
+    namespace = {"_text": lambda self, value: "<masked>"} if override else {}
+    return type("Late", (Registering, SnapshotContext), namespace)
+
+
+@pytest.mark.parametrize(
+    "data", [[1, "x" * 20], [1, [], [()], []]], ids=["flat", "nested"]
+)
 @pytest.mark.parametrize("override", [False, True], ids=["stock", "override"])
-def test_a_class_judged_near_the_recursion_limit(override):
-    """Judging a class at its first native call calls ``_choose_walk``, one
-    Python call. Where the stack has no room for it, the call goes to the
-    Python walk, so a capture of a class nothing judged never raises where
-    the Python walk returns, and then captures the same. A class that
-    overrides a walk method captures in Python in both modes, raising where
-    the Python walk raises."""
-    # One level, so the Python walk needs fewer frames than judging does.
-    data = [1, "x" * 20]
+def test_a_class_judged_near_the_recursion_limit(override, data):
+    """Judging a class at its first native call calls ``_choose_walk``.
+    Where the stack has no room for its frames, the entry retires the
+    context, which then captures as the Python walk does, raising where it
+    raises, and enters no entry again: one fallback for the whole capture.
+    A capture of a class nothing judged so never raises where the Python
+    walk returns, and then captures the same; a class that overrides a walk
+    method captures in Python in both modes. A later instance with room
+    judges the class."""
     left = {}
     for native in (False, True):
         for frames in range(1, 40):
+            late = _late_class(override)
+            with _mode(native):
+                context = late(DumpOptions())
+            before = _fallbacks() if native else 0
 
-            def capture():
-                class Registering:
-                    def __init_subclass__(cls, **kwargs):
-                        pass
+            def run():
+                try:
+                    return context.value(data)
+                except RecursionError:
+                    return "raised"
 
-                namespace = {"_text": lambda self, value: "<masked>"}
-                masked = type(
-                    "Masked",
-                    (Registering, SnapshotContext),
-                    namespace if override else {},
-                )
+            captured = pickle.dumps(_beneath(frames, run), protocol=5)
+            judged = vars(late).get("_native_walk_class") is late
+            left.setdefault(frames, {})[native] = (captured, judged)
+            if native:
+                assert _fallbacks() - before <= 1, frames
                 with _mode(native):
-                    context = masked(DumpOptions())
-
-                def run():
-                    try:
-                        return context.value(data)
-                    except RecursionError:
-                        return "raised"
-
-                return _beneath(frames, run)
-
-            left.setdefault(frames, {})[native] = pickle.dumps(capture(), protocol=5)
+                    again = late(DumpOptions())
+                reference = late(DumpOptions())
+                reference._native_walk = False
+                assert again.value(data) == reference.value(data)
+                assert vars(late)["_native_walk_class"] is late
     raised = pickle.dumps("raised", protocol=5)
-    assert any(found[False] == raised for found in left.values())
+    # Depths where judging failed: for the flat value, some where the Python
+    # walk had room; the nested value's walk needs as many frames.
+    assert any(
+        not found[True][1] and (found[False][0] != raised or len(data) > 2)
+        for found in left.values()
+    )
     for frames, found in left.items():
-        if override or found[False] != raised:
-            assert found[True] == found[False], frames
+        if override or found[False][0] != raised:
+            assert found[True][0] == found[False][0], frames
+
+
+@pytest.mark.parametrize("first", ["value", "_mapping"])
+@pytest.mark.parametrize("override", [False, True], ids=["stock", "override"])
+def test_a_class_nothing_judged_first_called_through_either_entry(first, override):
+    """Either entry judges a class at its first native call: through
+    ``value`` or through ``_mapping``, a class that changes nothing goes on
+    natively, with no fallback, and one that overrides a walk method gives
+    the call to the Python walk, once, and captures the same."""
+    found = {}
+    for native in (False, True):
+        late = _late_class(override)
+        with _mode(native):
+            context = late(DumpOptions())
+        before = _fallbacks() if native else 0
+        if first == "value":
+            captured = context.value({"k": ["x" * 20, (1,)]})
+        else:
+            captured = context._mapping({"k": ["x" * 20, (1,)]})
+        found[native] = (
+            pickle.dumps(captured, protocol=5),
+            list(context._truncation.items()),
+            context._nodes,
+        )
+        if native:
+            assert _fallbacks() - before == (1 if override else 0)
+            assert vars(late)["_native_walk_class"] is late
+            assert late._native_walk is not override
+    assert found[True] == found[False]
+
+
+def test_a_metaclass_setter_that_refuses_the_verdict():
+    """A metaclass data descriptor under ``_native_walk_class`` runs as
+    ``_choose_walk`` writes the verdict, natively only: where it raises, the
+    entry retires the context, which captures as the Python walk does, and
+    the next instance judges the class again."""
+
+    class Meta(type):
+        @property
+        def _native_walk_class(cls):
+            return None
+
+        @_native_walk_class.setter
+        def _native_walk_class(cls, value):
+            raise AttributeError("read-only")
+
+    class Registering:
+        def __init_subclass__(cls, **kwargs):
+            pass
+
+    found = {}
+    for native in (False, True):
+        late = Meta("Late", (Registering, SnapshotContext), {})
+        with _mode(native):
+            contexts = [late(DumpOptions()) for _ in range(2)]
+        before = _fallbacks() if native else 0
+        captured = [context.value([1, (2,), "x" * 20]) for context in contexts]
+        found[native] = pickle.dumps(captured, protocol=5)
+        if native:
+            assert _fallbacks() - before == 2
+            assert all(vars(context)["_native_walk"] is False for context in contexts)
+    assert found[True] == found[False]
+
+
+def test_first_calls_on_a_class_nothing_judged_from_many_threads():
+    """Threads that make their first native call on one class nothing judged
+    at the same time all judge it: none fails to, which would retire its
+    context, and each captures what the Python walk captures."""
+    data = {"k": [1, (2,), "x" * 20]}
+    reference = SnapshotContext(DumpOptions())
+    reference._native_walk = False
+    expected = pickle.dumps(reference.value(data), protocol=5)
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for _ in range(200):
+            late = _late_class(False)
+            barrier = threading.Barrier(6)
+            results, retired = [], []
+
+            def work():
+                barrier.wait()
+                context = late(DumpOptions())
+                try:
+                    captured = context.value(data)
+                    results.append(pickle.dumps(captured, protocol=5))
+                except Exception as error:
+                    results.append(repr(error))
+                retired.append("_native_walk" in vars(context))
+
+            threads = [threading.Thread(target=work) for _ in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            assert results == [expected] * 6, results
+            assert retired == [False] * 6
+    finally:
+        sys.setswitchinterval(interval)
+
+
+_PURE_LATE_SCRIPT = """
+import json
+from pydumpling.options import DumpOptions
+from pydumpling.snapshot import SnapshotContext, values
+
+
+class Registering:
+    def __init_subclass__(cls, **kwargs):
+        pass
+
+
+class Flagged(Registering, SnapshotContext):
+    _native_walk = True
+
+
+context = Flagged(DumpOptions())
+print(json.dumps({
+    "native": values._native is not None,
+    "value": repr(context.value([1, "x"])),
+    "mapping": repr(context._mapping({"a": [1]})),
+    "flag": Flagged._native_walk,
+}))
+"""
+
+
+def test_a_class_nothing_judged_that_sets_the_flag_itself_in_pure_mode():
+    """A class created past ``ValuesMixin.__init_subclass__`` that sets
+    ``_native_walk = True`` itself offers its calls to the entries even
+    where the extension is not loaded: there they choose its walk, Python's,
+    and the captures are those of the native walk."""
+    found = {}
+    for mode in ("1", "0"):
+        environment = _child_environment()
+        environment["PYDUMPLING_NATIVE"] = mode
+        process = subprocess.run(
+            [sys.executable, "-B", "-c", _PURE_LATE_SCRIPT],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=60,
+        )
+        assert process.returncode == 0, process.stderr
+        found[mode] = json.loads(process.stdout)
+    assert found["1"]["native"] and not found["0"]["native"]
+    assert found["0"]["flag"] is False
+    for key in ("value", "mapping"):
+        assert found["1"][key] == found["0"][key], key
 
 
 _UNJUDGED_MODULE = """
@@ -6678,12 +6889,12 @@ print(json.dumps({
 """
 
 
-def test_a_context_unpickled_in_a_fresh_process_of_a_class_no_init_judged(
+def test_a_context_unpickled_in_a_fresh_process_of_a_class_nothing_judged(
     tmp_path,
 ):
     """A context pickled in one process and loaded in another, where its
-    class was created past ``ValuesMixin.__init_subclass__`` and no
-    ``__init__`` judged it, captures there as in the Python walk."""
+    class was created past ``ValuesMixin.__init_subclass__`` and nothing
+    judged it, captures there as in the Python walk."""
     (tmp_path / "masking.py").write_text(_UNJUDGED_MODULE)
     blob = tmp_path / "context.pickle"
     found = {}

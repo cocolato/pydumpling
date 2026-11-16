@@ -118,6 +118,10 @@ pub(crate) struct Statics {
     /// `values._choose_walk`, which an entry calls to judge a class at its
     /// first native call ([`crate::walker`]).
     pub choose_walk: Py<PyAny>,
+    /// The instance-dict getter of `ValuesMixin`, which reads any
+    /// context's instance dict, from [`dict_getter`]: to retire an instance
+    /// whose class could not be judged ([`crate::walker`]).
+    pub instance_dict: Py<PyAny>,
     /// `object`.
     pub object: Py<PyAny>,
     /// `DumpOptions`, whether the walker reads its instances' budgets
@@ -261,6 +265,7 @@ impl Statics {
             class_qualname: getter("_CLASS_QUALNAME")?.unbind(),
             recursive_immutable: global("_RECURSIVE_IMMUTABLE")?.unbind(),
             choose_walk: global("_choose_walk")?.unbind(),
+            instance_dict: dict_getter(&mixin)?.unbind(),
             object: builtin("object")?.unbind(),
             dump_options: address(&options),
             dump_options_read: false,

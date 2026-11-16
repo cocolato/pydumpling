@@ -522,6 +522,17 @@ if (
         pass
 
 
+def _judge_in_python(context, *arguments):
+    """The native entries where the extension is not loaded.
+
+    Only a class created past ``ValuesMixin.__init_subclass__`` that sets
+    ``_native_walk`` true itself offers a call to them: its walk is chosen
+    here, Python's, as ``__init_subclass__`` would have chosen it.
+    """
+    _choose_walk(type(context))
+    return _IN_PYTHON
+
+
 # The reason of an immutable container's placeholder.  One shared object, so
 # the native walker's placeholders pickle to the same bytes as these.
 _RECURSIVE_IMMUTABLE = "recursive immutable reference"
@@ -531,7 +542,8 @@ _RECURSIVE_IMMUTABLE = "recursive immutable reference"
 _IN_PYTHON = object()
 # The walker's table and its native entries, bound below when the extension
 # loads.
-_STATICS = _native_value = _native_mapping = _native_stock = None
+_STATICS = _native_stock = None
+_native_value = _native_mapping = _judge_in_python
 
 # The context methods the native walker carries out itself.  A context class
 # that overrides any of them captures in Python, which calls the override.
@@ -591,7 +603,9 @@ _NATIVE_STATE = (
 # on its subclasses.  ``_native_walk_class`` names the class it was chosen for.
 # The walker's entries check it and choose the walk, at its first native
 # call, of a class whose ``__init_subclass__`` chain never reached
-# ``ValuesMixin``'s, so ``SnapshotContext.__init__`` checks nothing.  An
+# ``ValuesMixin``'s, so ``SnapshotContext.__init__`` checks nothing
+# (``_judge_in_python`` stands in for them where the extension is not
+# loaded).  An
 # instance set to False captures in Python: the walker sets it so for a
 # context whose state or arguments it does not mirror.  Changes to
 # a class after it was chosen are not seen.  An unlimited context, where
@@ -614,13 +628,17 @@ def _walk_methods(cls):
     attribute an instance of ``cls`` finds, or None, read from the class
     dicts along the MRO without calling its ``__get__`` or any metaclass
     hook.  None if a class dict holds a key other than an exact str, whose
-    own ``__eq__`` looking a name up there may run.
+    own ``__eq__`` looking a name up there may run.  Each dict's keys are
+    copied before they are checked, as another thread judging the same class
+    may add a name to it meanwhile.
     """
     namespaces = [
         _CLASS_DICT.__get__(base, type(base))
         for base in _CLASS_MRO.__get__(cls, type(cls))
     ]
-    if not all(type(key) is str for namespace in namespaces for key in namespace):
+    if not all(
+        type(key) is str for namespace in namespaces for key in tuple(namespace)
+    ):
         return None
     return tuple(
         next((namespace[name] for namespace in namespaces if name in namespace), None)
@@ -651,10 +669,12 @@ def _choose_walk(cls):
     ``_native_walk`` to False itself keeps it, as its subclasses inherit it;
     any other value it sets is replaced.  ``_native_walk_class`` records
     that the class was judged.  Class dicts are read through
-    ``type.__dict__``, and both are set through ``type``, so no hook of a
-    metaclass, nor the value's own code, runs.  Returns whether the class
-    keeps the walk it inherits, which the walker's entries, judging a class
-    at its first native call, read as "go on natively".
+    ``type.__dict__``, and both are set through ``type.__setattr__``, so no
+    metaclass ``__getattribute__`` or ``__setattr__``, nor the value's own
+    code, runs; a data descriptor a metaclass defines under either name
+    does, as ``type.__setattr__`` stores through it.  Returns whether the
+    class keeps the walk it inherits, which the walker's entries, judging a
+    class at its first native call, read as "go on natively".
     """
     own = _CLASS_DICT.__get__(cls, type(cls)).get("_native_walk", _UNMEMOIZED)
     walk = _walk_methods(cls) if _STOCK_WALK is not None else None
@@ -707,4 +727,5 @@ if _native is not None:
             stacklevel=1,
         )
         _native = None
-        _STATICS = _native_value = _native_mapping = _native_stock = None
+        _STATICS = _native_stock = None
+        _native_value = _native_mapping = _judge_in_python

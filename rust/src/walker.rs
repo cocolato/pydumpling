@@ -23,13 +23,14 @@
 use std::ptr::addr_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pyo3::exceptions::{PyAttributeError, PyRecursionError};
+use pyo3::exceptions::{PyAttributeError, PyException};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::state::State;
 use crate::statics::{type_address, Statics};
+use crate::types::fresh_dict;
 
 /// Why the walk stopped early.
 pub(crate) enum Halt {
@@ -95,20 +96,34 @@ pub(crate) fn retire<'py>(s: &Statics, ctx: &Bound<'py, PyAny>) -> PyResult<Boun
 /// Judges the class of a context whose class was never judged
 /// ([`Statics::judged`]), one created past `ValuesMixin.__init_subclass__`,
 /// at its first native call, as `__init_subclass__` would have, before
-/// anything of the class runs: whether the call goes on natively. A class
-/// that does not keep the native walk now holds `_native_walk = False`, so
-/// its instances call no entry again. Judging calls `_choose_walk`, one
-/// Python call; where the stack has no room for it, the call goes to the
-/// Python walk, which has room for its own frames, and the class is judged
-/// at a later call. Out of line, as no stock context comes here.
+/// anything of the class runs: `None` where the call goes on natively,
+/// else `_IN_PYTHON`. A class that does not keep the native walk now holds
+/// `_native_walk = False`, so its instances call no entry again. Where
+/// judging fails (an exception, such as a `RecursionError` where the stack
+/// has no room for `_choose_walk`'s frames, or a metaclass descriptor that
+/// keeps the verdict from the class dict), the context is retired as
+/// [`retire`] does, before anything of the class runs: the flag is written
+/// into the instance dict, past a `__setattr__` nothing compared with the
+/// stock one, so the rest of its calls are the Python walk's and none
+/// judges again; another instance judges the class. Out of line, as no
+/// stock context comes here.
 #[cold]
 #[inline(never)]
-fn judge(s: &Statics, ctx: &Bound<'_, PyAny>) -> PyResult<bool> {
+fn judge<'py>(s: &Statics, ctx: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
     let py = ctx.py();
     match s.choose_walk.bind(py).call1((ctx.get_type(),)) {
-        Ok(native) => native.is_truthy(),
-        Err(err) if err.is_instance_of::<PyRecursionError>(py) => Ok(false),
-        Err(err) => Err(err),
+        Ok(native) if s.judged(ctx)? => {
+            if native.is_truthy()? {
+                Ok(None)
+            } else {
+                Ok(Some(in_python(py, s)))
+            }
+        }
+        Err(err) if !err.is_instance_of::<PyException>(py) => Err(err),
+        _ => {
+            fresh_dict(&s.instance_dict, ctx)?.set_item(intern!(py, "_native_walk"), false)?;
+            Ok(Some(in_python(py, s)))
+        }
     }
 }
 
@@ -321,8 +336,10 @@ impl StaticsHandle {
         depth: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let s = self.table;
-        if !s.judged(ctx)? && !judge(s, ctx)? {
-            return Ok(in_python(ctx.py(), s));
+        if !s.judged(ctx)? {
+            if let Some(in_python) = judge(s, ctx)? {
+                return Ok(in_python);
+            }
         }
         let Some(depth) = exact_depth(s, depth) else {
             // A depth pydumpling's own callers never pass.
@@ -349,8 +366,10 @@ impl StaticsHandle {
     ) -> PyResult<Bound<'py, PyAny>> {
         let s = self.table;
         let py = ctx.py();
-        if !s.judged(ctx)? && !judge(s, ctx)? {
-            return Ok(in_python(py, s));
+        if !s.judged(ctx)? {
+            if let Some(in_python) = judge(s, ctx)? {
+                return Ok(in_python);
+            }
         }
         let counted = match counted {
             flag if flag.is(s.true_.bind(py)) => Some(true),
