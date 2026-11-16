@@ -29,11 +29,6 @@ fn fits(py: Python<'_>, value: &Bound<'_, PyAny>, limit: u64) -> PyResult<bool> 
     Ok(chars as u64 <= limit && value.call_method0(intern!(py, "isascii"))?.is_truthy()?)
 }
 
-/// `[:limit]`, for a limit that fits, as slicing reads it.
-fn head(py: Python<'_>, limit: u64) -> Bound<'_, PySlice> {
-    PySlice::new(py, 0, isize::try_from(limit).unwrap_or(isize::MAX), 1)
-}
-
 /// Reads a budget as `DumpOptions` validates it: `Some(None)` for `None`,
 /// `Some(Some(limit))` for a positive exact int, saturated to `u64`, and
 /// `None` for anything the Python walk alone compares as it would.
@@ -183,7 +178,7 @@ impl State {
             return Ok(value.clone());
         }
         let encode = (intern!(py, "utf-8"), intern!(py, "surrogatepass"));
-        let prefix = value.get_item(head(py, limit))?;
+        let prefix = value.get_item(self.head(py, limit)?)?;
         let encoded = if value.len()? == prefix.len()? {
             let encoded = prefix.call_method1(intern!(py, "encode"), encode)?;
             if encoded.len()? as u64 <= limit {
@@ -242,11 +237,32 @@ impl State {
         })
     }
 
+    /// `slice(None, limit)`, which `value[:limit]` slices with, made once
+    /// per call for the last limit asked for.
+    fn head<'py>(&mut self, py: Python<'py>, limit: u64) -> PyResult<Bound<'py, PyAny>> {
+        match &self.head {
+            Some((held, slice)) if *held == limit => Ok(slice.bind(py).clone()),
+            _ => self.new_head(py, limit),
+        }
+    }
+
+    /// [`State::head`]'s slice, made from an int it owns. Out of line, as
+    /// the frame of each native level would otherwise hold its locals.
+    #[cold]
+    #[inline(never)]
+    fn new_head<'py>(&mut self, py: Python<'py>, limit: u64) -> PyResult<Bound<'py, PyAny>> {
+        let slice = self.s.slice_cls.bind(py).call1((py.None(), limit))?;
+        self.head = Some((limit, slice.clone().unbind()));
+        Ok(slice)
+    }
+
     /// `SnapshotContext._bounded_bytes(value, max_string_bytes,
     /// "max_string_bytes")` for exact bytes or a bytearray.
     ///
     /// Slicing nonempty exact bytes to its full length returns the object
-    /// itself; an empty one may become the shared empty bytes.
+    /// itself, and any other slice is what `PyBytes::new` makes of the
+    /// prefix (`PyBytes_FromStringAndSize`, the shared empty and one-byte
+    /// bytes included). A bytearray slices into a new bytearray.
     pub(crate) fn bounded_bytes<'py>(
         &mut self,
         py: Python<'py>,
@@ -254,15 +270,23 @@ impl State {
     ) -> Walk<Bound<'py, PyAny>> {
         let size = value.len()? as u64;
         let limit = self.max_string_bytes;
-        if type_address(value) == self.s.bytes && size > 0 && limit.is_none_or(|l| size <= l) {
-            return Ok(value.clone());
-        }
-        if limit.is_some_and(|limit| size > limit) {
+        let cut = limit.is_some_and(|limit| size > limit);
+        if cut {
             self.count(py, intern!(py, "max_string_bytes"))?;
         }
+        if let Ok(bytes) = value.cast_exact::<PyBytes>() {
+            if size > 0 && !cut {
+                return Ok(value.clone());
+            }
+            let data = bytes.as_bytes();
+            let end = limit.map_or(data.len(), |limit| {
+                data.len().min(usize::try_from(limit).unwrap_or(usize::MAX))
+            });
+            return Ok(PyBytes::new(py, &data[..end]).into_any());
+        }
         let slice = match limit {
-            Some(limit) => head(py, limit),
-            None => PySlice::full(py),
+            Some(limit) => self.head(py, limit)?,
+            None => PySlice::full(py).into_any(),
         };
         Ok(value.get_item(slice)?)
     }

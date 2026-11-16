@@ -142,6 +142,7 @@ assert values._native is None
 messages = [str(w.message) for w in caught if w.category is RuntimeWarning]
 assert len(messages) == 1 and "rust/build_native.py" in messages[0], messages
 assert values._STATICS is values._native_value is values._native_mapping is None
+assert values._native_stock is None
 context = SnapshotContext(DumpOptions())
 assert context._native_walk is False
 assert context.value([1, {"a": 2}]) == [1, {"a": 2}]
@@ -163,6 +164,7 @@ from pydumpling.options import DumpOptions
 assert values._native is None
 assert not [w for w in caught if w.category is RuntimeWarning], caught
 assert values._STATICS is values._native_value is values._native_mapping is None
+assert values._native_stock is None
 context = SnapshotContext(DumpOptions())
 assert context._native_walk is False
 assert context.value([1, {"a": 2}]) == [1, {"a": 2}]

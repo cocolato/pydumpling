@@ -64,7 +64,27 @@ jobs:
       - name: Build the extension
         run: uv run --locked python rust/build_native.py
       - name: Verify the walker captures
-        run: uv run --locked python -c "from pydumpling import DumpOptions; from pydumpling.snapshot import SnapshotContext; context = SnapshotContext(DumpOptions()); assert context._walker is not None; assert context.value([1, (2,)]) == [1, (2,)]; assert context._walker.handbacks == 0"
+        shell: bash
+        run: |
+          uv run --locked python - <<'EOF'
+          from pydumpling import DumpOptions
+          from pydumpling.snapshot import SnapshotContext, values
+
+          assert values._native is not None, "the native walker did not load"
+          assert SnapshotContext._native_walk is True, "SnapshotContext walks in Python"
+          entered = []
+          value, mapping = values._native_value, values._native_mapping
+          values._native_value = lambda *args: entered.append("value") or value(*args)
+          values._native_mapping = lambda *args: entered.append("mapping") or mapping(*args)
+          context = SnapshotContext(DumpOptions())
+          before = values._STATICS.fallbacks
+          assert context.value([1, (2,)]) == [1, (2,)]
+          assert context._mapping({"a": [1]}) == {"a": [1]}
+          assert entered == ["value", "mapping"], entered
+          assert values._STATICS.fallbacks == before, "a capture fell back to Python"
+          assert context._native_walk is True, "the walker retired the context"
+          print("captured natively with", values._native.__file__)
+          EOF
       - name: Test with the native walker
         run: uv run --locked pytest
 

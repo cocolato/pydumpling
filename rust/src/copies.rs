@@ -111,6 +111,9 @@ impl State {
             let converted = self.attribute_mapping(py, attrs.as_any(), depth + 1, private)?;
             update(namespace, &converted)?;
         }
+        // The namespace holds copies and plain keys until a slot or field
+        // name that is not plain goes in ([`State::insert`]).
+        let mut mixed = false;
         match &*self.layout(py, value)? {
             Layout::Plain { members, fields } => {
                 for (name, getter) in members {
@@ -122,27 +125,23 @@ impl State {
                         break;
                     }
                     let converted = self.value(py, &item, depth + 1)?;
-                    let name = name.bind(py);
-                    if type_address(name) == self.s.str_ {
-                        namespace.set_item(name, converted)?;
-                    } else {
-                        self.application(py, || namespace.set_item(name, converted))?;
-                    }
+                    self.insert(py, namespace, name.bind(py), &converted, &mut mixed)?;
                 }
                 if !fields.is_empty() && type_address(copy) == self.s.fake_tuple_type {
                     let items = copy.cast::<PyTuple>().map_err(PyErr::from)?;
                     for (field, item) in fields.iter().zip(items.iter()) {
-                        namespace.set_item(field.bind(py), item)?;
+                        self.insert(py, namespace, field.bind(py), &item, &mut mixed)?;
                     }
                 }
             }
             Layout::Other { members, fields } => {
                 let (members, fields) = (members.bind(py), fields.bind(py));
                 self.fill_other(py, value, copy, namespace, members, fields, depth)?;
+                // Its names are whatever Python code wrote.
+                mixed = true;
             }
         }
-        namespace.set_item(&key, &type_name)?;
-        Ok(())
+        self.insert(py, namespace, &key, &type_name, &mut mixed)
     }
 
     /// Whether one more slot fits the item and node budgets; counts the one

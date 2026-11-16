@@ -1,13 +1,16 @@
 """What a snapshot holds does not depend on where objects live or on which walk
 took it: the same state dumps to the same bytes in each mode, a dump the native
-walker wrote loads and reports without the extension, and a context holds the
-same state in both modes."""
+walker wrote loads and reports without the extension, a context holds the
+same state in both modes, and so does a capture under a budget too large for
+``itertools.islice``."""
 
 import gzip
 import json
 import os
+import pickle
 import subprocess
 import sys
+import types
 from collections import OrderedDict, defaultdict, namedtuple
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -187,6 +190,7 @@ _CONTEXT_STATE_SCRIPT = """
 import json
 from pydumpling.options import DumpOptions
 from pydumpling.snapshot import SnapshotContext
+from pydumpling.snapshot import values
 
 found = {}
 for name, options in (("limited", DumpOptions()), ("unlimited", DumpOptions.unlimited())):
@@ -201,15 +205,18 @@ for name, options in (("limited", DumpOptions()), ("unlimited", DumpOptions.unli
         list(vars(copied)),
         vars(copied).get("_native_walk", "unset"),
     ]
-print(json.dumps(found))
+walker = [values._native is not None, SnapshotContext._native_walk]
+print(json.dumps([walker, found]))
 """
 
 
+@pytest.mark.skipif(not _NATIVE, reason="the optional native walker is unavailable")
 def test_a_context_holds_the_same_state_in_both_modes():
     """``SnapshotContext`` gives no context ``_native_walk`` of its own,
     limited or unlimited, with or without the extension, so a context
-    captured as a value shows the same attributes in both modes."""
-    found = []
+    captured as a value shows the same attributes in both modes. The
+    native child loads the walker and the other leaves it out."""
+    walkers, found = [], []
     for native in ("1", "0"):
         environment = dict(os.environ, PYDUMPLING_NATIVE=native)
         environment["PYTHONPATH"] = os.pathsep.join(
@@ -224,7 +231,83 @@ def test_a_context_holds_the_same_state_in_both_modes():
             timeout=60,
         )
         assert process.returncode == 0, process.stderr
-        found.append(json.loads(process.stdout))
+        walker, state = json.loads(process.stdout)
+        walkers.append(walker)
+        found.append(state)
+    assert walkers == [[True, True], [False, False]]
     assert found[0] == found[1]
     for name in ("limited", "unlimited"):
         assert found[0][name][1] == found[0][name][3] == "unset"
+
+
+_HOLDER_SOURCE = """
+def holder(values, text):
+    local = [text, values]
+    yield sys._getframe()
+"""
+
+
+@pytest.mark.parametrize(
+    "size",
+    [sys.maxsize, sys.maxsize + 1, 2**64, 2**100],
+    ids=["maxsize", "maxsize+1", "2**64", "2**100"],
+)
+@pytest.mark.parametrize("budget", ["max_items", "max_nodes"])
+def test_a_budget_past_what_islice_takes(budget, size):
+    """A ``max_items`` or ``max_nodes`` of ``sys.maxsize`` or more, which
+    the Python walk's ``itertools.islice`` refuses as a stop, bounds
+    nothing a mapping holds: a dict, an attribute dict, a frame's
+    variables and an exception's state are captured whole, and the same in
+    both modes."""
+    other = "max_nodes" if budget == "max_items" else "max_items"
+    options = DumpOptions(**{budget: size, other: None})
+    # Globals of their own, which the frame capture includes.
+    namespace = {"sys": sys}
+    exec(_HOLDER_SOURCE, namespace)
+    outcomes = {}
+    for native in (False, True) if _NATIVE else (False,):
+        context = SnapshotContext(options)
+        if not native:
+            context._native_walk = False
+        assert context._native_walk is native
+        data = {"k": [1, (2,)], "n": {"x": None}}
+        holder = namespace["holder"](data, "text")
+        attributes = types.SimpleNamespace(a=data, b="text")
+        captured = (
+            context.value(data),
+            context._mapping({"z": data}),
+            context._attribute_mapping(vars(attributes), 0),
+            context.from_frame(next(holder)),
+            context.value(ValueError("boom", data)),
+        )
+        assert captured[0] == data
+        assert context._native_walk is native
+        state = (captured, list(context._truncation.items()), context._nodes)
+        outcomes[native] = pickle.dumps(state, protocol=5)
+    assert len(set(outcomes.values())) == 1
+
+
+def test_a_context_class_s_creation_reaches_a_base_after_it():
+    """``ValuesMixin.__init_subclass__`` hands a new context class, and its
+    class keywords, on to an ``__init_subclass__`` later in the MRO, and
+    judges the class itself, which then captures as ``SnapshotContext``
+    does."""
+    seen = []
+
+    class Registering:
+        def __init_subclass__(cls, tag=None, **kwargs):
+            super().__init_subclass__(**kwargs)
+            seen.append((cls.__name__, tag))
+
+    class Tagged(SnapshotContext, Registering, tag="t"):
+        pass
+
+    assert seen == [("Tagged", "t")]
+    assert vars(Tagged)["_native_walk_class"] is Tagged
+    assert Tagged._native_walk is SnapshotContext._native_walk is _NATIVE
+    context = Tagged(DumpOptions())
+    statics = values_module._STATICS
+    before = statics.fallbacks if _NATIVE else 0
+    assert context.value({"k": [1, (2,)]}) == {"k": [1, (2,)]}
+    assert context._native_walk is _NATIVE
+    assert (statics.fallbacks if _NATIVE else 0) == before

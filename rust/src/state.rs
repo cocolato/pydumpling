@@ -1,5 +1,6 @@
-//! The context state a native call reads, with ordinary attribute access,
-//! and whether the walker reads an options object's budgets.
+//! The context state a native call reads, with ordinary attribute access;
+//! inserts into a dict that may hold application keys; and whether the
+//! walker reads an options object's budgets.
 
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -45,6 +46,8 @@ pub(crate) struct State {
     /// Whether every key of `_truncation` is an exact str, so looking a
     /// tally up runs no key's `__eq__`.
     truncation_plain: Option<bool>,
+    /// The slice `[:limit]` takes, and its limit ([`State::head`]).
+    pub(crate) head: Option<(u64, Py<PyAny>)>,
     /// Stack address where the current call entered the walker, and how
     /// much native stack the call may use below it.
     pub(crate) origin: usize,
@@ -148,6 +151,7 @@ impl State {
             types: AddressMap::default(),
             fake_class: None,
             truncation_plain: None,
+            head: None,
             origin: 0,
             stack_budget,
         }))
@@ -170,6 +174,26 @@ impl State {
         self.types.clear();
         self.fake_class = None;
         self.truncation_plain = None;
+    }
+
+    /// `target[key] = value` into a dict that holds application keys once
+    /// any key it was given is not of a plain kind (`mixed` says so): from
+    /// then on, an insert may compare with such a key, whose `__eq__` runs,
+    /// so it runs as application code. Only plain keys before it are
+    /// inserted natively.
+    pub(crate) fn insert<'py>(
+        &mut self,
+        py: Python<'py>,
+        target: &Bound<'py, PyDict>,
+        key: &Bound<'py, PyAny>,
+        value: &Bound<'py, PyAny>,
+        mixed: &mut bool,
+    ) -> Walk<()> {
+        if !*mixed && self.s.plain_key(key) {
+            return Ok(target.set_item(key, value)?);
+        }
+        *mixed = true;
+        self.application(py, || target.set_item(key, value))
     }
 
     /// `FakeClass` as it is now ([`FakeClassNow`]).
@@ -269,10 +293,15 @@ impl State {
     }
 }
 
+/// How many options types other than `DumpOptions` the table keeps a
+/// verdict for, and with it the type alive; past that it forgets them all.
+const OPTIONS_TYPES_KEPT: usize = 64;
+
 impl Statics {
     /// Whether the walker reads the budgets of `options` once per call, as
     /// `options.max_items` and the rest read them. The verdict is kept per
-    /// options type: a class changed later is not seen.
+    /// options type, for up to [`OPTIONS_TYPES_KEPT`] types at a time: a
+    /// class changed later is not seen while its verdict is kept.
     pub(crate) fn reads_options(&self, options: &Bound<'_, PyAny>) -> PyResult<bool> {
         let ty = type_address(options);
         if ty == self.dump_options {
@@ -290,7 +319,13 @@ impl Statics {
         // Computed unlocked: reading classes calls into Python.
         let cls = options.get_type().into_any();
         let verdict = self.options_verdict(&cls)?;
-        lock().insert(ty, (cls.unbind(), verdict));
+        let mut types = lock();
+        if types.len() >= OPTIONS_TYPES_KEPT {
+            // Each holds its type alive: a process that makes options
+            // classes as it goes would keep every one of them.
+            types.clear();
+        }
+        types.insert(ty, (cls.unbind(), verdict));
         Ok(verdict)
     }
 

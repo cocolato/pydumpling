@@ -3711,9 +3711,11 @@ def test_capture_reentered_by_a_collection():
     """A collection callback that captures on the context while the native
     walk runs captures as it does outside the walk, and the outer capture is
     unchanged: the context is captured again from inside its own capture as
-    in the Python walk. A collection runs inside a native call only at the
-    walker's signal check, where the node count is synced as around
-    application code, so the inner captures count toward the outer one's."""
+    in the Python walk. The graph holds no container copy, whose
+    ``FakeContainer.__hash__`` is Python code, so a collection runs inside
+    the native call only at the walker's signal check, where the node count
+    is synced as around application code, and the inner captures count
+    toward the outer one's."""
     graph = [[i, str(i)] for i in range(20000)]
     nodes = 1 + 3 * len(graph)  # The list, and each pair, its int and its str.
     results = {}
@@ -3867,10 +3869,11 @@ def test_a_class_rebased_by_a_collection_mid_call(native):
     ``__dict__`` is a property onto one with the real instance-dict
     descriptor. The instances captured after the collection carry their
     attributes, and only those before it count as ``unsupported_type``, in
-    both walks: a collection runs inside a native call only at the walker's
-    signal check, after which, as after application code, the walker
-    forgets what it read about types. The next call reads the attributes
-    too."""
+    both walks: with no container copy to hash, a collection runs inside a
+    native call only at the walker's signal check, after which, as after
+    application code, the walker forgets what it read about types. The next
+    call reads the attributes too. (``test_native_differences`` pins a
+    collection that runs between two sync points.)"""
     xs, tally, later, rebased = _rebased_mid_call(native)
     assert rebased, "no collection ran during the walk"
     hidden = xs.count(None)
@@ -3969,7 +3972,8 @@ def inside():
     return False
 
 def collected(phase, info):
-    # A collection runs inside the native call at one of its signal checks.
+    # The graph holds no container copy, so a collection runs inside the
+    # native call at one of its signal checks.
     global fired
     if phase != 'start' or fired or not inside():
         return
@@ -4244,7 +4248,8 @@ def test_a_hook_capturing_inside_application_code_matches_python(kind):
 def test_signal_handlers_and_asyncio_keep_the_native_walk():
     """Installing a Python signal handler, as ``asyncio.run`` installs one for
     SIGINT, leaves the walker in use and the handler installed: a handler
-    runs inside a native call only at the walker's signal checks."""
+    runs inside a native call where Python code runs, which the walker's
+    signal checks make sure of every 4,096 nodes."""
     with _mode(True):
         context = SnapshotContext(DumpOptions())
 
@@ -4370,6 +4375,10 @@ def _logged_hooks(log):
         log.append(("get", name))
         return object.__getattribute__(self, name)
 
+    def getattr_(self, name):
+        log.append(("missing", name))
+        raise AttributeError(name)
+
     def setattr_(self, name, value):
         log.append(("set", name))
         object.__setattr__(self, name, value)
@@ -4380,6 +4389,7 @@ def _logged_hooks(log):
 
     return {
         "__getattribute__": getattribute,
+        "__getattr__": getattr_,
         "__setattr__": setattr_,
         "__delattr__": delattr_,
     }
@@ -4442,14 +4452,69 @@ def test_state_behind_a_property_runs_as_in_python(name):
     assert outcomes[True][1], "the property never ran"
 
 
-@pytest.mark.parametrize("hook", ["__getattribute__", "__setattr__", "__delattr__"])
+@pytest.mark.parametrize(
+    "hook", ["__getattribute__", "__getattr__", "__setattr__", "__delattr__"]
+)
 def test_context_attribute_hooks_run_as_in_python(hook):
     """A context class with attribute hooks of its own captures in Python,
     which runs them exactly as often as the Python walk does. Neither walk
-    deletes an attribute, so ``__delattr__`` checks only that the context
-    goes to the Python walk."""
+    deletes an attribute or reads one that is missing here, so
+    ``__delattr__`` and ``__getattr__`` check only that the context goes to
+    the Python walk (``test_a_context_class_with_getattr``)."""
+    assert hook in values_module._STATE_ACCESS
     outcomes = _logged_capture(lambda log: {hook: _logged_hooks(log)[hook]}, "subclass")
     assert outcomes[True] == outcomes[False]
+
+
+def test_the_state_access_hooks_are_every_attribute_hook():
+    """Reading, writing and deleting an instance attribute goes through
+    ``__getattribute__``, then ``__getattr__`` for a missing one,
+    ``__setattr__`` and ``__delattr__`` (and descriptors under the state
+    names, which ``_NATIVE_STATE`` covers): a class with any of them of its
+    own captures in Python."""
+    assert set(values_module._STATE_ACCESS) == set(_logged_hooks([]))
+
+
+@pytest.mark.parametrize("missing", ["_layouts", "_code_text_limit", "_node_marker"])
+def test_a_context_class_with_getattr(missing):
+    """A context class whose ``__getattr__`` answers a state attribute its
+    instance lacks captures in Python, which runs the hook at every read of
+    it, as the Python walk does, not once per call."""
+    Pair = namedtuple("Pair", "left right")
+
+    def attributes(log):
+        def getattr_(self, name):
+            log.append(name)
+            if name != missing:
+                raise AttributeError(name)
+            return {
+                "_layouts": lambda: vars(self).setdefault("_kept", {}),
+                "_code_text_limit": lambda: 12,
+                "_node_marker": lambda: TruncatedValue("max_nodes"),
+            }[name]()
+
+        return {"__getattr__": getattr_}
+
+    outcomes = {}
+    for native in (False, True):
+        log = []
+        Context = type("Context", (SnapshotContext,), attributes(log))
+        assert Context._native_walk is False
+        with _mode(native):
+            context = Context(DumpOptions(max_nodes=12))
+        delattr(context, missing)
+        held = _Plain()
+        held.a_name_past_twelve_bytes = [Pair(1, 2), Pair(3, 4)]
+        results = (
+            context.value([Pair(5, 6), held, Pair(7, 8)]),
+            context._mapping({"k": [Pair(9, 10)] * 3}),
+            context.value(list(range(20))),
+            [context.value([index]) for index in range(3)],
+        )
+        state = (results, list(context._truncation.items()), context._nodes)
+        outcomes[native] = (pickle.dumps(state, protocol=5), log)
+    assert outcomes[True] == outcomes[False]
+    assert outcomes[True][1].count(missing) > 1
 
 
 @pytest.mark.parametrize(
@@ -5538,6 +5603,88 @@ def test_bounded_text_bytes_and_layouts_match_python():
     ]
 
 
+class _PlainText(str):
+    pass
+
+
+class _PlainData(bytes):
+    pass
+
+
+def _long_attribute_name():
+    held = _Plain()
+    setattr(held, "名" * 2000, 1)
+    return held
+
+
+# What the walk slices, or keeps whole, with each budget below: str and
+# bytes long and short, ASCII and not, their subclasses, any bytearray, and
+# a name past the code text limit. A budget past 256, the last cached small
+# int, is a new int in each slice.
+_SLICED = {
+    "ascii str": "x" * 5000,
+    "wide str": "é" * 300,
+    "wider str": "é餃" * 2000,
+    "lone surrogates": "\ud800" * 3000,
+    "str subclass": _PlainText("y" * 5000),
+    "long bytes": b"y" * 5000,
+    "short bytes": b"y" * 200,
+    "one byte": b"z",
+    "empty bytes": b"",
+    "bytes subclass": _PlainData(b"y" * 5000),
+    "short bytearray": bytearray(b"ab"),
+    "long bytearray": bytearray(5000),
+    "long attribute name": _long_attribute_name(),
+}
+
+
+def _blocks_per_capture(native, options, item, runs=300):
+    """``sys.getallocatedblocks()`` growth per capture of ``[item]`` on a
+    new context: the least over batches of ``runs``. A capture makes no
+    cyclic garbage, so the collector stays off meanwhile. What the free
+    lists keep fills them within a few batches (a collection would empty
+    them again), while a leak grows every batch, so batches run until one
+    grows nothing, ten at most."""
+    with _mode(native):
+
+        def once():
+            context = SnapshotContext(options)
+            _check_walker(context, native)
+            context.value([item])
+
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            least = float("inf")
+            for _ in range(10):
+                before = sys.getallocatedblocks()
+                for _ in range(runs):
+                    once()
+                least = min(least, (sys.getallocatedblocks() - before) / runs)
+                if least <= 0:
+                    break
+        finally:
+            if enabled:
+                gc.enable()
+    return least
+
+
+@pytest.mark.parametrize("budget", [4096, 257, None], ids=lambda budget: f"{budget}")
+def test_captures_of_sliced_values_keep_nothing_allocated(budget):
+    """Repeated captures of what the walk slices keep no more memory
+    allocated natively than in Python: a leaked object per capture is a
+    block per capture."""
+    options = DumpOptions(max_string_bytes=budget)
+    grown = {
+        name: (
+            _blocks_per_capture(True, options, item),
+            _blocks_per_capture(False, options, item),
+        )
+        for name, item in _SLICED.items()
+    }
+    assert {name: g for name, g in grown.items() if g[0] > g[1] + 0.25} == {}
+
+
 # Each budget at 1, its least valid value, alone and all at once. A forged 0
 # is among ``_STATE_CHANGES``.
 _BUDGETS = ("max_items", "max_nodes", "max_string_bytes", "max_depth")
@@ -6143,6 +6290,48 @@ def test_capturing_the_context_s_own_dicts():
         assert native.results[2][0] > 2 * 16  # each key counted in both dicts
 
 
+def _has_instance_dict(context):
+    """Whether ``context``'s instance dict exists. Reading ``__dict__``
+    makes it, and from then on attribute access on the context costs more
+    (3.12, 3.14)."""
+    return any(
+        type(referent) is dict and "objects" in referent
+        for referent in gc.get_referents(context)
+    )
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["pure", "native"])
+@pytest.mark.parametrize("holder", ["attributes", "dict", "context"])
+def test_a_nodes_key_leaves_the_context_s_dict_unmade(native, holder):
+    """A captured mapping with a ``_nodes`` key holding the very int the
+    context holds (an object's attributes, a dict, another context) leaves
+    the context's instance dict unmade, as in the Python walk. Only the
+    context's own dict, or a copy made from it, sends the walker to read
+    ``ctx.__dict__``. Small ints are one object each, so one of the counts
+    below is the one the context holds while the walk selects that key."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+        others = [SnapshotContext(DumpOptions()) for _ in range(32)]
+    _check_walker(context, native)
+    held = []
+    for count, other in enumerate(others):
+        if holder == "attributes":
+            value = _Plain()
+            value._nodes = count
+            value.count = 1
+        elif holder == "dict":
+            value = {"_nodes": count, "count": 1}
+        else:
+            value = other
+            value._nodes = count
+        held.append(value)
+    assert not _has_instance_dict(context)
+    context.value([[1, 2], held])
+    assert not _has_instance_dict(context)
+    vars(context)
+    assert _has_instance_dict(context)
+
+
 def test_namespaces_after_application_code_mid_call():
     """A call that runs application code, a tally's ``__add__``, holds in
     ``_namespaces`` the attribute dicts of the objects captured by earlier
@@ -6174,3 +6363,218 @@ def test_namespaces_after_application_code_mid_call():
 
     native, _ = _same_in_both_modes(build, DumpOptions(max_items=2), calls)
     assert native.results[2] == ([True, True, True, False], 3)
+
+
+# --- A class no ``__init__`` judged -------------------------------------------
+
+
+def _unjudged(log):
+    """A context class created past ``ValuesMixin.__init_subclass__``, by a
+    base ahead of it whose own does not call ``super()``, that overrides a
+    walk method: nothing judged it, and it inherits ``_native_walk``."""
+
+    class Registering:
+        def __init_subclass__(cls, **kwargs):
+            pass
+
+    class Masking(Registering, SnapshotContext):
+        def _text(self, value):
+            log.append(value)
+            return "<masked>"
+
+    assert Masking._native_walk_class is not Masking
+    return Masking
+
+
+@pytest.mark.parametrize("how", ["__class__", "object.__new__", "copy"])
+def test_a_class_no_init_judged_captures_in_python(how):
+    """An instance that reaches a class no ``__init__`` judged, by assigning
+    ``__class__``, through ``object.__new__`` or as a copy, captures in
+    Python, which calls the class's own walk method: the walker's entries
+    find the class was not judged and give the context to the Python walk
+    before anything of the class runs."""
+    data = {"key": ["secret", "x" * 20], "other": [1, (2,)]}
+    outcomes = {}
+    for native in (False, True):
+        log = []
+        Masking = _unjudged(log)
+        with _mode(native):
+            plain = SnapshotContext(DumpOptions(max_string_bytes=8))
+        if how == "object.__new__":
+            context = object.__new__(Masking)
+            vars(context).update(vars(plain))
+        else:
+            plain.__class__ = Masking
+            context = plain if how == "__class__" else copy.copy(plain)
+        assert context._native_walk is native
+        before = _fallbacks()
+        results = (context.value(data), context._mapping({"k": ["more"]}))
+        state = (results, list(context._truncation.items()), context._nodes)
+        outcomes[native] = (pickle.dumps(state, protocol=5), list(log))
+        assert context._native_walk is False
+        assert Masking._native_walk_class is not Masking
+        if native:
+            assert _fallbacks() == before + 1
+    assert outcomes[True] == outcomes[False]
+    assert "secret" in outcomes[True][1]
+
+
+_UNJUDGED_MODULE = """
+from pydumpling.snapshot import SnapshotContext
+
+LOG = []
+
+
+class Registering:
+    def __init_subclass__(cls, **kwargs):
+        pass
+
+
+class Masking(Registering, SnapshotContext):
+    def _text(self, value):
+        LOG.append(value)
+        return "<masked>"
+"""
+
+_UNPICKLED_SCRIPT = """
+import json, pickle, sys
+sys.path.insert(0, sys.argv[1])
+import masking
+from pydumpling.options import DumpOptions
+from pydumpling.snapshot import values
+
+if sys.argv[2] == "write":
+    with open(sys.argv[3], "wb") as file:
+        pickle.dump(masking.Masking(DumpOptions(max_string_bytes=8)), file)
+    raise SystemExit
+with open(sys.argv[3], "rb") as file:
+    context = pickle.load(file)
+judged = vars(masking.Masking).get("_native_walk_class") is masking.Masking
+offered = context._native_walk
+captured = context.value({"key": ["secret", "x" * 20], "other": [1, (2,)]})
+print(json.dumps({
+    "native": values._native is not None,
+    "judged": judged,
+    "offered": offered,
+    "captured": repr(captured),
+    "log": masking.LOG,
+    "truncation": list(context._truncation.items()),
+    "nodes": context._nodes,
+}))
+"""
+
+
+def test_a_context_unpickled_in_a_fresh_process_of_a_class_no_init_judged(
+    tmp_path,
+):
+    """A context pickled in one process and loaded in another, where its
+    class was created past ``ValuesMixin.__init_subclass__`` and no
+    ``__init__`` judged it, captures there as in the Python walk."""
+    (tmp_path / "masking.py").write_text(_UNJUDGED_MODULE)
+    blob = tmp_path / "context.pickle"
+    found = {}
+    for mode in ("write", "1", "0"):
+        environment = _child_environment()
+        environment["PYDUMPLING_NATIVE"] = "1" if mode == "write" else mode
+        process = subprocess.run(
+            [sys.executable, "-B", "-c", _UNPICKLED_SCRIPT]
+            + [str(tmp_path), mode, str(blob)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=60,
+        )
+        assert process.returncode == 0, process.stderr
+        if mode != "write":
+            found[mode] = json.loads(process.stdout)
+    native, pure = found["1"], found["0"]
+    assert native["native"] and native["offered"] and not native["judged"]
+    assert pure["native"] is False
+    for key in ("captured", "log", "truncation", "nodes"):
+        assert native[key] == pure[key], key
+    assert "secret" in native["log"]
+
+
+# --- Inserts that compare with application keys -------------------------------
+
+
+def _capturing_name(hashed, holder, log):
+    """A key of another kind that hashes like ``hashed``: its ``__eq__``,
+    which an insert or lookup of an equal-hashing key runs, captures
+    through the context in ``holder`` once armed, and logs the count it
+    found. It holds no attributes, so a capture of it holds no context."""
+
+    class CapturingName:
+        def __hash__(self):
+            return hash(hashed)
+
+        def __eq__(self, other):
+            context = holder[0]
+            if context is None:
+                return False
+            log.append(("enter", type(other).__name__, context._nodes))
+            context.value([[10], [11]])
+            log.append(("leave", context._nodes))
+            return False
+
+        def __reduce__(self):
+            # A slot name stays the copy's key itself.
+            return (str, ("capturing name",))
+
+    return CapturingName()
+
+
+class _SlotList(list):
+    __slots__ = ("a",)
+
+
+def _colliding_attribute(holder, log):
+    """A snapshot copy captured again whose attribute dict holds a key of
+    another kind and then a plain name that hashes like it."""
+    copy_ = FakeClass("<copy>", {})
+    vars(copy_)[_capturing_name("zz", holder, log)] = 5
+    vars(copy_)["zz"] = 6
+    return copy_
+
+
+def _colliding_slot(holder, log):
+    """A list subclass with a slot under a name of another kind that hashes
+    like the copy's type key, which goes into the copy's namespace last."""
+    name = _capturing_name(FakeList._type_key, holder, log)
+    cls = type("Odd", (_SlotList,), {"__slots__": (), name: _SlotList.a})
+    instance = cls([1])
+    instance.a = [2]
+    return instance
+
+
+@pytest.mark.filterwarnings("ignore:non-string key:RuntimeWarning")
+@pytest.mark.parametrize("where", ["attribute dict", "slot name"])
+@pytest.mark.parametrize("nodes", [1000, 16])
+def test_an_insert_that_compares_with_an_application_key(where, nodes):
+    """Where the walk inserts a plain key into a dict that holds a key of
+    another kind, hashing alike runs that key's ``__eq__``. The walker runs
+    it as application code, with ``_nodes`` synced around it, so a capture
+    from there counts toward the budget as in the Python walk. (A key
+    planted in the context's own ``_layouts`` is not synced:
+    ``test_native_differences`` pins it.)"""
+    outcomes = {}
+    for native in (False, True):
+        log, holder = [], [None]
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_nodes=nodes))
+        if where == "attribute dict":
+            target = _colliding_attribute(holder, log)
+        else:
+            target = _colliding_slot(holder, log)
+        holder[0] = context
+        captured = context.value([[1], [2], target, [3], [4]])
+        holder[0] = None
+        state = (
+            captured,
+            list(context._truncation.items()),
+            context._nodes,
+            len(context.objects),
+        )
+        outcomes[native] = (pickle.dumps(state, protocol=5), log)
+    assert outcomes[True] == outcomes[False]
+    assert outcomes[True][1], "the key's __eq__ never ran"

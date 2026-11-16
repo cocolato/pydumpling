@@ -2,19 +2,23 @@
 //! and the two ways the walk reaches Python code once it has started.
 //!
 //! On a context whose class captures natively (`_native_walk`, chosen once
-//! per class), each of the two methods calls its entry here
-//! first, bound as `_STATICS.value` and `_STATICS.mapping`. An entry reads
-//! the context's state anew and walks. It returns the copy, raises what the
-//! Python walk would raise, or returns `_IN_PYTHON` when it decides, before
-//! the call has done anything, that the call is the Python walk's; the
-//! method then runs the call itself, in its own frame. Once the walk has
-//! done something it never goes back: a node it does not model, or one
-//! below its native stack budget, goes to the Python walk in place
+//! per class), each of the two methods calls its entry here first, bound as
+//! `_STATICS.value` and `_STATICS.mapping`. An entry checks that the class
+//! was judged ([`Statics::judged`]), retiring an instance of one that was
+//! not, reads the context's state anew and walks. It returns the copy,
+//! raises what the Python walk would raise, or returns `_IN_PYTHON` when it
+//! decides, before the call has done anything, that the call is the Python
+//! walk's; the method then runs the call itself, in its own frame. Once the
+//! walk has done something it never goes back: a node it does not model, or
+//! one below its native stack budget, goes to the Python walk in place
 //! ([`State::python_value`]), and an operation that may run application
-//! code runs once, where the Python walk runs it ([`State::application`]).
-//! The walker keeps no memo of its own: like the Python walk, it looks every
-//! copy up in `ctx.objects` and writes it there, and its original into
-//! `ctx._sources`, as it makes it.
+//! code runs once, where the Python walk runs it ([`State::application`]),
+//! with the node count synced around both. Other Python code that runs
+//! inside a call, such as `FakeContainer.__hash__` or a finalizer, is not
+//! synced (`rust/DESIGN.md`, "Hooks and signals"). The walker keeps no memo
+//! of its own: like the Python walk, it looks every copy up in
+//! `ctx.objects` and writes it there, and its original into `ctx._sources`,
+//! as it makes it.
 
 use std::ptr::addr_of;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +30,7 @@ use pyo3::types::PyDict;
 
 use crate::state::State;
 use crate::statics::{type_address, Statics};
+use crate::types::fresh_dict;
 
 /// Why the walk stopped early.
 pub(crate) enum Halt {
@@ -85,6 +90,19 @@ pub(crate) fn in_python<'py>(py: Python<'py>, s: &Statics) -> Bound<'py, PyAny> 
 pub(crate) fn retire<'py>(s: &Statics, ctx: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let py = ctx.py();
     ctx.setattr(intern!(py, "_native_walk"), false)?;
+    Ok(in_python(py, s))
+}
+
+/// [`retire`] for a context whose class was never judged
+/// ([`Statics::judged`]), before anything of the class runs: the flag is
+/// written into the instance dict, past a `__setattr__` nothing compared
+/// with the stock one, which makes that dict exist. Out of line, as no
+/// stock context comes here.
+#[cold]
+#[inline(never)]
+fn unjudged<'py>(s: &Statics, ctx: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let py = ctx.py();
+    fresh_dict(&s.instance_dict, ctx)?.set_item(intern!(py, "_native_walk"), false)?;
     Ok(in_python(py, s))
 }
 
@@ -214,9 +232,10 @@ impl State {
     /// place, for a node the walker does not model or one below its stack
     /// budget: `_native_walk` is false on the instance until it returns, so
     /// the node and everything under it run there, with the arguments the
-    /// Python walk passes and no frame of the walker's between them. The
-    /// flag is then restored: the instance's own is removed where the
-    /// context found the class's `True`, and set back otherwise.
+    /// Python walk passes and no frame of the walker's between them. Then
+    /// the instance's entry is removed where the flag read `True`, so the
+    /// context reads its class's flag again, even where that `True` was the
+    /// instance's own; any other value it read is set back.
     pub(crate) fn python_value<'py>(
         &mut self,
         py: Python<'py>,
@@ -283,6 +302,9 @@ impl StaticsHandle {
         depth: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let s = self.table;
+        if !s.judged(ctx)? {
+            return unjudged(s, ctx);
+        }
         let Some(depth) = exact_depth(s, depth) else {
             // A depth pydumpling's own callers never pass.
             return retire(s, ctx);
@@ -308,6 +330,9 @@ impl StaticsHandle {
     ) -> PyResult<Bound<'py, PyAny>> {
         let s = self.table;
         let py = ctx.py();
+        if !s.judged(ctx)? {
+            return unjudged(s, ctx);
+        }
         let counted = match counted {
             flag if flag.is(s.true_.bind(py)) => Some(true),
             flag if flag.is(s.false_.bind(py)) => Some(false),
@@ -331,5 +356,12 @@ impl StaticsHandle {
     #[getter]
     fn fallbacks(&self) -> u64 {
         fallbacks()
+    }
+
+    /// Records `cls`, the composed context class `values._stock` makes
+    /// native, which the entries then take as judged without a lookup. The
+    /// first class named stays.
+    fn stock(&self, cls: Bound<'_, PyAny>) {
+        let _ = self.table.stock.set(cls.unbind());
     }
 }

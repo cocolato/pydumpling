@@ -20,7 +20,12 @@ impl State {
     /// `ValuesMixin._layout`: what `ctx._layouts` holds for `type(value)`,
     /// computed and written there as the helper does when it holds none.
     /// `_layouts` other than an exact dict runs its own `get` and
-    /// `__setitem__`, as in the Python walk, for every value.
+    /// `__setitem__`, as in the Python walk, for every value. An exact
+    /// dict is read and written natively, and a layout `_layout` wrote
+    /// there is kept per type until the walker next syncs: a key planted
+    /// there that hashes like a class id runs its `__eq__` unsynced, at the
+    /// walker's lookups only (`rust/DESIGN.md`, "The count is stale between
+    /// synced points").
     pub(crate) fn layout(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>) -> Walk<Arc<Layout>> {
         let cls = value.get_type();
         let layouts = self.layouts(py)?;

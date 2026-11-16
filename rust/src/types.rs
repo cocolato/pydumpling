@@ -3,9 +3,11 @@
 //! The Python walk rereads a value's MRO through `type.__dict__`
 //! descriptors for every value. The walker reads it once per type until
 //! application code runs ([`crate::state::State::forget_types`]), and keeps
-//! the type alive so its address is not reused. A class changed in between,
-//! by a finalizer that runs as the walker lets a value go, is seen once the
-//! walker reads the type anew, an accepted difference (`rust/DESIGN.md`).
+//! the type alive so its address is not reused. A class changed in between
+//! by Python code the walker does not sync around (a finalizer as it lets a
+//! value go, or a collection or signal handler inside
+//! `FakeContainer.__hash__`) is seen once the walker reads the type anew, an
+//! accepted difference (`rust/DESIGN.md`).
 
 use std::sync::Arc;
 

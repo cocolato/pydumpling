@@ -6,6 +6,7 @@ test says otherwise, both walks behave the same on CPython 3.12 to 3.15.
 
 import contextlib
 import copy
+import datetime
 import gc
 import json
 import os
@@ -20,6 +21,7 @@ import pytest
 from pydumpling.fake_types import (
     FakeBytes,
     FakeClass,
+    FakeContainer,
     FakeDict,
     FakeFloat,
     FakeFrozenSet,
@@ -379,6 +381,10 @@ def test_a_dict_descriptor_planted_on_fake_class(native):
 # Python walk runs. The walker decides once per options type whether it reads
 # an options object's budgets with attribute access once per call
 # (``DumpOptions`` at import); a hook given to ``DumpOptions`` later runs there.
+# To tell whether a class was judged, a native context reads
+# ``_native_walk_class`` from it, so on a class nothing judged yet, a key or
+# descriptor planted under that name runs, where the Python walk never reads
+# it.
 
 
 def test_a_walk_method_patched_onto_the_class_later(monkeypatch):
@@ -568,23 +574,25 @@ class _Hashing:
 
 
 @contextlib.contextmanager
-def _planted_in_dump_options():
-    """A key other than a str in ``DumpOptions``' class dict, where it
-    hashes like ``max_items`` and comes ahead of it in its probe order."""
-    namespace = gc.get_referents(vars(DumpOptions))[0]
-    planted = _Hashing(hash("max_items"))
-    kept = namespace.pop("max_items")
+def _planted_like(cls, name):
+    """A key other than a str in the class dict of ``cls``, where it hashes
+    like ``name`` and comes ahead of it in its probe order."""
+    namespace = gc.get_referents(vars(cls))[0]
+    planted = _Hashing(hash(name))
+    held = name in namespace
+    kept = namespace.pop(name, None)
     namespace[planted] = None
-    namespace["max_items"] = kept
+    if held:
+        namespace[name] = kept
     # Setting and deleting an attribute resets the attribute caches.
-    DumpOptions._planted = None
-    del DumpOptions._planted
+    cls._planted = None
+    del cls._planted
     try:
         yield
     finally:
         del namespace[planted]
-        DumpOptions._planted = None
-        del DumpOptions._planted
+        cls._planted = None
+        del cls._planted
 
 
 @pytest.mark.parametrize("hook", ["__getattribute__", "a property", "a planted key"])
@@ -617,7 +625,7 @@ def test_hooks_patched_onto_dump_options_later(monkeypatch, hook):
             elif hook == "__getattribute__":
                 patch.setattr(DumpOptions, "__getattribute__", get)
             else:
-                stack.enter_context(_planted_in_dump_options())
+                stack.enter_context(_planted_like(DumpOptions, "max_items"))
             with _armed() as hooks:
                 captured = context.value([[1, 2, 3]])
         found[native] = (pickle.dumps(captured, protocol=5), list(hooks))
@@ -626,6 +634,59 @@ def test_hooks_patched_onto_dump_options_later(monkeypatch, hook):
     assert native <= pure
     assert pure, "the Python walk never ran it"
     assert found[True][0] == found[False][0]
+
+
+class _Registering:
+    """A base whose ``__init_subclass__`` does not call ``super()``: a context
+    class on it is created past ``ValuesMixin.__init_subclass__``, and no
+    walk is chosen for it until its first ``__init__``."""
+
+    def __init_subclass__(cls, **kwargs):
+        pass
+
+
+class _Getting:
+    """A descriptor whose ``__get__`` is logged."""
+
+    def __get__(self, instance, owner=None):
+        _called("planted descriptor __get__")
+
+
+@pytest.mark.filterwarnings("ignore:non-string key:RuntimeWarning")
+@pytest.mark.parametrize("planted", ["a key", "a descriptor"])
+@pytest.mark.parametrize("how", ["__init__", "__class__"])
+def test_a_name_planted_on_a_class_not_judged(planted, how):
+    """To tell whether a context class was judged, a native context reads
+    ``_native_walk_class`` from it: at the first ``__init__`` of a class
+    created past ``ValuesMixin.__init_subclass__``, and at the walker's
+    entry for an instance given such a class by assigning ``__class__``.
+    There a key planted in the class dict that hashes like the name runs its
+    ``__eq__``, and a descriptor defined under the name its ``__get__``. The
+    Python walk never reads the name. The captures are the same."""
+    found = {}
+    for native in (False, True):
+        if planted == "a key":
+            namespace = {_Hashing(hash("_native_walk_class")): None}
+        else:
+            namespace = {"_native_walk_class": _Getting()}
+        if not native:
+            # What the class inherits where the extension is not loaded.
+            namespace["_native_walk"] = False
+        masked = type("Masked", (_Registering, SnapshotContext), namespace)
+        with _armed() as hooks:
+            if how == "__init__":
+                context = masked(DumpOptions())
+            else:
+                with _mode(native):
+                    context = SnapshotContext(DumpOptions())
+                context.__class__ = masked
+            captured = context.value([1, (2,), "x"])
+        found[native] = (pickle.dumps(captured, protocol=5), list(hooks))
+    assert found[True][0] == found[False][0]
+    assert found[False][1] == []
+    assert found[True][1], "the planted code never ran"
+    name = "planted key __eq__" if planted == "a key" else "planted descriptor __get__"
+    assert set(found[True][1]) == {name}
 
 
 # --- Over-long ints ----------------------------------------------------------
@@ -686,21 +747,27 @@ def test_over_long_int_in_an_exception_message():
         assert truncation == {"exception_format": 4}
 
 
-# --- Application code between two sync points --------------------------------
+# --- Python code between two sync points -------------------------------------
 # The walker keeps a call's node count in Rust. It writes the count to the
 # context's ``_nodes`` before application code it runs where the Python walk
-# runs it, and before it reads the context's own instance dict, and reads it
-# back after, so a capture through the same context from there counts on from
-# the walk's count and the walk from its. A collection or a signal handler runs
-# inside a native call only at the walker's signal check, which is synced the
-# same way. Application code that runs anywhere else inside a native call is
-# not: a finalizer or weakref callback that runs as the walker lets go of the
-# last reference to a value, or the ``__eq__`` of an object planted in the
-# context's own ``_namespaces`` (or of a key planted in ``objects``) that the
-# walker's lookup meets. A capture through the same context from there starts
-# from the count of the last sync, and the walk then writes its own count over
-# the one that capture left, so that capture's nodes count toward no budget.
-# Such code runs as often as in the Python walk; only the count differs.
+# runs it, before a node it runs in the Python walk, at its signal check, and
+# before it reads the context's own instance dict, and reads it back after, so
+# a capture through the same context from there counts on from the walk's
+# count and the walk from its; after such code it also reads each type's facts
+# anew. Python code that runs anywhere else inside a native call is not synced:
+# a finalizer or weakref callback that runs as the walker lets go of the last
+# reference to a value; the ``__eq__`` of an object planted in the context's
+# own ``_namespaces`` or ``_layouts`` (or of a key planted in ``objects``) that
+# the walker's lookup meets; and ``FakeContainer.__hash__``, which the walker
+# reaches as the Python walk does, through the set or dict it adds a container
+# copy to, and where the interpreter may run a pending signal handler or
+# collection. A capture through the same context from there starts from the
+# count of the last sync, and the walk then writes its own count over the one
+# that capture left, so that capture's nodes count toward no budget; a class
+# changed there is seen from the next sync or call by a walker that holds its
+# facts. Such code runs as often as in the Python walk, but for a key planted
+# in ``_layouts``: the walker keeps a class's layout once read there until it
+# runs Python code, where the Python walk looks it up for every value.
 
 
 class _Tally(int):
@@ -800,6 +867,173 @@ def test_an_object_planted_in_namespaces():
         assert len(planted.seen) == per_lookup
         found[native] = {count - start for count in planted.seen}
     assert found == {False: {2}, True: {1}}
+
+
+class _Point(tuple):
+    """A tuple subclass, whose copy reads its class's layout."""
+
+
+def test_a_key_planted_in_layouts():
+    """A key of ``_layouts`` that hashes like the id of a class is compared
+    with that id at each lookup and at the insert of the class's layout.
+    The Python walk looks the layout up for each of three values of the
+    class, after counting the value and its item, and inserts it after the
+    first lookup. The walker looks it up and inserts it once, keeps it for
+    the rest of the call, and its two comparisons see the count of its last
+    sync, the list ``value`` counted before the walker's entry. The
+    captures are the same."""
+    found = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions())
+        _check_walker(context, native)
+        context.value([1])
+        start = context._nodes
+        planted = _Planted(hash(id(_Point)), context)
+        context._layouts[planted] = None
+        assert id(_Point) not in context._layouts
+        per_lookup = len(planted.seen)
+        assert per_lookup >= 1
+        planted.seen.clear()
+        before = _fallbacks()
+        captured = context.value([_Point((1,)), _Point((2,)), _Point((3,))])
+        assert _fallbacks() == before
+        seen = [count - start for count in planted.seen[::per_lookup]]
+        found[native] = (pickle.dumps(captured, protocol=5), seen)
+    assert found[True][0] == found[False][0]
+    assert (found[False][1], found[True][1]) == ([2, 2, 4, 6], [1, 1])
+
+
+class _DictProperty:
+    """A base whose ``__dict__`` is a property: a copy of an instance of a
+    class on it keeps no attributes, and counts ``unsupported_type``."""
+
+    @property
+    def __dict__(self):
+        return {}
+
+
+class _WithDict:
+    """A base with the real instance-dict descriptor."""
+
+
+class _Member(tuple):
+    """A tuple subclass, copied as a ``FakeTuple``, which a set copy hashes
+    with ``FakeContainer.__hash__``, Python code."""
+
+
+def _rebased_inside_a_hash(native):
+    """Capture ``[first, {member}, second]``, instances of a class on
+    ``_DictProperty``, while the first collection finalizes a garbage cycle
+    whose finalizer rebases that class onto ``_WithDict``; then a third
+    instance in a second call. Returns what the finalizer saw (whether the
+    count lagged the memo, whether ``second`` was copied yet, whether
+    ``FakeContainer.__hash__`` was running), each copy's ``x``, None where
+    it has none, and the ``unsupported_type`` tally of the first call."""
+
+    class Rebased(_DictProperty):
+        pass
+
+    first, second, third = Rebased(), Rebased(), Rebased()
+    first.x, second.x, third.x = 1, 2, 3
+    with _mode(native):
+        context = SnapshotContext(DumpOptions())
+    _check_walker(context, native)
+    hashing = vars(FakeContainer)["__hash__"].__code__
+    seen = []
+
+    class Finalized:
+        def __del__(self):
+            Rebased.__bases__ = (_WithDict,)
+            frames, frame = [], sys._getframe(1)
+            while frame is not None:
+                frames.append(frame.f_code)
+                frame = frame.f_back
+            stale = context._nodes < len(context.objects)
+            seen.append((stale, id(second) in context.objects, hashing in frames))
+
+    value = [first, {_Member((0,))}, second]
+    saved = gc.get_threshold()
+    gc.collect()
+    garbage = Finalized()
+    garbage.cycle = garbage
+    del garbage
+    before = _fallbacks()
+    # The collection runs where the interpreter next checks for pending work
+    # after the walk allocates: the Python walk's next call, or the first
+    # Python code inside the native call.
+    gc.set_threshold(1)
+    try:
+        captured = context.value(value)
+    finally:
+        gc.set_threshold(*saved)
+    assert _fallbacks() == before
+    tally = context._truncation["unsupported_type"]
+    later = context.value(third)
+    return seen, [vars(copy).get("x") for copy in (*captured[::2], later)], tally
+
+
+def test_a_class_rebased_between_two_sync_points():
+    """In the Python walk the collection runs at once, before ``first`` is
+    copied, and every copy after it has the rebased class's attributes. The
+    walker runs no Python code until the set copy hashes its member, in
+    ``FakeContainer.__hash__``, where the collection runs with the count of
+    the last sync, after ``first`` and before ``second``. The walker still
+    holds the class's facts from ``first``, so ``second`` is copied as before
+    the rebase, without attributes; the next call reads them."""
+    assert _rebased_inside_a_hash(False) == ([(False, False, False)], [1, 2, 3], 0)
+    assert _rebased_inside_a_hash(True) == ([(True, False, True)], [None, None, 3], 2)
+
+
+class _Opaque:
+    """An object that cannot be unpacked."""
+
+
+def test_unpacking_a_layout_entry_python_code_wrote():
+    """A member of a ``_layouts`` entry Python code wrote that cannot be
+    unpacked as ``name, member`` raises ``TypeError`` in both walks. The
+    walker names its type by ``__name__``, where the interpreter prints
+    ``tp_name``, with the module for a static extension type and cut at 200
+    characters, and it looks ``__iter__`` and ``__getitem__`` up in the
+    type's class dicts to tell whether it is iterable, which runs the
+    ``__eq__`` of a key there that hashes alike. How often one lookup meets
+    that key depends on the hash's bits, so it is measured first."""
+
+    class Point(tuple):
+        pass
+
+    long_named = type("L" * 250, (), {})
+    items = [datetime.date(2020, 1, 1), long_named(), _Opaque()]
+    found = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_depth=2))
+        _check_walker(context, native)
+        messages = []
+        points = [Point((7, 8)) for _ in items]
+        with _planted_like(_Opaque, "__iter__"):
+            with _armed() as hooks:
+                assert "__iter__" not in vars(_Opaque)
+                per_lookup = len(hooks)
+            assert per_lookup >= 1
+            before = _fallbacks()
+            with _armed() as hooks:
+                for item, point in zip(items, points):
+                    context._layouts[id(Point)] = (Point, [item], ())
+                    with pytest.raises(TypeError) as raised:
+                        context.value(point)
+                    messages.append(str(raised.value))
+                lookups = len(hooks) / per_lookup, set(hooks)
+        assert _fallbacks() == before
+        _check_walker(context, native)
+        found[native] = (messages, lookups)
+    unpack = "cannot unpack non-iterable {} object".format
+    python = [unpack("datetime.date"), unpack("L" * 200), unpack("_Opaque")]
+    walker = [unpack("date"), unpack("L" * 250), unpack("_Opaque")]
+    assert found == {
+        False: (python, (0, set())),
+        True: (walker, (1, {"planted key __eq__"})),
+    }
 
 
 # --- CPython's C recursion limit ---------------------------------------------

@@ -531,7 +531,7 @@ _RECURSIVE_IMMUTABLE = "recursive immutable reference"
 _IN_PYTHON = object()
 # The walker's table and its native entries, bound below when the extension
 # loads.
-_STATICS = _native_value = _native_mapping = None
+_STATICS = _native_value = _native_mapping = _native_stock = None
 
 # The context methods the native walker carries out itself.  A context class
 # that overrides any of them captures in Python, which calls the override.
@@ -558,10 +558,11 @@ _NATIVE_WALK = (
 
 # How the Python walk reads and writes the context's own state, which the
 # native walker reads and writes with the same attribute access, once per
-# call.  Attribute access never looks ``__dict__`` up, so a class whose
-# ``__dict__`` entry is another class's, as a plain mixin gives it before
-# 3.15, still captures natively.
-_STATE_ACCESS = ("__getattribute__", "__setattr__", "__delattr__")
+# call: every hook of an instance's attribute access, ``__getattr__`` for an
+# attribute that is missing included.  Attribute access never looks
+# ``__dict__`` up, so a class whose ``__dict__`` entry is another class's, as
+# a plain mixin gives it before 3.15, still captures natively.
+_STATE_ACCESS = ("__getattribute__", "__getattr__", "__setattr__", "__delattr__")
 
 # The context state the native walker reads or writes.  The stock class
 # holds none of them, so attribute access finds them in the instance; a
@@ -589,16 +590,19 @@ _NATIVE_STATE = (
 # attribute hook or a state attribute, whose walk only this module runs, and
 # on its subclasses.  ``_native_walk_class`` names the class it was chosen for:
 # ``SnapshotContext.__init__`` chooses it for a class whose
-# ``__init_subclass__`` chain never reached ``ValuesMixin``'s.  An instance
-# set to False captures in Python: the walker sets it so for a context whose
-# state or arguments it does not mirror.  Changes to a class after it was
-# chosen are not seen.  An unlimited context, where probing each original
-# with the serializer dominates the cost, is never offered to the walker
-# (``value`` reads ``_unlimited`` first, ``_mapping`` offers only
-# ``_unlimited is False``), and nothing sets the flag on it: once any
-# instance holds ``_native_walk`` of its own, the name joins the class's
-# shared instance keys (3.13+), and every later load of the class's flag,
-# on any context, misses its specialization, 3 to 5 ns more a load.
+# ``__init_subclass__`` chain never reached ``ValuesMixin``'s, and the
+# walker's entries check it, so an instance of such a class that no
+# ``__init__`` judged (unpickled, made by ``object.__new__``, or given the
+# class by assigning ``__class__``) captures in Python.  An instance set to
+# False captures in Python: the walker sets it so for a context whose state
+# or arguments it does not mirror, or whose class was not judged.  Changes to
+# a class after it was chosen are not seen.  An unlimited context, where
+# probing each original with the serializer dominates the cost, is never
+# offered to the walker (``value`` reads ``_unlimited`` first, ``_mapping``
+# offers only ``_unlimited is False``), and nothing sets the flag on it: once
+# any instance holds ``_native_walk`` of its own, the name joins the class's
+# shared instance keys (3.13+), and every later load of the class's flag, on
+# any context, misses its specialization, 3 to 6 ns more a load.
 
 # The walk attributes of the context class the native walker stands in for,
 # recorded by ``_stock``; None while the extension is not loaded.
@@ -630,13 +634,15 @@ def _stock(cls):
     """Make ``cls``, the composed context class, capture natively.
 
     Its walk attributes are what the native walker stands in for; each
-    subclass is compared with them when it is created.
+    subclass is compared with them when it is created.  The walker's
+    entries take the class itself as judged without looking it up.
     """
     global _STOCK_WALK
     if _native is not None:
         _STOCK_WALK = _walk_methods(cls)
         cls._native_walk = True
         cls._native_walk_class = cls
+        _native_stock(cls)
 
 
 def _choose_walk(cls):
@@ -680,10 +686,12 @@ if _native is not None:
     try:
         # The walker's table of this module's classes and of ``value``, which
         # it calls for a node it runs in this walk, so a reloaded or vendored
-        # copy of the package has its own, and its two entries, which
-        # ``value`` and ``_mapping`` call.
+        # copy of the package has its own, its two entries, which ``value``
+        # and ``_mapping`` call, and where ``_stock`` names the composed
+        # context class.
         _STATICS = _native.Statics(globals(), _identity)
         _native_value, _native_mapping = _STATICS.value, _STATICS.mapping
+        _native_stock = _STATICS.stock
     except Exception as error:
         # An extension built for another version of this module, which lacks
         # what it reads here or has other entries: the package it only
@@ -698,4 +706,4 @@ if _native is not None:
             stacklevel=1,
         )
         _native = None
-        _STATICS = _native_value = _native_mapping = None
+        _STATICS = _native_value = _native_mapping = _native_stock = None

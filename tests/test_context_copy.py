@@ -2,6 +2,7 @@
 
 import copy
 import pickle
+from collections import Counter
 
 import dill
 import pytest
@@ -32,10 +33,27 @@ def _fallbacks():
     return statics.fallbacks if statics is not None else 0
 
 
+def _counted_entries(monkeypatch):
+    """Calls of the walker's two entries, per entry and context, from here
+    on."""
+    entries = Counter()
+    for name in ("_native_value", "_native_mapping"):
+        entry = getattr(values_module, name)
+        if entry is None:
+            continue
+
+        def counted(context, *args, _entry=entry, _name=name):
+            entries[_name, id(context)] += 1
+            return _entry(context, *args)
+
+        monkeypatch.setattr(values_module, name, counted)
+    return entries
+
+
 @pytest.mark.parametrize("native", [False, True], ids=["python", "native"])
 @pytest.mark.parametrize("context_type", [_SlottedContext, _ChildContext])
 @pytest.mark.parametrize("clone", [copy.copy, copy.deepcopy, _pickle_copy, _dill_copy])
-def test_context_copy_preserves_slots(native, context_type, clone):
+def test_context_copy_preserves_slots(native, context_type, clone, monkeypatch):
     if native and values_module._native is None:
         pytest.skip("the optional native walker is unavailable")
     context = context_type(DumpOptions())
@@ -71,4 +89,15 @@ def test_context_copy_preserves_slots(native, context_type, clone):
     else:
         assert copied.tag is not context.tag
     assert copied.value("new value") == "new value"
+    # A container new to the copy goes through the copy's walk: the
+    # walker's entry, natively, and the same copy as a Python walk makes.
+    fresh = [3, {"k": [4]}]
+    reference = SnapshotContext(DumpOptions())
+    reference._native_walk = False
+    expected = pickle.dumps(reference.value(fresh), protocol=pickle.HIGHEST_PROTOCOL)
+    entries = _counted_entries(monkeypatch)
+    captured = copied.value(fresh)
+    assert entries == (Counter({("_native_value", id(copied)): 1}) if native else {})
+    assert pickle.dumps(captured, protocol=pickle.HIGHEST_PROTOCOL) == expected
+    assert copied._native_walk is native
     assert _fallbacks() == before

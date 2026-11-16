@@ -592,6 +592,41 @@ def _dense(kind, runner):
     return _frame_capture(held, DumpOptions(), runner)
 
 
+# The named tuple types of record_stack, one per frame, made when it runs.
+_RECORD_TYPES = []
+
+
+def _records(level, levels, fn):
+    """Descend ``levels`` frames, each holding an instance of a named tuple
+    type of its own, then call ``fn``."""
+    record = _RECORD_TYPES[level](level, "x")
+    return fn() if level + 1 >= levels else _records(level + 1, levels, fn)
+
+
+def _record_stack(depth, runner):
+    """from_frame of a stack ``depth`` deep, every frame captured, whose
+    frames each hold an instance of a named tuple type of their own, as
+    functions holding their own record types do: each frame's _mapping reads
+    a layout ``_layouts`` lacks, beside those of the frames captured before
+    it.  The recursion limit is raised to leave the walk room."""
+    DumpOptions, SnapshotContext, _ = _api()
+    options = DumpOptions(max_frames=depth + 100)
+    _RECORD_TYPES[:] = [namedtuple(f"Record{i}", "level name") for i in range(depth)]
+
+    def build():
+        return Case(lambda: _from_caller(SnapshotContext, options))
+
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(depth + 1000)
+    try:
+        # _records' frames, then the runner callback, Runner.__call__,
+        # _sample or _content, and run itself, which executes ``depth`` deep.
+        levels = depth - _depth() - _RUN_OFFSET + 1
+        return _records(0, levels, lambda: runner(build))
+    finally:
+        sys.setrecursionlimit(limit)
+
+
 def _deep_frame(threaded, runner):
     """A frame of a 150-level list, dict chain and object chain, captured at
     max_depth=100: the native walk keeps each level natively on the main
@@ -757,6 +792,36 @@ def _per_call(kind, runner):
     return runner(lambda: Case(run, inner=200, reset=reset))
 
 
+def _subclass_calls(runner):
+    """value() of a new list subclass instance, 200 per run, on a live
+    context whose ``_layouts`` already holds the layouts of 2,000 classes,
+    as after capturing that many builtin subclass types; each run gets the
+    context afresh, with a copy of those layouts."""
+    DumpOptions, SnapshotContext, _ = _api()
+    options, live = DumpOptions(), [None]
+    kinds = [type(f"Kind{i}", (list,), {}) for i in range(2000)]
+    filled = SnapshotContext(DumpOptions(max_items=None, max_nodes=None))
+    filled.value([kind((i,)) for i, kind in enumerate(kinds)])
+
+    class Row(list):
+        """The class of the values each call captures."""
+
+    # Ints past the small-int cache: each is a node of its own.
+    rows = [Row((100_000 + step,)) for step in range(200)]
+
+    def reset():
+        live[0] = SnapshotContext(options)
+        live[0]._layouts.update(filled._layouts)
+
+    def run():
+        context = live[0]
+        for row in rows[:-1]:
+            context.value(row)
+        return context.value(rows[-1]), context
+
+    return runner(lambda: Case(run, inner=200, reset=reset))
+
+
 def _deep_data(kind, threaded, runner):
     DumpOptions, SnapshotContext, _ = _api()
     if kind == "list":  # [[[...]]], 2000 levels
@@ -875,6 +940,8 @@ def _registry():
         ("out_of_nodes", "value(new int) on a live context with no nodes left"),
     ):
         add(f"call_{kind}", what, partial(_per_call, kind))
+    what = "value(new list subclass instance) on a live context, 2,000 _layouts"
+    add("call_live_subclass", what, _subclass_calls)
     for kind, data in (("list", "2000-level list"), ("chain", "300-object chain")):
         for threaded in (False, True):
             where = "thread with a 512 KiB stack" if threaded else "main thread"
@@ -892,6 +959,8 @@ def _registry():
     for kind, values in _DENSE_KINDS.items():
         what = f"from_frame, frame of 300 each of {values}"
         add(f"dense_{kind}", what, partial(_dense, kind))
+    what = "from_frame, max_frames=2100, stack depth 2000, a record type per frame"
+    add("record_stack_d2000", what, partial(_record_stack, 2000))
     for threaded in (False, True):
         what = "from_frame, max_depth=100, frame of 150-level list, dicts, objects"
         where = ", thread with a 512 KiB stack" if threaded else ""

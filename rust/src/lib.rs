@@ -14,9 +14,11 @@
 //! same C entry points, and runs a node it does not model, or one below its
 //! native stack budget, in the Python walk in place. It calls none of
 //! pydumpling's Python helpers, so tracing and profiling hooks see only
-//! that application code and those nodes. CPython's C recursion limit is
-//! excepted for both, which run beneath the walker's C frames (see the
-//! contract and "The C recursion limit" in `rust/DESIGN.md`).
+//! that application code, those nodes, and `FakeContainer.__hash__` where
+//! a set or dict hashes a container copy, through C as in the Python walk.
+//! CPython's C recursion limit is excepted for the code and the nodes,
+//! which run beneath the walker's C frames (see the contract and "The C
+//! recursion limit" in `rust/DESIGN.md`).
 //!
 //! The module is optional and needs CPython 3.12+ with the GIL. Where it is
 //! not loaded, under `python -b`, or with `PYDUMPLING_NATIVE=0`, pydumpling

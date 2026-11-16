@@ -255,8 +255,14 @@ impl State {
     /// (through the context, or a reference to the dict): its `_nodes`
     /// holds the running count when the Python walk reads its entries, so
     /// the walk writes it there and takes it. Only a selected key that is
-    /// the very `"_nodes"` attribute names are interned as sends the walker
-    /// to compare `source` with that dict, which a lookup would not.
+    /// the interned `"_nodes"`, the very object attribute names are, while
+    /// the count is not written, can make `source` that dict. It is then an
+    /// exact dict whose `_nodes` is the object the context holds and whose
+    /// `objects` is the context's; both are read as attributes, which
+    /// leaves the dict unmade. Only a mapping that passes (that dict, or a
+    /// copy of it, both made from the dict) sends the walker to read the
+    /// dict and compare it with `source`; reading it makes the dict exist,
+    /// which the Python walk never does (`rust/DESIGN.md`, "State reads").
     fn own_count<'py>(
         &mut self,
         py: Python<'py>,
@@ -267,16 +273,44 @@ impl State {
         if self.written == Some(self.nodes) {
             return Ok(());
         }
-        let Some(entry) = chosen.entries.iter_mut().find(|(key, _)| key.is(name)) else {
+        let Some(slot) = chosen.entries.iter().position(|(key, _)| key.is(name)) else {
             return Ok(());
         };
-        if entry.1.is_none() || !source.is(&fresh_dict(&self.s.instance_dict, self.ctx(py))?) {
+        let Some(found) = &chosen.entries[slot].1 else {
+            return Ok(());
+        };
+        if type_address(source) != self.s.dict {
+            return Ok(());
+        }
+        let ctx = self.ctx(py).clone();
+        if !found.is(&ctx.getattr(name)?) {
+            return Ok(());
+        }
+        // A small int is one object wherever it is held, so `_nodes` alone
+        // passes another context's dict, or an object's, that holds the
+        // same count. `objects` tells them apart; a selection cut short by
+        // a budget may leave it out, and only then is the dict read.
+        let memo = intern!(py, "objects");
+        match chosen.entries.iter().find(|(key, _)| key.is(memo)) {
+            Some((_, Some(objects))) => {
+                if !objects.is(&ctx.getattr(memo)?) {
+                    return Ok(());
+                }
+            }
+            Some((_, None)) => return Ok(()),
+            None => {
+                if chosen.entries.len() >= source.len()? {
+                    return Ok(());
+                }
+            }
+        }
+        if !source.is(&fresh_dict(&self.s.instance_dict, &ctx)?) {
             return Ok(());
         }
         let count = self.nodes.into_pyobject(py)?.into_any();
-        self.ctx(py).setattr(name, &count)?;
+        ctx.setattr(name, &count)?;
         self.written = Some(self.nodes);
-        entry.1 = Some(count);
+        chosen.entries[slot].1 = Some(count);
         Ok(())
     }
 
@@ -284,8 +318,8 @@ impl State {
     /// names, not string data. `private` is the bookkeeping attribute of a
     /// snapshot copy captured again; its caller restores it. Leaving it out
     /// builds a dict of the other entries, which hashes a key that is not a
-    /// plain one with its own `__hash__`, as the Python walk's dict
-    /// comprehension does.
+    /// plain one with its own `__hash__`, and compares a later key with it,
+    /// as the Python walk's dict comprehension does ([`State::insert`]).
     pub(crate) fn attribute_mapping<'py>(
         &mut self,
         py: Python<'py>,
@@ -297,16 +331,13 @@ impl State {
             None => attrs.clone(),
             Some(private) => {
                 let kept = PyDict::new(py);
+                let mut mixed = false;
                 for item in self.s.dict_items.bind(py).call1((attrs,))?.try_iter()? {
                     let (key, value) = pair(self.s, item?)?;
                     if is_exact_str(self, &key) && key.eq(private)? {
                         continue;
                     }
-                    if self.s.plain_key(&key) {
-                        kept.set_item(key, value)?;
-                    } else {
-                        self.application(py, || kept.set_item(key, value))?;
-                    }
+                    self.insert(py, &kept, &key, &value, &mut mixed)?;
                 }
                 kept.into_any()
             }

@@ -9,9 +9,10 @@
 //! package, a reloaded one or a vendored copy, gets its own classes, and
 //! its own native entries, the table's `value` and `mapping` methods.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use pyo3::exceptions::PyTypeError;
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyInt, PyTuple};
 
@@ -121,8 +122,9 @@ pub(crate) struct Statics {
     /// `object`.
     pub object: Py<PyAny>,
     /// `DumpOptions`, whether the walker reads its instances' budgets
-    /// ([`Statics::reads_options`]), as at import, and the same for each
-    /// other options type met since, kept alive with its verdict.
+    /// ([`Statics::reads_options`]), as at import, and the same for other
+    /// options types met since, each kept alive with its verdict, a bounded
+    /// number at a time.
     pub dump_options: usize,
     pub(crate) dump_options_read: bool,
     pub(crate) options_types: Mutex<AddressMap<(Py<PyAny>, bool)>>,
@@ -141,6 +143,11 @@ pub(crate) struct Statics {
     pub frame_locals: usize,
     pub true_: Py<PyAny>,
     pub false_: Py<PyAny>,
+    /// `type`.
+    pub type_: usize,
+    /// The composed context class, `SnapshotContext`, once `values._stock`
+    /// named it ([`Statics::judged`]).
+    pub(crate) stock: OnceLock<Py<PyAny>>,
 }
 
 impl Statics {
@@ -265,6 +272,8 @@ impl Statics {
             frame_locals,
             true_: builtin("True")?.unbind(),
             false_: builtin("False")?.unbind(),
+            type_: address(&builtin("type")?),
+            stock: OnceLock::new(),
         };
         table.dump_options_read = table.options_verdict(&options)?;
         for (base, namespace) in class_dicts(&table, table.fake_class.bind(py))? {
@@ -280,6 +289,33 @@ impl Statics {
             table.fake_class_dicts.push(namespace.unbind());
         }
         Ok(table)
+    }
+
+    /// Whether the class of `ctx` was judged to capture natively: the
+    /// composed class, or a class `_choose_walk` judged, which holds
+    /// `_native_walk_class` naming itself. A class created past
+    /// `ValuesMixin.__init_subclass__` (a base ahead of it whose own
+    /// `__init_subclass__` does not call `super()`) inherits its flag from
+    /// a class that was judged; until `SnapshotContext.__init__` judges it,
+    /// an instance that reached it otherwise (unpickled, `object.__new__`,
+    /// `__class__` assigned) finds a parent's name there. The name is read
+    /// as `type` reads a class attribute, through the MRO and its cache,
+    /// when the metaclass is `type`, and from the class's own dict, read
+    /// through `type.__dict__`, past any other metaclass's hooks.
+    pub(crate) fn judged(&self, ctx: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let py = ctx.py();
+        let cls = ctx.get_type().into_any();
+        if self.stock.get().is_some_and(|stock| cls.is(stock.bind(py))) {
+            return Ok(true);
+        }
+        let name = intern!(py, "_native_walk_class");
+        let found = if type_address(&cls) == self.type_ {
+            cls.getattr_opt(name)?
+        } else {
+            let namespace = self.class_dict.bind(py).call1((&cls, cls.get_type()))?;
+            Some(namespace.call_method1(intern!(py, "get"), (name,))?)
+        };
+        Ok(found.is_some_and(|found| found.is(&cls)))
     }
 
     /// `_plain_key`: whether hashing or comparing a key runs no
