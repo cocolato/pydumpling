@@ -1,18 +1,18 @@
-//! Budgets, counters, placeholders, and bounded text: the small helpers of
-//! `SnapshotContext`, each with a fast path for the common case and the
-//! Python helper itself for the rest, so every side effect stays the same.
+//! Budgets, counters, placeholders, and bounded text: the helpers of
+//! `SnapshotContext` the walk uses, done natively with the operations the
+//! Python helpers make, in their order, through the C API.
 
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyInt, PyString};
+use pyo3::types::{PyBytes, PyDict, PyInt, PySlice, PyString};
 
+use crate::state::State;
 use crate::statics::{type_address, Statics};
-use crate::types::fresh_dict;
-use crate::walker::{Halt, State, Walk};
+use crate::types::{fresh_dict, TypeInfo};
+use crate::walker::Walk;
 
 /// Whether `chars` code points surely fit in `limit` UTF-8 bytes: each takes
-/// at most four, so the Python helper's encode-and-compare returns the
-/// value itself.
+/// at most four, so `_bounded_text`'s encode-and-compare keeps the value.
 fn surely_fits(chars: usize, limit: u64) -> bool {
     (chars as u128) * 4 <= u128::from(limit)
 }
@@ -27,6 +27,11 @@ fn fits(py: Python<'_>, value: &Bound<'_, PyAny>, limit: u64) -> PyResult<bool> 
         return Ok(true);
     }
     Ok(chars as u64 <= limit && value.call_method0(intern!(py, "isascii"))?.is_truthy()?)
+}
+
+/// `[:limit]`, for a limit that fits, as slicing reads it.
+fn head(py: Python<'_>, limit: u64) -> Bound<'_, PySlice> {
+    PySlice::new(py, 0, isize::try_from(limit).unwrap_or(isize::MAX), 1)
 }
 
 /// Reads a budget as `DumpOptions` validates it: `Some(None)` for `None`,
@@ -62,137 +67,245 @@ impl State {
             .is_some_and(|limit| i128::from(depth) >= i128::from(limit))
     }
 
-    /// `self._truncation[reason]`, which counting adds one to. An exact
-    /// int is read without running code; another tally the Python walk
-    /// adds to with its own `__add__`, so the call goes to it.
-    fn tally(&self, py: Python<'_>, reason: &Bound<'_, PyString>) -> Walk<i64> {
-        match self.truncation.bind(py).get_item(reason)? {
-            None => Ok(0),
-            Some(count) if type_address(&count) == self.s.int => match count.extract::<i64>() {
-                Ok(count) if count < i64::MAX => Ok(count),
-                _ => Err(Halt::Bail),
-            },
-            Some(_) => Err(Halt::Bail),
+    /// `self._truncation[reason] += 1`: the subscript, the in-place add and
+    /// the store the Python walk makes. An exact `Counter` is read in the
+    /// dict, where a missing tally is 0 without its `__missing__`, and an
+    /// exact int tally is added to natively; anything else runs its own
+    /// code, as in the Python walk.
+    pub(crate) fn count(&mut self, py: Python<'_>, reason: &Bound<'_, PyString>) -> Walk<()> {
+        let (truncation, counter, plain) = self.truncation(py)?;
+        self.started = true;
+        if !counter {
+            let iadd = self.s.iadd.bind(py);
+            return self.application(py, || {
+                let tally = truncation.get_item(reason)?;
+                truncation.set_item(reason, iadd.call1((tally, 1))?)
+            });
         }
-    }
-
-    /// `self._truncation[reason] += 1`.
-    pub(crate) fn count(&self, py: Python<'_>, reason: &Bound<'_, PyString>) -> Walk<()> {
-        let current = self.tally(py, reason)?;
-        self.truncation.bind(py).set_item(reason, current + 1)?;
+        let tallies = truncation.cast_into::<PyDict>().map_err(PyErr::from)?;
+        let (iadd, int) = (self.s.iadd.bind(py), self.s.int);
+        if !plain {
+            // A key's own `__eq__` may run in either lookup.
+            return self.application(py, || {
+                let tally = match tallies.get_item(reason)? {
+                    None => PyInt::new(py, 1).into_any(),
+                    Some(tally) if type_address(&tally) == int => tally.add(1)?,
+                    Some(tally) => iadd.call1((tally, 1))?,
+                };
+                tallies.set_item(reason, tally)
+            });
+        }
+        let tally = match tallies.get_item(reason)? {
+            None => PyInt::new(py, 1).into_any(),
+            Some(tally) if type_address(&tally) == int => match tally.extract::<i64>() {
+                Ok(count) if count < i64::MAX => PyInt::new(py, count + 1).into_any(),
+                _ => tally.add(1)?,
+            },
+            Some(tally) => {
+                // Its own `__iadd__` may run, and change what the store
+                // below compares.
+                return self.application(py, || tallies.set_item(reason, iadd.call1((tally, 1))?));
+            }
+        };
+        tallies.set_item(reason, tally)?;
         Ok(())
-    }
-
-    /// Hands the call back before a Python helper that may count `reason`
-    /// runs Python code: a hook or the tally's own `__add__` must run in
-    /// the Python walk alone, not once here and again after a hand-back.
-    fn before_helper(&self, py: Python<'_>, reason: &Bound<'_, PyString>) -> Walk<()> {
-        self.tally(py, reason)?;
-        self.before_python(py)
     }
 
     /// `SnapshotContext._remember`, for the original whose id is `id`.
     pub(crate) fn remember<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         id: &Bound<'py, PyInt>,
         original: &Bound<'py, PyAny>,
         captured: Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
-        self.objects(py)?.set_item(id, &captured)?;
+        self.started = true;
+        self.objects(py).set_item(id, &captured)?;
         // Under an int of its own, as the Python walk's second `id()` makes
         // one: a walk that captures both dicts copies each key as a value.
-        self.sources(py)?
-            .set_item(crate::statics::id(original), original)?;
+        let (sources, key) = (self.sources(py)?, crate::statics::id(original));
+        if type_address(&sources) == self.s.dict {
+            sources.set_item(key, original)?;
+        } else {
+            // Its own `__setitem__` may run.
+            self.application(py, || sources.set_item(key, original))?;
+        }
         Ok(captured)
     }
 
     /// `SnapshotContext._text` for an exact str.
     pub(crate) fn text<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         value: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
-        match self.max_string_bytes {
-            Some(limit) if !fits(py, value, limit)? => {
-                self.before_helper(py, intern!(py, "max_string_bytes"))?;
-                Ok(self.ctx(py)?.call_method1(intern!(py, "_text"), (value,))?)
-            }
-            _ => Ok(value.clone()),
-        }
+        let limit = self.max_string_bytes;
+        self.bounded_text(py, value, limit, intern!(py, "max_string_bytes"))
     }
 
-    /// `SnapshotContext._code_text` for an exact str.
+    /// `SnapshotContext._code_text`. A `_code_text_limit` other than
+    /// `None` or a positive exact int, which only Python code rebinding it
+    /// makes, bounds the text with its own code, as in the Python walk.
     pub(crate) fn code_text<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         value: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
-        match self.code_text_limit {
-            Some(limit) if !fits(py, value, limit)? => {
-                self.before_helper(py, intern!(py, "code_metadata"))?;
-                Ok(self
-                    .ctx(py)?
-                    .call_method1(intern!(py, "_code_text"), (value,))?)
-            }
-            _ => Ok(value.clone()),
+        let reason = intern!(py, "code_metadata");
+        let limit = self.code_text_limit(py)?;
+        match budget(self.s, &limit) {
+            Some(read) => self.bounded_text(py, value, read, reason),
+            None => self.bounded_object(py, value, &limit, reason),
         }
     }
 
-    /// `SnapshotContext._bounded_bytes` with the string budget.
+    /// `SnapshotContext._bounded_text(value, limit, reason)`: the str
+    /// slice, `encode("utf-8", "surrogatepass")`, bytes slice and
+    /// `decode("utf-8", "ignore")` it makes (with `context._utf8_prefix`),
+    /// on an exact str through the C API, whose codecs and error handlers
+    /// are C. Any other value, which only a type name made by a str
+    /// subclass's own code is, runs the same operations generically.
+    fn bounded_text<'py>(
+        &mut self,
+        py: Python<'py>,
+        value: &Bound<'py, PyAny>,
+        limit: Option<u64>,
+        reason: &Bound<'py, PyString>,
+    ) -> Walk<Bound<'py, PyAny>> {
+        let Some(limit) = limit else {
+            return Ok(value.clone());
+        };
+        if type_address(value) != self.s.str_ {
+            let limit = PyInt::new(py, limit).into_any();
+            return self.bounded_object(py, value, &limit, reason);
+        }
+        if fits(py, value, limit)? {
+            return Ok(value.clone());
+        }
+        let encode = (intern!(py, "utf-8"), intern!(py, "surrogatepass"));
+        let prefix = value.get_item(head(py, limit))?;
+        let encoded = if value.len()? == prefix.len()? {
+            let encoded = prefix.call_method1(intern!(py, "encode"), encode)?;
+            if encoded.len()? as u64 <= limit {
+                return Ok(value.clone());
+            }
+            encoded
+        } else {
+            prefix.call_method1(intern!(py, "encode"), encode)?
+        };
+        self.count(py, reason)?;
+        // `_utf8_prefix(value, limit)`: `value[:limit]` is `prefix`, and
+        // encoding it again gives the same bytes.
+        let encoded = encoded.cast_into::<PyBytes>().map_err(PyErr::from)?;
+        let bytes = encoded.as_bytes();
+        let cut = PyBytes::new(py, &bytes[..bytes.len().min(limit as usize)]);
+        let decoded = PyString::from_encoded_object(cut.as_any(), Some(c"utf-8"), Some(c"ignore"))?;
+        Ok(decoded.into_any())
+    }
+
+    /// `_bounded_text` on a value other than an exact str, or with a limit
+    /// other than a positive int, whose own code may run at every step, as
+    /// in the Python walk.
+    fn bounded_object<'py>(
+        &mut self,
+        py: Python<'py>,
+        value: &Bound<'py, PyAny>,
+        limit: &Bound<'py, PyAny>,
+        reason: &Bound<'py, PyString>,
+    ) -> Walk<Bound<'py, PyAny>> {
+        if limit.is_none() {
+            return Ok(value.clone());
+        }
+        // `value[:limit]` slices with `slice(None, limit, None)`.
+        let stop = self.s.slice_cls.bind(py).call1((py.None(), limit))?;
+        let encode = (intern!(py, "utf-8"), intern!(py, "surrogatepass"));
+        let keep = self.application(py, || {
+            let prefix = value.get_item(&stop)?;
+            if value.len()? != prefix.len()? {
+                return Ok(false);
+            }
+            let size = prefix.call_method1(intern!(py, "encode"), encode)?.len()?;
+            size.into_pyobject(py)?.le(limit)
+        })?;
+        if keep {
+            return Ok(value.clone());
+        }
+        self.count(py, reason)?;
+        let decode = (intern!(py, "utf-8"), intern!(py, "ignore"));
+        self.application(py, || {
+            let encoded = value
+                .get_item(&stop)?
+                .call_method1(intern!(py, "encode"), encode)?;
+            encoded
+                .get_item(&stop)?
+                .call_method1(intern!(py, "decode"), decode)
+        })
+    }
+
+    /// `SnapshotContext._bounded_bytes(value, max_string_bytes,
+    /// "max_string_bytes")` for exact bytes or a bytearray.
     ///
     /// Slicing nonempty exact bytes to its full length returns the object
     /// itself; an empty one may become the shared empty bytes.
     pub(crate) fn bounded_bytes<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         value: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
-        if type_address(value) == self.s.bytes
-            && value.len().is_ok_and(|size| {
-                size > 0
-                    && self
-                        .max_string_bytes
-                        .is_none_or(|limit| size as u64 <= limit)
-            })
-        {
+        let size = value.len()? as u64;
+        let limit = self.max_string_bytes;
+        if type_address(value) == self.s.bytes && size > 0 && limit.is_none_or(|l| size <= l) {
             return Ok(value.clone());
         }
-        let reason = intern!(py, "max_string_bytes");
-        self.before_helper(py, reason)?;
-        let args = (value, self.string_limit.bind(py), reason);
-        Ok(self
-            .ctx(py)?
-            .call_method1(intern!(py, "_bounded_bytes"), args)?)
+        if limit.is_some_and(|limit| size > limit) {
+            self.count(py, intern!(py, "max_string_bytes"))?;
+        }
+        let slice = match limit {
+            Some(limit) => head(py, limit),
+            None => PySlice::full(py),
+        };
+        Ok(value.get_item(slice)?)
     }
 
-    /// `SnapshotContext._type_name`: read through the type descriptors.
+    /// `SnapshotContext._type_name`: the class's `__module__` and
+    /// `__qualname__`, read through the `type` descriptors, joined with the
+    /// `+` the Python walk makes, then bounded as code text.
     pub(crate) fn type_name<'py>(
         &mut self,
         py: Python<'py>,
         value: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
+        let s = self.s;
         let cls = value.get_type();
-        // A class's `__module__` is looked up in its dict.
-        if self.info(py, &cls)?.hostile {
-            return Err(Halt::Bail);
-        }
         let meta = cls.get_type();
-        let module = self.s.class_module.bind(py).call1((&cls, &meta))?;
-        let name = self.s.class_qualname.bind(py).call1((&cls, &meta))?;
-        if type_address(&name) != self.s.str_ {
-            // A str subclass name runs its own `__radd__` and slicing.
-            return Err(Halt::Bail);
-        }
-        let module = if type_address(&module) == self.s.str_ {
+        let module_of = s.class_module.bind(py);
+        // A class's `__module__` is looked up in its dict, where a key that
+        // is not an exact str may run its `__eq__`; the dicts of the
+        // builtin types the walk meets most hold only str keys.
+        let module = if TypeInfo::exact_kind(s, type_address(value)).is_none()
+            && self.info(py, &cls)?.hostile
+        {
+            self.application(py, || module_of.call1((&cls, &meta)))?
+        } else {
+            module_of.call1((&cls, &meta))?
+        };
+        let name = s.class_qualname.bind(py).call1((&cls, &meta))?;
+        let module = if type_address(&module) == s.str_ {
             module
         } else {
             intern!(py, "?").clone().into_any()
         };
+        // An exact str compared with an exact str runs no code.
         let text = if module.eq(intern!(py, "builtins"))? {
             name
         } else {
-            module.add(intern!(py, "."))?.add(&name)?
+            let dotted = module.add(intern!(py, "."))?;
+            if type_address(&name) == s.str_ {
+                dotted.add(&name)?
+            } else {
+                // A str subclass's own `__radd__` runs.
+                self.application(py, || dotted.add(&name))?
+            }
         };
         self.code_text(py, &text)
     }
@@ -230,66 +343,23 @@ impl State {
         self.truncated(py, reason.as_any(), &type_name)
     }
 
-    /// `"<%s snapshot>" % type_name`, for the exact str [`State::type_name`]
-    /// returns.
+    /// `"<%s snapshot>" % type_name`. Formatting anything but an exact str
+    /// runs its own `__str__`, or reads it as a tuple of arguments.
     pub(crate) fn snapshot_repr<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         type_name: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
-        if type_address(type_name) == self.s.str_ {
-            if let Ok(text) = type_name.cast::<PyString>().map_err(PyErr::from)?.to_str() {
-                return Ok(PyString::new(py, &format!("<{text} snapshot>")).into_any());
-            }
+        let template = intern!(py, "<%s snapshot>");
+        if type_address(type_name) != self.s.str_ {
+            return self.application(py, || template.rem(type_name));
+        }
+        if let Ok(text) = type_name.cast::<PyString>().map_err(PyErr::from)?.to_str() {
+            return Ok(PyString::new(py, &format!("<{text} snapshot>")).into_any());
         }
         // A lone surrogate does not convert; Python formats it.
-        Ok(PyString::new(py, "<%s snapshot>").rem(type_name)?)
+        Ok(template.rem(type_name)?)
     }
-}
-
-/// `options.max_items`, `max_nodes`, `max_depth` and `max_string_bytes`,
-/// for `options` an exact `DumpOptions`, if reading each runs no code, as
-/// the walker reads them all where the Python walk reads only those it
-/// needs: from an instance dict of exact str keys (a dict subclass assigned
-/// as `__dict__` too, which attribute lookup reads as a dict), while
-/// `DumpOptions` holds no hook, and for each, if anything, `None` or an
-/// int, a default the instance dict overrides, as the dataclass does.
-pub(crate) fn plain_budgets<'py>(
-    py: Python<'py>,
-    s: &Statics,
-    options: &Bound<'py, PyAny>,
-) -> PyResult<Option<[Bound<'py, PyAny>; 4]>> {
-    let names = [
-        intern!(py, "max_items"),
-        intern!(py, "max_nodes"),
-        intern!(py, "max_depth"),
-        intern!(py, "max_string_bytes"),
-    ];
-    let Some(defaults) = s.options_own.entries(py, s, names)? else {
-        return Ok(None);
-    };
-    let int_or_none = |entry: &Bound<'_, PyAny>| entry.is_none() || type_address(entry) == s.int;
-    if !defaults.iter().flatten().all(int_or_none) {
-        return Ok(None);
-    }
-    let Ok(fields) = s
-        .options_dict
-        .bind(py)
-        .call1((options,))?
-        .cast_into::<PyDict>()
-    else {
-        return Ok(None);
-    };
-    if !s.str_keys(&fields) {
-        return Ok(None);
-    }
-    let [items, nodes, depth, string] = names.map(|name| fields.get_item(name));
-    Ok(match (items?, nodes?, depth?, string?) {
-        (Some(items), Some(nodes), Some(depth), Some(string)) => {
-            Some([items, nodes, depth, string])
-        }
-        _ => None,
-    })
 }
 
 #[cfg(test)]

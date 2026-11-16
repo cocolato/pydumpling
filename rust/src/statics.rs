@@ -6,13 +6,18 @@
 //!
 //! The table is read from the namespace of the `values` module that builds
 //! it, never by importing `pydumpling` by name, so each import of the
-//! package, a reloaded one or a vendored copy, gets its own classes.
+//! package, a reloaded one or a vendored copy, gets its own classes, and
+//! its own native entries, the table's `value` and `mapping` methods.
 
+use std::sync::Mutex;
+
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyInt, PyString, PyTuple};
+use pyo3::types::{PyDict, PyInt, PyTuple};
 
+use crate::address::AddressMap;
 use crate::copies::CopyClass;
-use crate::types::{dict_getter, Base, OwnClass, Scalar};
+use crate::types::{class_dicts, dict_getter, Base, Scalar};
 
 /// An object's address: its `id()`, and the identity types are compared by.
 pub(crate) fn address(object: &Bound<'_, PyAny>) -> usize {
@@ -51,6 +56,7 @@ pub(crate) struct Statics {
     pub frozendict: Option<usize>,
     pub ordered_dict: usize,
     pub getset_descriptor: usize,
+    pub member_descriptor: usize,
     pub truncated_type: usize,
     pub fake_class_type: usize,
     pub fake_dict_type: usize,
@@ -75,11 +81,11 @@ pub(crate) struct Statics {
     pub fake_float: CopyClass,
     pub fake_class: Py<PyAny>,
     pub fake_class_repr: Py<PyAny>,
-    /// `FakeClass` and `DumpOptions` as at import, and the instance-dict
-    /// getter of `DumpOptions`, from [`dict_getter`].
-    pub fake_class_own: OwnClass,
-    pub options_own: OwnClass,
-    pub options_dict: Py<PyAny>,
+    /// `FakeClass` as at import: the classes of its MRO, which assigning
+    /// `__bases__` changes, and their dicts but `object`'s, which held only
+    /// exact str keys then ([`crate::types::FakeClassNow`]).
+    pub fake_class_mro: Vec<Py<PyAny>>,
+    pub fake_class_dicts: Vec<Py<PyAny>>,
     pub truncated: Py<PyAny>,
     /// The copy classes' instance-dict getters, from [`dict_getter`].
     pub truncated_dict: Py<PyAny>,
@@ -92,6 +98,10 @@ pub(crate) struct Statics {
     pub set_iter: Py<PyAny>,
     pub frozenset_iter: Py<PyAny>,
     pub int_bit_length: Py<PyAny>,
+    /// `operator.iadd`, the in-place add of a tally that is not an exact
+    /// int, and `zip`, for a layout `_layout` did not write.
+    pub iadd: Py<PyAny>,
+    pub zip: Py<PyAny>,
     pub int_int: Py<PyAny>,
     pub float_float: Py<PyAny>,
     pub str_getitem: Py<PyAny>,
@@ -99,38 +109,32 @@ pub(crate) struct Statics {
     /// Bound `__get__` of `type.__dict__["__dict__"]` and its siblings.
     pub class_dict: Py<PyAny>,
     pub class_mro: Py<PyAny>,
-    pub class_flags: Py<PyAny>,
     pub class_module: Py<PyAny>,
     pub class_qualname: Py<PyAny>,
     /// The reason of an immutable container's placeholder: the very object
     /// the Python walk uses, so placeholders pickle identically.
     pub recursive_immutable: Py<PyAny>,
-    /// `sys.getrecursionlimit` and `sys._getframe`.
-    pub recursion_limit: Py<PyAny>,
-    pub get_frame: Py<PyAny>,
-    /// `sys.monitoring._all_events`, where the interpreter has it, else
-    /// `sys.getprofile` and `sys.gettrace`, and `sys.monitoring.get_tool`:
-    /// whether running Python code would also run a tracing hook.
-    pub all_events: Option<Py<PyAny>>,
-    pub get_profile: Py<PyAny>,
-    pub get_trace: Py<PyAny>,
-    pub get_tool: Py<PyAny>,
-    /// `object.__getattribute__` and `object.__setattr__`: attribute
-    /// access as a stock context's, without its class's hooks.
-    pub object_getattribute: Py<PyAny>,
-    pub object_setattr: Py<PyAny>,
-    /// `DumpOptions` and `collections.Counter`, the only options and
-    /// truncation tally types the walker mirrors.
+    /// The instance-dict getter of `ValuesMixin`, which reads any
+    /// context's instance dict, from [`dict_getter`]: for the one mapping
+    /// the walk compares with it ([`crate::mapping`]).
+    pub instance_dict: Py<PyAny>,
+    /// `object`.
+    pub object: Py<PyAny>,
+    /// `DumpOptions`, whether the walker reads its instances' budgets
+    /// ([`Statics::reads_options`]), as at import, and the same for each
+    /// other options type met since, kept alive with its verdict.
     pub dump_options: usize,
+    pub(crate) dump_options_read: bool,
+    pub(crate) options_types: Mutex<AddressMap<(Py<PyAny>, bool)>>,
+    /// `collections.Counter`, the only truncation tally type the walker
+    /// mirrors.
     pub counter: usize,
-    /// `values._NATIVE_WALK`, the context methods the walker stands in
-    /// for, then `values._STATE_ACCESS` and `values._NATIVE_STATE`, the
-    /// class attributes the context must hold as the stock class does,
-    /// interned.
-    pub walk_keys: Vec<Py<PyString>>,
-    /// How many of [`Statics::walk_keys`] are `_NATIVE_WALK`: the names an
-    /// instance attribute may shadow.
-    pub walk_count: usize,
+    /// `values._IN_PYTHON`, which an entry returns for a call the Python
+    /// method runs itself.
+    pub in_python: Py<PyAny>,
+    /// `ValuesMixin.value`, the Python walk's function, which the walk
+    /// calls in place for a node it sends there.
+    pub value_function: Py<PyAny>,
     /// The type of a function frame's `f_locals`: `FrameLocalsProxy` on
     /// Python 3.13+, whose `items()` runs no application code. Zero when
     /// frame inspection is unavailable, so proxies use the Python walk.
@@ -139,35 +143,11 @@ pub(crate) struct Statics {
     pub false_: Py<PyAny>,
 }
 
-/// The walker's table for one import of `pydumpling.snapshot.values`.
-///
-/// `values` builds one when it is imported and hands it to every `Walker`.
-/// The table lives as long as the process: a reloaded package builds a new
-/// one, and the old one keeps the classes its snapshots were made of.
-#[pyclass(module = "pydumpling._native", name = "Statics", frozen)]
-pub struct StaticsHandle {
-    pub(crate) table: &'static Statics,
-}
-
-#[pymethods]
-impl StaticsHandle {
-    /// Reads the table from the `values` module namespace and its
-    /// `identity` module.
-    #[new]
-    fn new(values: &Bound<'_, PyDict>, identity: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let table = Statics::load(values, identity)?;
-        Ok(Self {
-            table: Box::leak(Box::new(table)),
-        })
-    }
-}
-
 impl Statics {
-    fn load(values: &Bound<'_, PyDict>, identity: &Bound<'_, PyAny>) -> PyResult<Self> {
+    pub(crate) fn load(values: &Bound<'_, PyDict>, identity: &Bound<'_, PyAny>) -> PyResult<Self> {
         let py = values.py();
         let builtins = py.import("builtins")?;
         let types = py.import("types")?;
-        let sys = py.import("sys")?;
         let global = |name: &str| -> PyResult<Bound<'_, PyAny>> {
             values.get_item(name)?.ok_or_else(|| {
                 pyo3::exceptions::PyKeyError::new_err(format!("values has no {name}"))
@@ -186,21 +166,17 @@ impl Statics {
         } else {
             address(&locals_type)
         };
-        let walk: Vec<String> = global("_NATIVE_WALK")?.extract()?;
-        let access: Vec<String> = global("_STATE_ACCESS")?.extract()?;
-        let state: Vec<String> = global("_NATIVE_STATE")?.extract()?;
-        let walk_keys = walk
-            .iter()
-            .chain(&access)
-            .chain(&state)
-            .map(|name| PyString::intern(py, name).unbind())
-            .collect();
-        let type_dict = builtin("type")?.getattr("__dict__")?;
         let frozendict = builtins.getattr("frozendict").ok();
         let none = py.None().into_bound(py).get_type().into_any();
         let fake_class = fake_type("FakeClass")?;
         let options = global("DumpOptions")?;
         let (class_mro, class_dict) = (getter("_CLASS_MRO")?, getter("_CLASS_DICT")?);
+        let mixin = global("ValuesMixin")?;
+        // Read from the class dict: the function itself, as the Python
+        // walk's own `self.value` calls resolve to it on a native context.
+        let value_function = class_dict
+            .call1((&mixin, mixin.get_type()))?
+            .get_item("value")?;
         let plain_keys = [
             address(&builtin("str")?),
             address(&builtin("int")?),
@@ -210,7 +186,7 @@ impl Statics {
             address(&builtin("bytes")?),
             address(&none),
         ];
-        Ok(Self {
+        let mut table = Self {
             none: address(&none),
             bool_: address(&builtin("bool")?),
             int: address(&builtin("int")?),
@@ -227,6 +203,7 @@ impl Statics {
             frozendict: frozendict.as_ref().map(address),
             ordered_dict: address(&ordered),
             getset_descriptor: address(&types.getattr("GetSetDescriptorType")?),
+            member_descriptor: address(&types.getattr("MemberDescriptorType")?),
             truncated_type: address(&fake_type("TruncatedValue")?),
             fake_class_type: address(&fake_class),
             fake_dict_type: address(&fake_type("FakeDict")?),
@@ -253,9 +230,8 @@ impl Statics {
             fake_int: CopyClass::new(fake_type("FakeInt")?, &builtin("int")?)?,
             fake_float: CopyClass::new(fake_type("FakeFloat")?, &builtin("float")?)?,
             fake_class_repr: fake_class.getattr("__repr__")?.unbind(),
-            fake_class_own: OwnClass::new(&fake_class, &class_mro, &class_dict)?,
-            options_own: OwnClass::new(&options, &class_mro, &class_dict)?,
-            options_dict: dict_getter(&options)?.unbind(),
+            fake_class_mro: Vec::new(),
+            fake_class_dicts: Vec::new(),
             fake_class_dict: dict_getter(&fake_class)?.unbind(),
             fake_class: fake_class.unbind(),
             truncated_dict: dict_getter(&fake_type("TruncatedValue")?)?.unbind(),
@@ -267,39 +243,43 @@ impl Statics {
             set_iter: method("set", "__iter__")?.unbind(),
             frozenset_iter: method("frozenset", "__iter__")?.unbind(),
             int_bit_length: method("int", "bit_length")?.unbind(),
+            iadd: py.import("operator")?.getattr("iadd")?.unbind(),
+            zip: builtin("zip")?.unbind(),
             int_int: method("int", "__int__")?.unbind(),
             float_float: method("float", "__float__")?.unbind(),
             str_getitem: method("str", "__getitem__")?.unbind(),
             bytes_getitem: method("bytes", "__getitem__")?.unbind(),
             class_dict: class_dict.unbind(),
             class_mro: class_mro.unbind(),
-            class_flags: type_dict
-                .get_item("__flags__")?
-                .getattr("__get__")?
-                .unbind(),
             class_module: getter("_CLASS_MODULE")?.unbind(),
             class_qualname: getter("_CLASS_QUALNAME")?.unbind(),
             recursive_immutable: global("_RECURSIVE_IMMUTABLE")?.unbind(),
-            recursion_limit: sys.getattr("getrecursionlimit")?.unbind(),
-            get_frame: sys.getattr("_getframe")?.unbind(),
-            get_profile: sys.getattr("getprofile")?.unbind(),
-            get_trace: sys.getattr("gettrace")?.unbind(),
-            all_events: sys
-                .getattr("monitoring")?
-                .getattr("_all_events")
-                .ok()
-                .map(Bound::unbind),
-            get_tool: sys.getattr("monitoring")?.getattr("get_tool")?.unbind(),
-            object_getattribute: method("object", "__getattribute__")?.unbind(),
-            object_setattr: method("object", "__setattr__")?.unbind(),
+            instance_dict: dict_getter(&mixin)?.unbind(),
+            object: builtin("object")?.unbind(),
             dump_options: address(&options),
+            dump_options_read: false,
+            options_types: Mutex::new(AddressMap::default()),
             counter: address(&py.import("collections")?.getattr("Counter")?),
-            walk_keys,
-            walk_count: walk.len(),
+            in_python: global("_IN_PYTHON")?.unbind(),
+            value_function: value_function.unbind(),
             frame_locals,
             true_: builtin("True")?.unbind(),
             false_: builtin("False")?.unbind(),
-        })
+        };
+        table.dump_options_read = table.options_verdict(&options)?;
+        for (base, namespace) in class_dicts(&table, table.fake_class.bind(py))? {
+            table.fake_class_mro.push(base.clone().unbind());
+            if base.is(table.object.bind(py)) {
+                continue;
+            }
+            for key in namespace.try_iter()? {
+                if type_address(&key?) != table.str_ {
+                    return Err(PyTypeError::new_err("a FakeClass dict key is not a str"));
+                }
+            }
+            table.fake_class_dicts.push(namespace.unbind());
+        }
+        Ok(table)
     }
 
     /// `_plain_key`: whether hashing or comparing a key runs no
@@ -307,7 +287,9 @@ impl Statics {
     pub(crate) fn plain_key(&self, key: &Bound<'_, PyAny>) -> bool {
         let plain = |item: &Bound<'_, PyAny>| self.plain_keys.contains(&type_address(item));
         match key.cast::<PyTuple>() {
-            Ok(items) if type_address(key) == self.tuple => items.iter().all(|item| plain(&item)),
+            Ok(items) if type_address(key) == self.tuple => {
+                items.iter_borrowed().all(|item| plain(&item))
+            }
             _ => plain(key),
         }
     }

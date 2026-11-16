@@ -1,54 +1,22 @@
 //! `ValuesMixin._scalar` and `_fill_copy`: the copy of a str, bytes, int,
 //! or float subclass instance, and the type name, attributes, slots, and
-//! named fields every subclass copy keeps beside its entries or value.
-
-use std::sync::Arc;
+//! named fields every subclass copy keeps beside its entries or value, the
+//! last two as [`crate::layouts`] lists them.
 
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyInt, PyTuple};
 
+use crate::keys::pair;
+use crate::state::State;
 use crate::statics::{type_address, Statics};
 use crate::types::{dict_getter, fresh_dict, Base, Layout, Scalar};
 use crate::walk::{unless_exception, update};
-use crate::walker::{Halt, State, Walk};
+use crate::walker::Walk;
 
 impl State {
-    /// `ValuesMixin._layout`, called once per type and cached.
-    pub(crate) fn layout(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>) -> Walk<Arc<Layout>> {
-        let info = self.info(py, &value.get_type())?;
-        if info.hostile {
-            // `_layout` puts each class dict key in a set.
-            return Err(Halt::Bail);
-        }
-        if let Some(layout) = info.layout.clone() {
-            return Ok(layout);
-        }
-        self.before_python(py)?;
-        let pair = self
-            .ctx(py)?
-            .call_method1(intern!(py, "_layout"), (value,))?;
-        let layout = Arc::new(Layout::from_python(py, &pair)?);
-        self.info(py, &value.get_type())?.layout = Some(layout.clone());
-        Ok(layout)
-    }
-
     /// `ValuesMixin._scalar`: a str, bytes, int, or float subclass copy.
     pub(crate) fn scalar<'py>(
-        &mut self,
-        py: Python<'py>,
-        id: &Bound<'py, PyInt>,
-        value: &Bound<'py, PyAny>,
-        scalar: Scalar,
-        depth: i64,
-    ) -> Walk<Bound<'py, PyAny>> {
-        self.enter(py)?;
-        let captured = self.scalar_body(py, id, value, scalar, depth);
-        self.leave();
-        captured
-    }
-
-    fn scalar_body<'py>(
         &mut self,
         py: Python<'py>,
         id: &Bound<'py, PyInt>,
@@ -102,20 +70,6 @@ impl State {
         class: &CopyClass,
         depth: i64,
     ) -> Walk<()> {
-        self.enter(py)?;
-        let filled = self.fill_copy_body(py, value, copy, class, depth);
-        self.leave();
-        filled
-    }
-
-    fn fill_copy_body<'py>(
-        &mut self,
-        py: Python<'py>,
-        value: &Bound<'py, PyAny>,
-        copy: &Bound<'py, PyAny>,
-        class: &CopyClass,
-        depth: i64,
-    ) -> Walk<()> {
         let namespace = &class.namespace(copy)?;
         let cls = value.get_type();
         let own = cls.is(class.cls.bind(py));
@@ -126,12 +80,12 @@ impl State {
         };
         let type_name = if own {
             // The lookup compares the name with every key of its hash.
-            if !self.s.str_keys(&attrs) {
-                return Err(Halt::Bail);
-            }
-            attrs
-                .get_item(&key)?
-                .unwrap_or_else(|| py.None().into_bound(py))
+            let found = if self.s.str_keys(&attrs) {
+                attrs.get_item(&key)?
+            } else {
+                self.application(py, || attrs.get_item(&key))?
+            };
+            found.unwrap_or_else(|| py.None().into_bound(py))
         } else {
             self.type_name(py, value)?
         };
@@ -157,45 +111,96 @@ impl State {
             let converted = self.attribute_mapping(py, attrs.as_any(), depth + 1, private)?;
             update(namespace, &converted)?;
         }
-        let layout = self.layout(py, value)?;
-        for (name, getter) in &layout.members {
-            let Some(item) = unless_exception(py, getter.bind(py).call1((value, &cls)))? else {
-                continue; // An unset slot holds nothing.
-            };
-            if self
-                .max_items
-                .is_some_and(|limit| namespace.len() as u64 >= limit)
-            {
-                self.count(py, intern!(py, "max_items"))?;
-                break;
+        match &*self.layout(py, value)? {
+            Layout::Plain { members, fields } => {
+                for (name, getter) in members {
+                    let got = getter.bind(py).call1((value, &cls));
+                    let Some(item) = unless_exception(py, got)? else {
+                        continue; // An unset slot holds nothing.
+                    };
+                    if !self.slot_fits(py, namespace)? {
+                        break;
+                    }
+                    let converted = self.value(py, &item, depth + 1)?;
+                    let name = name.bind(py);
+                    if type_address(name) == self.s.str_ {
+                        namespace.set_item(name, converted)?;
+                    } else {
+                        self.application(py, || namespace.set_item(name, converted))?;
+                    }
+                }
+                if !fields.is_empty() && type_address(copy) == self.s.fake_tuple_type {
+                    let items = copy.cast::<PyTuple>().map_err(PyErr::from)?;
+                    for (field, item) in fields.iter().zip(items.iter()) {
+                        namespace.set_item(field.bind(py), item)?;
+                    }
+                }
             }
-            if !self.has_nodes() {
-                self.count(py, intern!(py, "max_nodes"))?;
-                break;
-            }
-            let converted = self.value(py, &item, depth + 1)?;
-            namespace.set_item(name.bind(py), converted)?;
-        }
-        if !layout.fields.is_empty() && type_address(copy) == self.s.fake_tuple_type {
-            let items = copy.cast::<PyTuple>().map_err(PyErr::from)?;
-            for (field, item) in layout.fields.iter().zip(items.iter()) {
-                namespace.set_item(field.bind(py), item)?;
+            Layout::Other { members, fields } => {
+                let (members, fields) = (members.bind(py), fields.bind(py));
+                self.fill_other(py, value, copy, namespace, members, fields, depth)?;
             }
         }
         namespace.set_item(&key, &type_name)?;
         Ok(())
     }
 
-    /// `ValuesMixin._filled_slot`: whether any slot holds a value.
-    fn filled_slot(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>) -> Walk<bool> {
-        let layout = self.layout(py, value)?;
-        let cls = value.get_type();
-        for (_, getter) in &layout.members {
-            if unless_exception(py, getter.bind(py).call1((value, &cls)))?.is_some() {
-                return Ok(true);
-            }
+    /// Whether one more slot fits the item and node budgets; counts the one
+    /// that stops the copy.
+    fn slot_fits(&mut self, py: Python<'_>, namespace: &Bound<'_, PyDict>) -> Walk<bool> {
+        if self
+            .max_items
+            .is_some_and(|limit| namespace.len() as u64 >= limit)
+        {
+            self.count(py, intern!(py, "max_items"))?;
+            return Ok(false);
         }
-        Ok(false)
+        if !self.has_nodes() {
+            self.count(py, intern!(py, "max_nodes"))?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The slots and fields of a subclass copy, read from a layout
+    /// `_layout` did not write: `for name, member in members`,
+    /// `member.__get__(value, cls)` and `namespace.update(zip(fields,
+    /// copy))`, each running the objects' own code, as in the Python walk.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_other<'py>(
+        &mut self,
+        py: Python<'py>,
+        value: &Bound<'py, PyAny>,
+        copy: &Bound<'py, PyAny>,
+        namespace: &Bound<'py, PyDict>,
+        members: &Bound<'py, PyAny>,
+        fields: &Bound<'py, PyAny>,
+        depth: i64,
+    ) -> Walk<()> {
+        let (s, cls) = (self.s, value.get_type());
+        let mut members = self.application(py, || members.try_iter())?;
+        while let Some(entry) = self.application(py, || members.next().transpose())? {
+            let got = self.application(py, || {
+                let (name, member) = pair(s, entry)?;
+                let got = member.call_method1(intern!(py, "__get__"), (value, &cls));
+                Ok((name, got))
+            })?;
+            let (name, Some(item)) = (got.0, unless_exception(py, got.1)?) else {
+                continue;
+            };
+            if !self.slot_fits(py, namespace)? {
+                break;
+            }
+            let converted = self.value(py, &item, depth + 1)?;
+            self.application(py, || namespace.set_item(&name, converted))?;
+        }
+        let zip = self.s.zip.bind(py);
+        self.application(py, || {
+            if fields.is_truthy()? && type_address(copy) == self.s.fake_tuple_type {
+                namespace.call_method1(intern!(py, "update"), (zip.call1((fields, copy))?,))?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -285,23 +290,5 @@ impl Statics {
         } else {
             container.call0()
         }
-    }
-}
-
-impl Layout {
-    /// Converts `(members, fields)` from `ValuesMixin._layout`.
-    pub(crate) fn from_python(py: Python<'_>, pair: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let mut members = Vec::new();
-        for member in pair.get_item(0)?.try_iter()? {
-            let member = member?;
-            let getter = member.get_item(1)?.getattr(intern!(py, "__get__"))?;
-            members.push((member.get_item(0)?.unbind(), getter.unbind()));
-        }
-        let fields = pair
-            .get_item(1)?
-            .try_iter()?
-            .map(|field| field.map(Bound::unbind))
-            .collect::<PyResult<_>>()?;
-        Ok(Self { members, fields })
     }
 }

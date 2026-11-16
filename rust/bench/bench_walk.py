@@ -14,7 +14,13 @@ Implementations (``--impl``):
 * ``legacy``: the frozen pre-change package under ``--legacy-root``;
 * ``pure``: the repository's package with ``PYDUMPLING_NATIVE=0``;
 * ``native``: the repository's package with the compiled ``pydumpling._native``
-  walker; fails if the extension does not load or a context has no walker.
+  walker; fails if the extension does not load or a context does not capture
+  natively.
+
+``--caller-depth FRAMES`` runs both measurements that many frames deeper in
+the stack, as a capture from deep in an application runs.  Every native result
+records how many of the last capture's calls the walker sent to the Python
+walk (``fallbacks``) and whether the context still captures natively.
 
 Every subprocess gets ``PYTHONHASHSEED`` fixed (``--hash-seed``) so all
 implementations walk identically laid out dicts and sets.  Peak RSS is
@@ -111,10 +117,23 @@ def _import_impl(impl, legacy_root):
 
 
 def _describe_walker(context):
-    if not hasattr(context, "_walker"):
-        return "absent (no _walker attribute)"
-    walker = context._walker
-    return "None" if walker is None else f"set ({type(walker).__qualname__})"
+    if not hasattr(context, "_native_walk"):
+        return "absent (no _native_walk attribute)"
+    return "native" if context._native_walk else "python"
+
+
+def _fallbacks():
+    """How many calls the native walker has sent to the Python walk, or None
+    without it."""
+    from pydumpling.snapshot import values
+
+    statics = getattr(values, "_STATICS", None)
+    return None if statics is None else statics.fallbacks
+
+
+def _beneath(frames, run):
+    """Call ``run`` from ``frames`` more Python frames."""
+    return run() if frames <= 0 else _beneath(frames - 1, run)
 
 
 def _summary(samples):
@@ -172,10 +191,10 @@ def run_child(args):
 
     probe = SnapshotContext(options)
     walker = _describe_walker(probe)
-    if args.impl == "native" and getattr(probe, "_walker", None) is None:
-        _fail(f"native run of {name}: SnapshotContext._walker is {walker}")
-    if args.impl != "native" and getattr(probe, "_walker", None) is not None:
-        _fail(f"--impl {args.impl} run of {name}: SnapshotContext._walker is set")
+    if args.impl == "native" and walker != "native":
+        _fail(f"native run of {name}: the context's walk is {walker}")
+    if args.impl != "native" and getattr(probe, "_native_walk", False):
+        _fail(f"--impl {args.impl} run of {name}: the context captures natively")
     del probe
     hook = (
         f"_native={native_file}"
@@ -213,13 +232,24 @@ def run_child(args):
             "warmup_runs": args.warmup_runs,
             "warmup_time": args.warmup_time,
         }
-        save_stats = _sample(save, **floors)
+        depth = args.caller_depth
+        save_stats = _beneath(depth, lambda: _sample(save, **floors))
         dump_bytes = target.stat().st_size
-        capture_stats = _sample(capture, **floors)
+        capture_stats = _beneath(depth, lambda: _sample(capture, **floors))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
-    context, payload = capture()
+    def last():
+        return capture()
+
+    # As deep as a timed capture, which runs beneath a lambda and _sample.
+    before = _fallbacks()
+    context, payload = _beneath(args.caller_depth, lambda: last())
+    fallbacks = None if before is None else _fallbacks() - before
+    if fallbacks:
+        print(f"[{args.impl}] {name}: {fallbacks} calls ran in Python", flush=True)
+    if args.impl == "native" and not context._native_walk:
+        print(f"[{args.impl}] {name}: the context left the native walk", flush=True)
     raw = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
     result = {
         "workload": name,
@@ -233,6 +263,8 @@ def run_child(args):
         "native_hook": hooked,
         "native_file": native_file,
         "walker": walker,
+        "caller_depth": args.caller_depth,
+        "fallbacks": fallbacks,
         "hash_seed": os.environ.get("PYTHONHASHSEED"),
         "save": save_stats,
         "capture": capture_stats,
@@ -403,6 +435,7 @@ def run_parent(args):
         "warmup_runs": args.warmup_runs,
         "warmup_time_s": args.warmup_time,
         "rounds": args.rounds,
+        "caller_depth": args.caller_depth,
         "rss_unit": "MB = 2**20 bytes, from ru_maxrss",
     }
     rounds = {name: [] for name in names}
@@ -429,6 +462,8 @@ def run_parent(args):
                     str(args.warmup_time),
                     "--tmpdir",
                     scratch,
+                    "--caller-depth",
+                    str(args.caller_depth),
                 ]
                 if args.impl == "legacy":
                     command += ["--legacy-root", str(root)]
@@ -480,6 +515,9 @@ def compare(base_path, other_path):
     base, other = (document["workloads"] for document in documents)
     labels = [document["meta"]["impl"] for document in documents]
     print(f"{other_path} ({labels[1]}) vs {base_path} ({labels[0]})")
+    depths = [document["meta"].get("caller_depth", 0) for document in documents]
+    if depths[0] != depths[1]:
+        print(f"warning: measured from caller depths {depths[1]} and {depths[0]}")
     print(
         f"{'workload':<20} {'save x':>7} {'capture x':>10} {'rss x':>6}  "
         "same pickle/nodes/truncation"
@@ -547,6 +585,13 @@ def main(argv=None):
     parser.add_argument("--warmup-time", type=float, default=0.1, metavar="SECONDS")
     parser.add_argument("--hash-seed", type=int, default=0)
     parser.add_argument(
+        "--caller-depth",
+        type=int,
+        default=0,
+        metavar="FRAMES",
+        help="measure from this many frames deeper in the stack (default 0)",
+    )
+    parser.add_argument(
         "--python",
         default=sys.executable,
         help="interpreter for the subprocesses (default: this one)",
@@ -562,6 +607,10 @@ def main(argv=None):
         return
     if args.impl is None:
         parser.error("--impl is required unless --compare is given")
+    if not 0 <= args.caller_depth <= sys.getrecursionlimit() - 100:
+        parser.error(
+            "--caller-depth must be between 0 and the recursion limit less 100"
+        )
     if args.min_runs < 2 or args.rounds < 1:
         parser.error("--min-runs must be at least 2 and --rounds at least 1")
     if not math.isfinite(args.min_time) or args.min_time < 0:

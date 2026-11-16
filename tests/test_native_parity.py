@@ -8,7 +8,14 @@ node count, and the kinds of what ``objects`` and ``_sources`` end up holding,
 in their order, must match byte for byte, and the native walk must run exactly
 the application hooks the pure one runs: none, outside contrived calls.  A
 first, discarded pure run materializes lazily created state, such as an
-exception's instance dict, that changes every later capture.
+exception's instance dict, that changes every later capture.  Some cases run
+from deep in the call stack, 120 to 400 frames from the recursion limit, where
+the Python walk still has room, so both walks capture the same.  Where the
+Python walk reaches the limit, as through the longest chains, the native walk
+may capture more, never less, by the provisional definition of
+``_captures_less``: no root variable both walks captured reaches more
+``'recursion'`` placeholders natively, and ``objects`` keeps no fewer
+originals.
 
 A captured set iterates in hash order, and ``TruncatedValue``, ``FakeClass``
 and NaN ``FakeFloat`` copies hash by identity, so while these tests run they
@@ -23,6 +30,8 @@ import asyncio
 import builtins
 import contextlib
 import copy
+import copyreg
+import cProfile
 import functools
 import gc
 import gzip
@@ -49,11 +58,12 @@ import pytest
 from pydumpling import dump_current_traceback, save_dumping
 from pydumpling.fake_types import (
     FakeClass,
-    FakeContainer,
     FakeDict,
     FakeFloat,
+    FakeFrame,
     FakeList,
     FakeStr,
+    FakeTraceback,
     FakeType,
     TruncatedValue,
 )
@@ -83,46 +93,36 @@ DUMP_SEEDS = 20
 def _mode(native):
     """Build contexts on the native walker, or switch it off so they run pure.
 
-    ``PYDUMPLING_NATIVE=0`` also keeps contexts created inside the walk, such
-    as an exception's metadata context, in pure Python.
+    Off, each context built meanwhile gets ``_native_walk = False`` of its
+    own as its ``__init__`` ends, and captures in Python for good: contexts
+    created inside the walk, such as an exception's metadata context, too.
     """
-    saved = os.environ.get("PYDUMPLING_NATIVE")
     if native:
-        os.environ.pop("PYDUMPLING_NATIVE", None)
-    else:
-        os.environ["PYDUMPLING_NATIVE"] = "0"
+        yield
+        return
+    init = vars(SnapshotContext)["__init__"]
+
+    def pure(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        # Past the class's own attribute hooks, which the walk alone runs.
+        if object.__getattribute__(self, "_native_walk"):
+            object.__setattr__(self, "_native_walk", False)
+
+    SnapshotContext.__init__ = pure
     try:
         yield
     finally:
-        if saved is None:
-            os.environ.pop("PYDUMPLING_NATIVE", None)
-        else:
-            os.environ["PYDUMPLING_NATIVE"] = saved
+        SnapshotContext.__init__ = init
 
 
 def _check_walker(context, native):
-    """The context must be served by the walker its mode asks for.
-
-    The native walker lives on the context, as ``_walker`` or as the
-    ``value`` entry point it installs.
-    """
-    state = vars(context)
-    served = state.get("_walker")
-    if served is None:
-        served = state.get("value")
-    assert (served is not None) is native, f"native={native} but walker={served!r}"
+    """The context must capture with the walk its mode asks for."""
+    assert context._native_walk is native, f"native={native}"
 
 
-def _traced():
-    """Whether a profiler, tracer or monitoring tool, such as coverage's, is
-    set: the walker then hands back each call before it runs Python code."""
-    all_events = getattr(sys.monitoring, "_all_events", dict)
-    return (
-        sys.getprofile() is not None
-        or sys.gettrace() is not None
-        or bool(all_events())
-        or any(sys.monitoring.get_tool(tool) is not None for tool in range(6))
-    )
+def _fallbacks():
+    """How many calls the native walker has sent to the Python walk."""
+    return values_module._STATICS.fallbacks
 
 
 # --- Application types whose hooks must never run during a capture ---------
@@ -1510,6 +1510,7 @@ class _Case:
     seed: int
     options: DumpOptions
     ops: list
+    left: object  # Frames left to push where the ops run, or None.
     stacks: list
 
     def close(self):
@@ -1611,7 +1612,11 @@ def _case(seed):
     if chain is not None:
         target = rng.choice((chain, {"deep": chain, "kept": graph.leaf()}, [chain]))
         ops.insert(rng.randint(0, len(ops)), ("value", target, rng.choice((0, 0, 1))))
-    return _Case(seed, options, ops, [stack])
+    left = None
+    if seed % 10 == 3 and not deep:
+        # Far enough from the limit that the Python walk never overflows.
+        left = rng.randint(120, 400)
+    return _Case(seed, options, ops, left, [stack])
 
 
 # --- Running both walks ----------------------------------------------------
@@ -1704,7 +1709,7 @@ def test_comparable_reads_what_a_pickle_would_keep():
         assert outcome(*other) != same
 
 
-@dataclass
+@dataclass(repr=False)  # A captured graph can take exponential time to repr.
 class _Outcome:
     results: list
     truncation: list
@@ -1712,6 +1717,7 @@ class _Outcome:
     hooks: list
     memo: object = None
     blob: bytes = b""
+    fallbacks: object = None  # The walker's, compared apart from the blob.
 
     def __post_init__(self):
         outcome = _comparable((self.results, self.truncation, self.nodes, self.memo))
@@ -1770,13 +1776,24 @@ def _descend(depth, run):
     return _descend(depth - 1, run)
 
 
+def _beneath(left, run):
+    """Call ``run`` with ``left`` frames left to push, or directly."""
+    if left is None:
+        return run()
+    return _descend(_frames_left() - left - 2, run)
+
+
 def _run(case, native):
     """Replay the case's operations on a fresh context in the given mode."""
     with _mode(native):
         context = SnapshotContext(case.options)
         _check_walker(context, native)
+        before = _fallbacks()
         with _armed() as calls:
-            results = [_apply(context, op) for op in case.ops]
+            results = _beneath(
+                case.left, lambda: [_apply(context, o) for o in case.ops]
+            )
+        fallbacks = _fallbacks() - before
         hooks = list(calls)
     return _Outcome(
         results,
@@ -1784,6 +1801,7 @@ def _run(case, native):
         context._nodes,
         hooks,
         _memo(context),
+        fallbacks=fallbacks if native else None,
     )
 
 
@@ -1829,6 +1847,115 @@ def _assert_parity(case, native, pure):
     )
 
 
+def _overflows(outcome):
+    """How often a walk reached the recursion limit: the ``RecursionError``s
+    its operations raised, and the ``'recursion'`` placeholders it left."""
+    raised = sum(
+        type(result) is tuple
+        and len(result) == 3
+        and [type(part) for part in result] == [str, str, str]
+        and result[:2] == ("raised", "RecursionError")
+        for result in outcome.results
+    )
+    return raised, dict(outcome.truncation).get("recursion", 0)
+
+
+def _recursion_placeholders(root):
+    """How many ``TruncatedValue('recursion')`` placeholders a captured value
+    reaches, each counted once."""
+    count, seen, pending = 0, set(), [root]
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if type(item) is TruncatedValue:
+            count += vars(item).get("reason") == "recursion"
+            continue
+        if isinstance(item, dict):
+            pending += dict.keys(item)
+            pending += dict.values(item)
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            pending += item
+        try:
+            state = object.__getattribute__(item, "__dict__")
+        except AttributeError:
+            continue
+        if type(state) is dict:
+            pending += state.values()
+    return count
+
+
+def _frame_copies(captured):
+    """The frame copies a captured traceback or frame holds, in chain order."""
+    frames, tracebacks = [], [captured]
+    while tracebacks:
+        entry = tracebacks.pop()
+        if isinstance(entry, FakeTraceback):
+            tracebacks.append(vars(entry).get("tb_next"))
+            frame = vars(entry).get("tb_frame")
+            while isinstance(frame, FakeFrame) and frame not in frames:
+                frames.append(frame)
+                frame = vars(frame).get("f_back")
+    return frames
+
+
+def _root_variables(ops, results):
+    """Each root variable of a replay, with the ``'recursion'`` placeholders
+    it reaches: the entries of what a ``_mapping``, an ``_attribute_mapping``
+    or a ``value`` of a mapping at depth 0 returned, of the state of the
+    exception an exception capture holds, and of the namespaces of the
+    frames a traceback or frame capture holds, by operation, mapping and
+    position."""
+    found = {}
+    for index, (op, result) in enumerate(zip(ops, results)):
+        roots = {}
+        if op[0] in ("mapping", "attributes", "value") and op[2] == 0:
+            roots["mapping"] = result
+        elif op[0] == "exception" and isinstance(result, dict):
+            saved = result.get("exc_value")
+            if isinstance(saved, BaseException):
+                roots["exception"] = vars(saved)
+        elif op[0] in ("traceback", "frame"):
+            for position, frame in enumerate(_frame_copies(result)):
+                roots[f"frame {position} locals"] = vars(frame).get("f_locals")
+                roots[f"frame {position} globals"] = vars(frame).get("f_globals")
+        seen = set()
+        for name, root in roots.items():
+            # Frames of one module share their globals' copy.
+            if isinstance(root, dict) and id(root) not in seen:
+                seen.add(id(root))
+                for position, item in enumerate(dict.values(root)):
+                    found[index, name, position] = _recursion_placeholders(item)
+    return found
+
+
+def _captures_less(ops, native, pure):
+    """How the native outcome captures less than the pure one, where the
+    pure walk reached the recursion limit, by a definition the owner has
+    yet to approve: (i) a root variable both walks captured reaches more
+    ``'recursion'`` placeholders natively, (ii) the native walk keeps fewer
+    originals in ``objects``. Not fewer nodes: the pure walk's ``_nodes``
+    also counts the copies it dropped where it recovered an overflow at a
+    root variable. A variable only the pure walk captured is no shortfall:
+    under a node budget, capturing more of an earlier one can leave a later
+    one, or a later mapping, with fewer entries."""
+    mine = _root_variables(ops, native.results)
+    theirs = _root_variables(ops, pure.results)
+    shortfalls = [
+        f"root variable {key}: {mine[key]} natively, {count} in Python"
+        for key, count in theirs.items()
+        if mine.get(key, count) > count
+    ]
+    kept = [len(outcome.memo[0] or ()) for outcome in (native, pure)]
+    if kept[0] < kept[1]:
+        shortfalls.append(
+            f"kept in objects: {kept[0]} natively, {kept[1]} in Python"
+            f" (nodes: {native.nodes} natively, {pure.nodes} in Python)"
+        )
+    return shortfalls
+
+
 # --- Tests -----------------------------------------------------------------
 
 
@@ -1842,9 +1969,22 @@ def test_walk_parity(seed):
         _run(case, native=False)
         native = _run(case, native=True)
         pure = _run(case, native=False)
+        # From deep in the stack, the walker sends no more calls to Python
+        # than from where the test runs.
+        if case.left is not None:
+            shallow = _run(replace(case, left=None), native=True)
     finally:
         case.close()
-    _assert_parity(case, native, pure)
+    reached = _overflows(pure)
+    if any(reached):
+        # Near the recursion limit the native walk may capture more, never
+        # less.
+        assert all(n <= p for n, p in zip(_overflows(native), reached)), case.seed
+        assert not _captures_less(case.ops, native, pure), case.seed
+    else:
+        _assert_parity(case, native, pure)
+    if case.left is not None:
+        assert native.fallbacks == shallow.fallbacks, case.seed
 
 
 def test_parity_check_detects_differences():
@@ -1986,7 +2126,7 @@ def test_dump_parity(seed, tmp_path, monkeypatch):
 # Paths random graphs rarely reach: mappings that are not dicts (their own
 # ``items()`` is application code, which only the Python walk runs), errors
 # raised part way through a walk, odd type names, a collection during a walk,
-# and calls handed back to the Python walk.
+# and nodes run in the Python walk in place.
 
 
 class _ItemsSource:
@@ -2049,7 +2189,7 @@ def _items_case(shape, priority, fail_on=None, collect=False, max_items=None):
         ("value", [shared, source, entries], 0),
         ("mapping", source, 1, priority, False, dict),
     ]
-    return _Case(0, options, ops, [])
+    return _Case(0, options, ops, None, [])
 
 
 @pytest.mark.parametrize("shape", _ITEMS_SHAPES)
@@ -2103,36 +2243,10 @@ def test_odd_type_names():
         slotted.value = [1]
         values = [odd_name(), slotted, no_module(), odd_name, [odd_module]]
         options = DumpOptions(max_depth=None, max_string_bytes=8)
-        return _Case(0, options, [("value", values, 0)], [])
+        return _Case(0, options, [("value", values, 0)], None, [])
 
     first = case()
     _assert_parity(first, _run(first, native=True), _run(case(), native=False))
-
-
-def test_dispatch_descriptor_and_handbacks():
-    """The class attribute is the native descriptor around the Python method,
-    and a walk deeper than the native stack budget is handed back intact."""
-    descriptor = vars(values_module.ValuesMixin)["value"]
-    assert SnapshotContext.value is descriptor
-    assert descriptor.__wrapped__.__qualname__ == "ValuesMixin.value"
-    assert descriptor.__doc__ == descriptor.__wrapped__.__doc__
-    nested = []
-    for _ in range(600):
-        nested = [nested, {"key": nested}]
-    options = DumpOptions(max_depth=None, max_nodes=None, max_items=None)
-    results = {}
-    for native in (True, False):
-        with _mode(native):
-            context = SnapshotContext(options)
-            _check_walker(context, native)
-            captured = context.value(nested)
-            if native:
-                assert context._walker.handbacks >= 1
-            results[native] = pickle.dumps(
-                (captured, list(context._truncation.items()), context._nodes),
-                protocol=5,
-            )
-    assert results[True] == results[False]
 
 
 def _same_in_both_modes(build, options, calls):
@@ -2160,7 +2274,8 @@ def _same_in_both_modes(build, options, calls):
             )
     native, pure = outcomes[True], outcomes[False]
     assert native.hooks == pure.hooks
-    assert native.blob == pure.blob, (native.results, pure.results)
+    same = native.blob == pure.blob
+    assert same, reprlib.repr((native.results, pure.results))
     return native, pure
 
 
@@ -2174,9 +2289,9 @@ def _contents(context):
 
 
 def test_class_level_and_bound_calls():
-    """``SnapshotContext.value(ctx, ...)`` routes like ``ctx.value(...)``, and
-    the bound call behaves like the bound method it stands in for."""
-    descriptor = vars(values_module.ValuesMixin)["value"]
+    """``SnapshotContext.value(ctx, ...)`` captures like ``ctx.value(...)``,
+    and the bound method is the Python function's in both modes."""
+    function = vars(values_module.ValuesMixin)["value"]
 
     def build():
         shared = [1, "two", (3,)]
@@ -2190,24 +2305,21 @@ def test_class_level_and_bound_calls():
         ]
 
     _same_in_both_modes(build, DumpOptions(max_nodes=9), calls)
+    assert SnapshotContext.value is function
     for native in (True, False):
         with _mode(native):
             context = SnapshotContext(DumpOptions())
             bound = context.value
             assert bound.__self__ is context
-            assert getattr(bound.__func__, "__wrapped__", bound.__func__) is (
-                descriptor.__wrapped__
-            )
+            assert bound.__func__ is function
             assert bound == context.value and hash(bound) == hash(context.value)
             assert bound != SnapshotContext(DumpOptions()).value
             assert bound.__name__ == "value"
-            assert bound.__doc__ == descriptor.__wrapped__.__doc__
+            assert bound.__doc__ == function.__doc__
             assert bound.__qualname__ == "ValuesMixin.value"
             assert str(inspect.signature(bound)) == "(value, depth=0)"
             assert inspect.getsource(bound).lstrip().startswith("def value(")
             assert bound.__reduce__() == (getattr, (context, "value"))
-            if native:
-                assert context._walker.handbacks == 0
 
 
 class _Redacting(SnapshotContext):
@@ -2223,14 +2335,48 @@ class _Composed(SnapshotContext):
 
 def test_overriding_a_walk_method_keeps_the_python_walk():
     """A subclass overriding a walk method captures in Python, which calls it:
-    its walker hands the context there for good at the first call."""
+    the walk is chosen when the class is created."""
+    assert _Redacting._native_walk is False
+    assert _Composed._native_walk is True
+    assert "_native_walk" not in vars(_Composed)
+    before = _fallbacks()
     with _mode(True):
         redacting = _Redacting(DumpOptions())
         assert redacting.value({"key": ["secret"]}) == {"<redacted>": ["<redacted>"]}
-        assert vars(redacting).get("_walker") is None
         composed = _Composed(DumpOptions())
         composed.value([1])
-        assert isinstance(vars(composed).get("_walker"), values_module._native.Walker)
+    assert _fallbacks() == before
+
+
+def test_a_class_past_a_non_cooperative_init_subclass():
+    """A context class whose MRO puts a base whose ``__init_subclass__`` does
+    not call ``super()`` ahead of ``ValuesMixin`` is judged at its first
+    instance: one that overrides a walk method captures in Python, which
+    calls it, and one that changes nothing captures natively."""
+    registered = []
+
+    class Registering:
+        def __init_subclass__(cls, **kwargs):
+            registered.append(cls)
+
+    class Redacting(Registering, SnapshotContext):
+        def _text(self, value):
+            return "<redacted>"
+
+    class Composed(Registering, SnapshotContext):
+        pass
+
+    assert registered == [Redacting, Composed]
+    assert Redacting._native_walk_class is SnapshotContext
+    before = _fallbacks()
+    with _mode(True):
+        redacting = Redacting(DumpOptions())
+        composed = Composed(DumpOptions())
+    assert (Redacting._native_walk, Composed._native_walk) == (False, True)
+    assert redacting.value({"key": ["secret"]}) == {"<redacted>": ["<redacted>"]}
+    composed.value([1])
+    assert composed._native_walk
+    assert _fallbacks() == before
 
 
 def _child_environment():
@@ -2241,36 +2387,169 @@ def _child_environment():
     return dict(os.environ, PYTHONPATH=root if not path else root + os.pathsep + path)
 
 
-_THREAD_SCRIPT = """
-import os, pickle, sys, threading
+_FRAMES_SCRIPT = """
+import json, sys
+from pydumpling.fake_types import FakeClass
 from pydumpling.options import DumpOptions
-from pydumpling.snapshot import SnapshotContext
+from pydumpling.snapshot import SnapshotContext, values
 
-node = None
-for _ in range(3000):
-    node = [node]
-outcomes = {}
+depths = []
 
-def work(native):
-    os.environ["PYDUMPLING_NATIVE"] = "1" if native else "0"
+
+class Name(str):
+    def __radd__(self, other):  # runs as ``_type_name`` names a Probe
+        frame, depth = sys._getframe(), 0
+        while frame is not None:
+            frame, depth = frame.f_back, depth + 1
+        depths.append(depth)
+        return str.__add__(other, self)
+
+
+Probe = type("Probe", (), {})
+Probe.__qualname__ = Name("Probe")
+
+
+class Super(SnapshotContext):
+    def value(self, value, depth=0):
+        return super().value(value, depth)
+
+
+class Pure(SnapshotContext):
+    _native_walk = False
+
+
+class Extra:
+    pass
+
+
+def capture(context, rebase=False):
+    depths.clear()
+    fallbacks = values._STATICS.fallbacks if values._STATICS else 0
+    bases = FakeClass.__bases__
+    if rebase:
+        # Objects are then copied in the Python walk, in place.
+        FakeClass.__bases__ = bases + (Extra,)
+    try:
+        context.value([[Probe()], {"key": (Probe(),)}])
+    finally:
+        FakeClass.__bases__ = bases
+    used = values._STATICS.fallbacks - fallbacks if values._STATICS else 0
+    return depths[:], used
+
+
+instance = SnapshotContext(DumpOptions())
+instance._native_walk = False
+contexts = {
+    "native": (SnapshotContext(DumpOptions()), False),
+    "in python in place": (SnapshotContext(DumpOptions()), True),
+    "pure instance": (instance, False),
+    "pure class": (Pure(DumpOptions()), False),
+    "super().value": (Super(DumpOptions()), False),
+}
+print(json.dumps({name: capture(*how) for name, how in contexts.items()}))
+"""
+
+
+def test_no_walk_adds_a_python_frame():
+    """Application code the walk runs sees no more Python frames beneath it
+    on any path than in the Python walk alone (``PYDUMPLING_NATIVE=0``):
+    the native walk runs it with none of the walk's frames between, a node
+    it sends to the Python walk in place starts there with one, and a
+    context pure by its instance flag, by its class, or by overriding
+    ``value`` and calling ``super().value`` adds no frame either."""
+    found = {}
+    for native in ("1", "0"):
+        environment = _child_environment()
+        environment["PYDUMPLING_NATIVE"] = native
+        process = subprocess.run(
+            [sys.executable, "-c", _FRAMES_SCRIPT],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=120,
+        )
+        assert process.returncode == 0, process.stderr
+        found[native] = json.loads(process.stdout)
+    pure = {name: depths for name, (depths, _) in found["0"].items()}
+    native = {name: depths for name, (depths, _) in found["1"].items()}
+    assert len({tuple(depths) for depths in pure.values()} - {()}) == 2
+    assert all(len(depths) == 2 for depths in pure.values())
+    for name, depths in native.items():
+        assert len(depths) == 2, name
+        assert all(mine <= theirs for mine, theirs in zip(depths, pure[name])), name
+    assert native["native"] < pure["native"]
+    assert native["native"] < native["in python in place"] < pure["native"]
+    for name in ("pure instance", "pure class", "super().value"):
+        assert native[name] == pure[name]
+    # Only the stock context reached the walker, which sent each object to
+    # the Python walk while ``FakeClass`` had other bases.
+    assert {name: sent for name, (_, sent) in found["1"].items()} == {
+        "native": 0,
+        "in python in place": 2,
+        "pure instance": 0,
+        "pure class": 0,
+        "super().value": 0,
+    }
+
+
+_THREAD_SCRIPT = """
+import json, pickle, sys, threading
+from pydumpling.options import DumpOptions
+from pydumpling.snapshot import SnapshotContext, values
+
+# Built, pickled and freed on the main thread, which has the stack for that.
+nodes, outcomes, contexts = {}, {}, []
+for levels in (600, 3000):
+    node = None
+    for _ in range(levels):
+        node = [node]
+    nodes[levels] = node
+
+def work(levels, native):
     context = SnapshotContext(DumpOptions(max_depth=None, max_nodes=None))
-    captured = context.value({"deep": node})
-    outcomes[native] = pickle.dumps(
-        (captured, dict(context._truncation), context._nodes), protocol=5
+    contexts.append(context)
+    if not native:
+        context._native_walk = False
+    before = values._STATICS.fallbacks
+    captured = context.value({"deep": nodes[levels]})
+    outcomes[levels, native] = (
+        (captured, dict(context._truncation), context._nodes),
+        context._truncation["recursion"],
+        values._STATICS.fallbacks - before,
     )
 
 threading.stack_size(int(sys.argv[1]) * 1024)
-for native in (True, False):
-    thread = threading.Thread(target=work, args=(native,))
-    thread.start()
-    thread.join()
-print("same" if outcomes[True] == outcomes[False] else "different")
+for levels in (600, 3000):
+    for native in (True, False):
+        thread = threading.Thread(target=work, args=(levels, native))
+        thread.start()
+        thread.join()
+threading.stack_size(0)
+same = {
+    levels: pickle.dumps(outcomes[levels, True][0], protocol=5)
+    == pickle.dumps(outcomes[levels, False][0], protocol=5)
+    for levels in (600, 3000)
+}
+print(json.dumps({
+    levels: {
+        "same": same[levels],
+        "recursion": [outcomes[levels, native][1] for native in (True, False)],
+        "fallbacks": outcomes[levels, True][2],
+    }
+    for levels in (600, 3000)
+}))
 """
 
 
 @pytest.mark.parametrize("stack_kib", [64, 160, 512])
 def test_small_thread_stack(stack_kib):
-    """A walk on a thread with a small native stack hands back, not crashes."""
+    """A walk on a thread with a small native stack does not crash. With
+    less than 192 KiB of it left, each call runs in the Python walk from
+    its start. With more, the walk sends the node at its stack budget, and
+    everything under it, to the Python walk in place, once. Either way a
+    600-level list, where the Python walk has room, is captured as there,
+    and a 3000-level one, where it overflows, leaves no more ``'recursion'``
+    placeholders."""
     process = subprocess.run(
         [sys.executable, "-c", _THREAD_SCRIPT, str(stack_kib)],
         capture_output=True,
@@ -2279,7 +2558,14 @@ def test_small_thread_stack(stack_kib):
         timeout=120,
     )
     assert process.returncode == 0, process.stderr
-    assert process.stdout.strip() == "same"
+    found = json.loads(process.stdout)
+    assert found["600"]["same"]
+    native, pure = found["3000"]["recursion"]
+    assert native <= pure == 1
+    if stack_kib == 512:
+        assert found["600"]["fallbacks"] == 1
+    else:
+        assert found["600"]["fallbacks"] > 600
 
 
 class _Nest:
@@ -2290,24 +2576,153 @@ class _Nest:
         self.result = run() if levels <= 0 else _Nest(levels - 1, run).result
 
 
-@pytest.mark.parametrize("margin", [40, 90, 140, 200, 320])
-def test_hidden_init_frames_near_the_limit(margin):
-    """Capture beneath a chain of ``__init__`` calls near the recursion limit."""
+def _frames_left():
+    """How many frames the caller's thread can still push, counted by pushing
+    them: one more than this function's deepest recursion that fits."""
+
+    def push(count):
+        if count > 1:
+            push(count - 1)
+
+    low, high = 0, sys.getrecursionlimit() + 1
+    while high - low > 1:
+        middle = (low + high) // 2
+        try:
+            push(middle)
+        except RecursionError:
+            high = middle
+        else:
+            low = middle
+    return low + 1
+
+
+class _Linked:
+    """An object whose instance dict holds the next link of a chain."""
+
+    def __init__(self, link):
+        self.link = link
+
+
+_LINKS = {
+    "list": lambda inner: [inner],
+    "dict": lambda inner: {"k": inner},
+    "tuple": lambda inner: (inner,),
+    "object": _Linked,
+    "mapping": lambda inner: [inner],
+}
+
+
+@pytest.mark.parametrize("bounded", [False, True], ids=["unbounded", "max_depth"])
+@pytest.mark.parametrize("hidden", [False, True], ids=["frames", "init_frames"])
+@pytest.mark.parametrize("shape", list(_LINKS))
+def test_near_the_limit_the_walker_captures_at_least_as_much(shape, hidden, bounded):
+    """Near the recursion limit the Python walk overflows: it raises, or
+    ``_root_value`` leaves a ``'recursion'`` placeholder. The walker pushes
+    no Python frames, and bounds the long string at the end of the chain
+    itself, so it never raises where the Python walk returns, never leaves
+    more placeholders, and from 20 frames below the limit captures what the
+    Python walk captures far from it, with no node in the Python walk. A walk
+    bounded by the default ``max_depth`` has room in Python from 30 frames
+    below the limit, and there both walks capture the same. So beneath
+    plain frames and beneath ``__init__`` calls, whose shim frames 3.13+
+    counts but hides, for each of the walk's recursive methods."""
+    nested = "x" * 5000
+    for _ in range(30):
+        nested = _LINKS[shape](nested)
+    options = DumpOptions() if bounded else DumpOptions(max_depth=None)
+
+    def outcome(left, native):
+        with _mode(native):
+            context = SnapshotContext(options)
+        before = _fallbacks()
+        if shape == "mapping":
+            capture = functools.partial(context._mapping, {"root": nested})
+        else:
+            capture = functools.partial(context.value, nested)
+
+        def place():
+            return _descend(_frames_left() - left - 1, capture)
+
+        try:
+            captured = _Nest(120, place).result if hidden else place()
+        except RecursionError:
+            return None, None, context._nodes, len(context.objects)
+        assert _fallbacks() == before
+        state = (captured, dict(context._truncation), context._nodes)
+        blob = pickle.dumps(state, protocol=5)
+        # Only the root mapping's one variable can hold a 'recursion'
+        # placeholder.
+        recursion = context._truncation["recursion"]
+        return blob, recursion, context._nodes, len(context.objects)
+
+    roomy = outcome(400, False)
+    assert outcome(400, True) == roomy
+    overflowed = []
+    for left in range(2, 260, 3):
+        native, pure = outcome(left, True), outcome(left, False)
+        assert native[0] is not None or pure[0] is None, left
+        if native[0] is not None and pure[0] is not None:
+            assert native[1] <= pure[1], left
+        # One chain: no copy the pure walk dropped outnumbers the native
+        # walk's whole capture, so its nodes too.
+        assert native[2] >= pure[2], left
+        assert native[3] >= pure[3], left
+        if left >= 20:
+            assert native == roomy, left
+        if pure != roomy:
+            overflowed.append(left)
+    if bounded:
+        assert max(overflowed) < 30, overflowed
+    else:
+        assert max(overflowed) >= 20, "the Python walk never overflowed"
+
+
+class _OverflowingName(str):
+    """A ``__qualname__`` whose ``+``, application code ``_type_name`` runs,
+    raises ``RecursionError`` while ``armed``."""
+
+    armed = False
+
+    def __radd__(self, other):
+        _called("overflowing __radd__")
+        if _OverflowingName.armed:
+            raise RecursionError("maximum recursion depth exceeded")
+        return str.__add__(other, str(self))
+
+
+def test_a_recursion_error_in_application_code_is_recovered_at_the_root_variable():
+    """A ``RecursionError`` raised by application code the walk runs while it
+    captures a root mapping's variable is recovered there, natively, as
+    ``_root_value`` recovers it: the copies made since the variable began
+    are forgotten, with their nodes and counters kept, and the variable
+    becomes a ``'recursion'`` placeholder. The other variables, and a later
+    capture of a forgotten object, are as in the Python walk."""
 
     def build():
-        nested = []
-        for _ in range(150):
-            nested = [nested, {"key": nested}]
-        return (nested,)
+        Deep = type("Deep", (), {})
+        Deep.__qualname__ = _OverflowingName("Deep")
+        shared = [1, "kept"]
+        inner = [2.5, {"k": "x" * 50}, Deep()]
+        return {"before": shared, "deep": [shared, inner], "after": [3]}, inner
 
-    def calls(context, nested):
-        def deep():
-            levels = (sys.getrecursionlimit() - _stack_depth() - margin) // 2
-            return _Nest(levels, lambda: context.value(nested)).result
+    def calls(context, namespace, inner):
+        def overflowing():
+            _OverflowingName.armed = True
+            try:
+                return context._mapping(namespace)
+            finally:
+                _OverflowingName.armed = False
 
-        return [deep, lambda: context._mapping({"nested": nested})]
+        return [overflowing, lambda: context.value(inner)]
 
-    _same_in_both_modes(build, DumpOptions(max_depth=None, max_nodes=None), calls)
+    before = _fallbacks()
+    native, _ = _same_in_both_modes(build, DumpOptions(max_string_bytes=8), calls)
+    root, again = native.results
+    assert isinstance(root["deep"], TruncatedValue)
+    assert root["deep"].reason == "recursion"
+    assert again[:2] == [2.5, {"k": "x" * 8}]
+    assert native.hooks == ["overflowing __radd__"] * 2
+    assert _fallbacks() == before
 
 
 def test_empty_bytes_that_are_not_the_singleton():
@@ -2391,8 +2806,56 @@ def test_call_arguments_of_any_shape(call):
     )
 
 
+class _Name(str):
+    """A keyword name whose hash and comparison are application code."""
+
+    def __hash__(self):
+        _called("_Name.__hash__")
+        return str.__hash__(self)
+
+    def __eq__(self, other):
+        _called("_Name.__eq__")
+        return str.__eq__(self, other)
+
+
 @pytest.mark.parametrize(
-    "depth, handed_back",
+    "form, compared",
+    [("bound", 3), ("class", 3), ("mapping", 5), ("receiver", 1)],
+)
+def test_str_subclass_keyword_names(form, compared):
+    """A keyword name that is a str subclass is matched to its parameter by
+    CPython alone, in both walks: its ``__eq__`` runs once per parameter it
+    is compared with, and its ``__hash__`` never, as the walker sees only the
+    arguments."""
+    outcomes = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions())
+        data = [1, "two"]
+        # Built before any hook is collected: building the dict hashes a name.
+        if form == "bound":
+            names = {_Name("depth"): 1}
+            call = functools.partial(context.value, data, **names)
+        elif form == "class":
+            names = {_Name("depth"): 1}
+            call = functools.partial(SnapshotContext.value, context, data, **names)
+        elif form == "mapping":
+            names = {_Name("counted"): True}
+            call = functools.partial(context._mapping, {"key": data}, **names)
+        else:
+            names = {_Name("self"): context, "value": data}
+            call = functools.partial(SnapshotContext.value, **names)
+        before = _fallbacks()
+        with _armed() as hooks:
+            result = call()
+        assert _fallbacks() == before
+        outcomes[native] = (pickle.dumps(result, protocol=5), list(hooks))
+    assert outcomes[True] == outcomes[False]
+    assert outcomes[True][1] == ["_Name.__eq__"] * compared
+
+
+@pytest.mark.parametrize(
+    "depth, in_python",
     [
         (-(2**63), True),
         (-(2**63) + 1, True),
@@ -2402,23 +2865,27 @@ def test_call_arguments_of_any_shape(call):
         (2**62 + 1, True),
     ],
 )
-def test_a_depth_beyond_two_to_the_62_is_handed_back(depth, handed_back):
+def test_a_depth_beyond_two_to_the_62_runs_in_python(depth, in_python):
     """A depth of more than 2**62 in magnitude, which adding to could
-    overflow, hands the call back, down to -2**63, whose magnitude no i64
-    holds; the walker takes one within that bound."""
+    overflow, gives the call and the context to the Python walk before the
+    call starts, down to -2**63, whose magnitude no i64 holds; the walker
+    takes one within that bound."""
     found = {}
     for native in (False, True):
         with _mode(native):
             context = SnapshotContext(DumpOptions(max_depth=2))
         _check_walker(context, native)
+        before = _fallbacks()
         found[native] = pickle.dumps(context.value([[[1]]], depth), 4)
     assert found[True] == found[False]
-    assert context._walker.handbacks == (1 if handed_back else 0)
+    assert _fallbacks() - before == (1 if in_python else 0)
+    # A depth pydumpling's callers never pass gives the context to Python.
+    assert context._native_walk is not in_python
 
 
 def test_copy_of_a_capturing_context():
-    """A shallow copy of a native context shares its walker, as it shares
-    ``objects``; a deep copy, which has its own, captures in Python."""
+    """A shallow copy of a context, which shares its ``objects``, and a deep
+    copy, which has its own, capture as the context does."""
 
     def build():
         shared = [1, [2], {"three": 3}]
@@ -2427,9 +2894,8 @@ def test_copy_of_a_capturing_context():
     def calls(context, shared, holder):
         def copied():
             twin = copy.copy(context)
-            assert vars(twin).get("_walker") is vars(context).get("_walker")
             deep = copy.deepcopy(context)
-            assert vars(deep).get("_walker") is None
+            assert twin._native_walk is deep._native_walk is context._native_walk
             return (twin.value(holder), twin._nodes, deep.value([shared]), deep._nodes)
 
         return [lambda: context.value(shared), copied]
@@ -2438,12 +2904,13 @@ def test_copy_of_a_capturing_context():
 
 
 def test_frame_namespaces_stay_native():
-    """A frame's own locals are read natively, without a hand-back."""
+    """A frame's own locals are read natively."""
     with _mode(True):
         context = SnapshotContext(DumpOptions())
         local = {"nested": [1, 2, 3]}  # noqa: F841
+        before = _fallbacks()
         context.from_frame(sys._getframe())
-        assert context._walker.handbacks == 0 or _traced()
+        assert _fallbacks() == before
 
 
 def test_bases_changed_between_calls():
@@ -2494,7 +2961,7 @@ class Space(dict):
 
 new = New(NewOptions(max_depth=None))
 old = Old(DumpOptions(max_depth=None))
-assert isinstance(vars(new)["_walker"], _native.Walker)
+assert new._native_walk and old._native_walk
 assert FakeDict is not OldFakeDict
 assert type(new.value(Space(a=1))) is FakeDict
 assert type(old.value(Space(a=1))) is OldFakeDict
@@ -2515,9 +2982,10 @@ def test_reimported_package_has_its_own_classes():
     assert process.stdout.strip() == "ok"
 
 
-def test_errors_and_hand_backs_inside_native_calls():
-    """An error the native walk raises keeps what it did; odd memo entries and
-    keys the private filter would hash go to Python."""
+def test_errors_and_application_code_inside_native_calls():
+    """An error the native walk raises keeps what it did; an odd memo
+    entry's reason and a key the private filter hashes run their own code
+    natively, as in the Python walk."""
 
     def build():
         reason = TruncatedValue(_Text("max_depth"), "odd")
@@ -2600,13 +3068,14 @@ def test_a_memo_entry_that_answers_its_own_class(entry, how):
     if entry is int:
         with _mode(True):
             context = SnapshotContext(DumpOptions())
+            before = _fallbacks()
             for call in calls(context, *build()):
                 call()
-            assert context._walker.handbacks == 0 or _traced()
+            assert _fallbacks() == before
 
 
 def test_type_names_read_natively():
-    """Odd but plain class names and modules are read without a hand-back."""
+    """Odd but plain class names and modules are read natively."""
 
     def build():
         _, odd_module, no_module = _odd_types()
@@ -2623,16 +3092,9 @@ def test_type_names_read_natively():
         native, _ = _same_in_both_modes(build, options, calls)
 
 
-def test_descriptor_attributes_and_odd_receivers():
-    """The descriptor reads like the function, and a class-level call on an
-    object that is no context fails as the function would."""
-    descriptor = vars(values_module.ValuesMixin)["_mapping"]
-    assert SnapshotContext._mapping.__name__ == "_mapping"
-    assert SnapshotContext._mapping.__qualname__ == "ValuesMixin._mapping"
-    assert (
-        descriptor.__wrapped__
-        is vars(values_module.ValuesMixin)["_mapping"].__wrapped__
-    )
+def test_class_level_calls_on_odd_receivers():
+    """A class-level call on an object that is no context, or with odd
+    arguments, fails or captures as the function would."""
     with _mode(True):
         context = SnapshotContext(DumpOptions())
         assert repr(context.value).startswith("<bound method ValuesMixin.value of ")
@@ -2746,13 +3208,15 @@ _STATE_CHANGES = {
     "max_items float": _mutated_options(max_items=2.5),
     "max_items True": _mutated_options(max_items=True),
     "max_depth float": _mutated_options(max_depth=2.0),
+    # ``DumpOptions`` refuses 0 for every budget; forged, it retires the
+    # context.
+    "max_depth 0": _mutated_options(max_depth=0),
+    "max_items 0": _mutated_options(max_items=0),
+    "max_nodes 0": _mutated_options(max_nodes=0),
     "max_string_bytes 0": _mutated_options(max_string_bytes=0),
     "max_nodes maxsize": _mutated_options(max_nodes=sys.maxsize),
     "max_nodes beyond 64 bits": _mutated_options(max_nodes=2**70),
     "max_items maxsize": _mutated_options(max_items=sys.maxsize),
-    "walk method on the instance": lambda c: setattr(
-        c, "_text", lambda value: "<redacted>"
-    ),
     "non-str instance key": lambda c: vars(c).__setitem__(1, 2),
 }
 
@@ -2786,29 +3250,71 @@ def test_context_state_changed_between_calls(change):
     _same_in_both_modes(build, DumpOptions(max_nodes=40, max_items=8), calls)
 
 
-def test_options_subclass_keeps_the_python_walk():
-    """Options of another class may compute their budgets in application
-    code, so their contexts capture in Python."""
+def test_an_unlimited_context_never_enters_the_walker():
+    """An unlimited context runs the Python walk in both modes: ``value``
+    reads ``_unlimited`` before the flag, and ``_mapping`` offers a call only
+    while ``_unlimited is False``. The walker sends nothing to Python for
+    it and writes no flag on it, even where the walk reaches ``_mapping``
+    through an object no serializer writes."""
+    contexts = []
 
-    class Options(DumpOptions):
-        pass
+    def build():
+        holder = _Plain()
+        holder.items = [1, "two", {"three": 3.0}]
+        holder.pending = (step for step in range(3))  # pickled by neither
+        return ({"holder": holder, "plain": [4, 5]},)
 
-    data = {"key": ["v" * 30, (1, 2)]}
-    results = {}
-    for native in (True, False):
-        with _mode(native):
-            context = SnapshotContext(Options(max_string_bytes=8))
-            results[native] = pickle.dumps(
-                (context.value(data), dict(context._truncation), context._nodes)
-            )
-            assert vars(context).get("_walker") is None
-    assert results[True] == results[False]
+    def calls(context, data):
+        contexts.append(context)
+        return [
+            lambda: context.value(data),
+            lambda: context._mapping({"k": data, "more": [6]}, 0),
+            lambda: context._attribute_mapping(vars(data["holder"]), 1),
+        ]
+
+    before = _fallbacks()
+    native, _ = _same_in_both_modes(build, DumpOptions.unlimited(), calls)
+    assert dict(native.truncation)["unserializable"] > 0
+    assert _fallbacks() == before
+    assert "_native_walk" not in vars(contexts[1])
+
+
+class _PlainOptions(DumpOptions):
+    """An options subclass that reads its budgets as ``DumpOptions`` does."""
+
+
+class _LoggedOptions(DumpOptions):
+    """An options subclass whose budget reads are application code."""
+
+    def __getattribute__(self, name):
+        if name.startswith("max_"):
+            _called(f"options {name}")
+        return object.__getattribute__(self, name)
+
+
+def test_options_subclasses():
+    """An options subclass that leaves its budgets to ``DumpOptions`` is read
+    natively; one that reads them with its own code captures in Python, which
+    runs that code as often as it reads a budget."""
+
+    def build():
+        return ({"key": ["v" * 30, (1, 2)], "more": list(range(9))},)
+
+    def calls(context, data):
+        return [lambda: context.value(data), lambda: context.value([data, 1])]
+
+    before = _fallbacks()
+    _same_in_both_modes(build, _PlainOptions(max_string_bytes=8), calls)
+    assert _fallbacks() == before
+    native, _ = _same_in_both_modes(build, _LoggedOptions(max_string_bytes=8), calls)
+    assert "options max_items" in native.hooks
+    assert _fallbacks() == before + 1
 
 
 def test_method_objects_pickle_copy_and_weakref():
     """The class attribute pickles and copies as itself, and the bound method
-    reads like the Python walk's own, in both modes."""
-    function = vars(values_module.ValuesMixin)["value"].__wrapped__
+    is the Python walk's own, in both modes."""
+    function = vars(values_module.ValuesMixin)["value"]
     for native in (True, False):
         with _mode(native):
             context = SnapshotContext(DumpOptions())
@@ -2880,10 +3386,10 @@ def test_application_code_behind_builtin_lookups(planted):
             copies.append(copied)
         return (cls, _odd_types()[0](), fake, copies)
 
-    def calls(context, cls, handed_back, fake, copies):
+    def calls(context, cls, odd, fake, copies):
         return [
             lambda: context.value([cls]),
-            lambda: context.value([cls, handed_back]),
+            lambda: context.value([cls, odd]),
             lambda: context.value([fake, fake]),
             lambda: context.value(copies),
         ]
@@ -2892,9 +3398,9 @@ def test_application_code_behind_builtin_lookups(planted):
 
 
 def test_deep_caller_stack_under_a_raised_limit():
-    """A capture from a stack deeper than the walker looks, 1024 frames,
-    goes to the Python walk however far below a raised recursion limit it
-    is, and matches it."""
+    """A capture far below a raised recursion limit stays native however
+    deep the caller's stack is, and matches the Python walk.  The graph is
+    shallow enough for the native stack budget of any build."""
     nested = None
     for _ in range(12):
         nested = [nested, {"k": (nested,)}]
@@ -2905,9 +3411,9 @@ def test_deep_caller_stack_under_a_raised_limit():
         for native in (True, False):
             with _mode(native):
                 context = SnapshotContext(DumpOptions(max_depth=None, max_nodes=None))
+                before = _fallbacks()
                 captured = _descend(5000, lambda: context.value(nested))
-                if native:
-                    assert context._walker.handbacks == 1
+                assert _fallbacks() == before
                 outcomes[native] = pickle.dumps(
                     (captured, dict(context._truncation), context._nodes), protocol=5
                 )
@@ -2916,156 +3422,113 @@ def test_deep_caller_stack_under_a_raised_limit():
         sys.setrecursionlimit(saved)
 
 
-_AUDIT_SCRIPT = """
+_ABOVE_THE_LIMIT_SCRIPT = """
+import _thread, json, os, sys
+from pydumpling.options import DumpOptions
+from pydumpling.snapshot import SnapshotContext
+from pydumpling.snapshot.values import _STATICS
+
+def deep(frames, run):
+    return run() if frames <= 0 else deep(frames - 1, run)
+
+outcomes = {}
+for native in (True, False):
+    context = SnapshotContext(DumpOptions())
+    if not native:
+        context._native_walk = False
+    before = _STATICS.fallbacks
+    parked, go, done = (_thread.allocate_lock() for _ in range(3))
+    for lock in (parked, go, done):
+        lock.acquire()
+    outcome = []
+
+    def park():
+        parked.release()
+        go.acquire()
+        # 500 frames deep, beneath a limit of 100 another thread set.
+        try:
+            outcome.append(repr(context.value([1, {"a": (2,)}])))
+        except RecursionError:
+            outcome.append("RecursionError")
+        outcome.append(context._native_walk and _STATICS.fallbacks - before)
+
+    def thread():
+        try:
+            deep(500, park)
+        finally:
+            done.release()
+
+    _thread.start_new_thread(thread, ())
+    parked.acquire()
+    sys.setrecursionlimit(100)
+    go.release()
+    done.acquire()
+    sys.setrecursionlimit(1000)
+    outcomes["native" if native else "python"] = outcome
+print(json.dumps(outcomes))
+"""
+
+
+def test_a_caller_deeper_than_a_lowered_limit():
+    """Another thread can lower the recursion limit beneath a thread already
+    deeper than it. There the Python walk overflows at its first frame, and
+    so does a native capture, whose entry is that frame: the walker is not
+    reached."""
+    process = subprocess.run(
+        [sys.executable, "-c", _ABOVE_THE_LIMIT_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=_child_environment(),
+        timeout=60,
+    )
+    assert process.returncode == 0, process.stderr
+    assert json.loads(process.stdout) == {
+        "native": ["RecursionError", 0],
+        "python": ["RecursionError", False],
+    }
+
+
+_DEEP_STACK_SCRIPT = """
 import json, os, pickle, sys
 from pydumpling.options import DumpOptions
 from pydumpling.snapshot import SnapshotContext
+from pydumpling.snapshot.values import _STATICS
 
-refusal = {
-    "RuntimeError": RuntimeError,
-    "ValueError": ValueError,
-    "KeyboardInterrupt": KeyboardInterrupt,
-}[sys.argv[1]]
-armed = [False]
+def deep(level, run):
+    items, name = [level, str(level)], f"level-{level}"
+    return run() if level == 0 else deep(level - 1, run)
 
-def deny(event, arguments):
-    if armed[0] and event == "sys._getframe":
-        raise refusal("denied")
-
-sys.addaudithook(deny)
-
-def stack():
-    frame, count = sys._getframe(1), 0
-    while frame is not None:
-        count, frame = count + 1, frame.f_back
-    return count
-
-def descend(frames, run):
-    return run() if frames <= 0 else descend(frames - 1, run)
-
-def build():
-    nested = None
-    for _ in range(15):
-        nested = [nested, {"k": nested}]
-    return nested
-
-nested, other = build(), build()
-outcomes, blobs = {}, {}
-for native in (True, False):
-    os.environ["PYDUMPLING_NATIVE"] = "1" if native else "0"
-    context = SnapshotContext(DumpOptions(max_depth=None, max_nodes=None))
-    walker = vars(context).get("_walker")
-    # 20 frames below the limit, short of what the walk needs.
-    frames = sys.getrecursionlimit() - stack() - 20
-    armed[0] = True
-    shallow = context.value({"deep": nested})
-    after_shallow = None if walker is None else walker.handbacks
-    shallow = pickle.dumps(shallow, protocol=5)
-    try:
-        deep = descend(frames, lambda: context.value({"deep": other}))
-    except KeyboardInterrupt:
-        deep = "KeyboardInterrupt"
-    else:
-        deep = pickle.dumps((deep, dict(context._truncation)), protocol=5)
-    armed[0] = False
-    mode = "native" if native else "python"
-    handbacks = None if walker is None else walker.handbacks
-    outcomes[mode] = [after_shallow, handbacks, sorted(context._truncation)]
-    blobs[native] = (shallow, deep)
-outcomes["same"] = [left == right for left, right in zip(*blobs.values())]
-print(json.dumps(outcomes))
-"""
-
-
-@pytest.mark.parametrize("refusal", ["RuntimeError", "ValueError", "KeyboardInterrupt"])
-def test_audit_hook_refusing_frame_access(refusal):
-    """An audit hook that refuses ``sys._getframe`` never sees the walker's
-    looks from a shallow stack, which fail before the event, so the capture
-    stays native and the same. From a deep stack a look succeeds and the
-    hook runs: a refusal, even with the ``ValueError`` a failed look raises,
-    proves no room and hands the call back, which overflows as in Python,
-    and an exception that is not an ``Exception``, as a signal handler might
-    raise there, goes on."""
-    process = subprocess.run(
-        [sys.executable, "-c", _AUDIT_SCRIPT, refusal],
-        capture_output=True,
-        text=True,
-        env=_child_environment(),
-        timeout=120,
-    )
-    assert process.returncode == 0, process.stderr
-    outcomes = json.loads(process.stdout)
-    assert "recursion" in outcomes["python"][2]
-    if refusal == "KeyboardInterrupt":
-        assert outcomes["native"][:2] == [0, 0]
-        assert outcomes["same"] == [True, False]
-    else:
-        assert outcomes["native"] == [0, 1, outcomes["python"][2]]
-        assert outcomes["same"] == [True, True]
-
-
-_FRAMELESS_SCRIPT = """
-import _thread, itertools, json, os, sys
-from pydumpling.options import DumpOptions
-from pydumpling.snapshot import SnapshotContext
-
-raised, done = [], _thread.allocate_lock()
-
-def report(unraisable):
-    raised.append(type(unraisable.exc_value).__name__)
-    done.release()
-
-sys.unraisablehook = report
-outcomes = {}
-for limit, levels in ((60, 80), (90, 95), (150, 160)):
-    nested = None
-    for _ in range(levels):
-        nested = [nested]
+def capture():
+    frame = sys._getframe(1)
+    outcome = {}
     for native in (True, False):
-        os.environ["PYDUMPLING_NATIVE"] = "1" if native else "0"
-        options = DumpOptions(max_depth=None, max_nodes=None, max_items=None)
-        context = SnapshotContext(options)
-        walker = vars(context).get("_walker")
-        raised.clear()
-        results = []
-        done.acquire()
-        sys.setrecursionlimit(limit)
-        # C calls C down to the walker on a new thread, with no Python frame
-        # beneath it, and releases the lock after, or reports what it raised.
-        captures = map(context.value, [nested])
-        _thread.start_new_thread(
-            results.extend, (itertools.chain(captures, iter(done.release, None)),)
-        )
-        assert done.acquire(timeout=60)
-        done.release()
-        sys.setrecursionlimit(1000)
-        outcome = [list(raised), len(results), len(context.objects), context._nodes]
-        outcome.append(sorted(context._truncation.items()))
-        if walker is not None:
-            outcome.append(walker.handbacks)
-        outcomes.setdefault(f"{limit}/{levels}", {})[
-            "native" if native else "python"
-        ] = outcome
-print(json.dumps(outcomes))
+        context = SnapshotContext(DumpOptions(max_frames=None))
+        if not native:
+            context._native_walk = False
+        before = _STATICS.fallbacks
+        snapshot = context.from_frame(frame)
+        state = (snapshot, dict(context._truncation), context._nodes)
+        outcome[native] = pickle.dumps(state, protocol=5), _STATICS.fallbacks - before
+    return outcome
+
+outcome = deep(700, capture)
+print(json.dumps([outcome[True][0] == outcome[False][0], outcome[True][1]]))
 """
 
 
-def test_a_call_from_a_thread_with_no_python_frame():
-    """A call made from C on a thread with no Python frame, under a limit
-    too low for the walk, hands back where the walker's looks all fail and
-    so prove nothing, and overflows as in Python."""
+def test_a_whole_stack_from_700_frames_deep_stays_native():
+    """At the default recursion limit, a capture of all 702 frames of a stack
+    from 700 frames deep, a few calls per frame, stays native throughout and
+    matches the Python walk, which has room there."""
     process = subprocess.run(
-        [sys.executable, "-c", _FRAMELESS_SCRIPT],
+        [sys.executable, "-c", _DEEP_STACK_SCRIPT],
         capture_output=True,
         text=True,
         env=_child_environment(),
-        timeout=120,
+        timeout=60,
     )
     assert process.returncode == 0, process.stderr
-    for case, outcome in json.loads(process.stdout).items():
-        native, python = outcome["native"], outcome["python"]
-        assert python[0] == ["RecursionError"], (case, outcome)
-        assert native == [*python, 1], (case, outcome)
+    assert json.loads(process.stdout) == [True, 0]
 
 
 def test_placeholders_replaced_in_place():
@@ -3076,7 +3539,7 @@ def test_placeholders_replaced_in_place():
     def build():
         return ({"a": {"leaf": [1]}}, {"b": {"leaf": [2]}}, _odd_types()[0]())
 
-    def calls(context, first, second, handed_back):
+    def calls(context, first, second, odd):
         return [
             lambda: context.value([first, second]),
             # A bool depth is not one the walker reads: Python takes the call.
@@ -3084,18 +3547,19 @@ def test_placeholders_replaced_in_place():
             lambda: context.value({"again": first}),
             lambda: copy.copy(context) and None,
             lambda: context._mapping(second, 0),
-            lambda: context.value([second, handed_back]),
+            lambda: context.value([second, odd]),
         ]
 
     _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
 
 
 @pytest.mark.parametrize("key", [1, 1.5, b"reason"], ids=["int", "float", "bytes"])
-def test_a_placeholder_with_a_key_not_a_str_is_handed_back(key):
-    """``_mapping`` meeting a depth placeholder in its memo reads its
-    ``reason`` only from an instance dict of exact str keys: one that holds
-    another, a bytes key too, which compared with a str warns under
-    ``python -b``, hands the call back, and the Python walk replaces it."""
+def test_a_placeholder_with_a_key_not_a_str_is_read_as_in_python(key):
+    """``_mapping`` meeting a depth placeholder in its memo whose instance
+    dict holds a key other than an exact str, a bytes key too, which
+    compared with a str warns under ``python -b``, reads its ``reason``
+    through the same lookups as the Python walk, natively, and replaces
+    it as there."""
     found = {}
     for native in (False, True):
         with _mode(native):
@@ -3104,9 +3568,10 @@ def test_a_placeholder_with_a_key_not_a_str_is_handed_back(key):
         inner = {"k": 1}
         (placeholder,) = context.value([inner])
         vars(placeholder)[key] = 1
+        before = _fallbacks()
         found[native] = (context._mapping(inner), dict(context._truncation))
     assert found[True] == found[False] == ({"k": 1}, {"max_depth": 1})
-    assert context._walker.handbacks == 1
+    assert _fallbacks() == before
 
 
 @pytest.mark.parametrize("answer", ["a str subclass", "max_depth", "nothing"])
@@ -3146,13 +3611,13 @@ def test_a_placeholder_class_hook_runs_once_where_mapping_meets_it(monkeypatch, 
     _same_in_both_modes(build, DumpOptions(max_depth=1), calls)
 
 
-@pytest.mark.parametrize("taken", ["natively", "by a hand-back", "natively, copied"])
+@pytest.mark.parametrize("taken", ["natively", "natively, copied"])
 def test_a_placeholder_captured_as_itself_and_replaced_in_place(taken):
     """A depth placeholder captured as its own copy is, to the Python walk's
     ``_mapping``, a depth placeholder like any other: it replaces it in
     place before it fails on the placeholder's missing ``items``. The
-    walker, which handed that call back, takes the replacement up and
-    returns it from then on, as the Python walk does."""
+    walker takes the replacement up and returns it from then on, as the
+    Python walk does."""
 
     def build():
         return (TruncatedValue("max_depth", "dict"),)
@@ -3160,7 +3625,6 @@ def test_a_placeholder_captured_as_itself_and_replaced_in_place(taken):
     def calls(context, placeholder):
         taking = {
             "natively": [lambda: context.value(placeholder) is placeholder],
-            "by a hand-back": [lambda: context.value(value=placeholder) is placeholder],
             "natively, copied": [
                 lambda: copy.copy(context) and None,
                 lambda: context.value(placeholder) is placeholder,
@@ -3192,14 +3656,41 @@ def test_a_placeholder_replaced_in_place_is_let_go():
         assert placeholder() is None
 
 
-def _inside_the_walk(context):
-    """Whether a native walk on ``context`` is running on this thread."""
-    try:
-        context._walker.handbacks
-    except RuntimeError:
-        return True
-    except AttributeError:
-        return False  # A callback-safe hand-back temporarily removes the walker.
+def _native_call_lines():
+    """The lines of ``value`` and ``_mapping`` that call the native walker."""
+    lines = {}
+    for name in ("value", "_mapping"):
+        function = vars(values_module.ValuesMixin)[name]
+        source, first = inspect.getsourcelines(function)
+        lines[function.__code__] = {
+            first + at for at, line in enumerate(source) if "= _native_" in line
+        }
+    return lines
+
+
+_NATIVE_CALL_LINES = _native_call_lines()
+
+
+def _inside_the_walk(context, nodes):
+    """Whether a native call on ``context`` is running on this thread.
+
+    Some ``value`` or ``_mapping`` frame on ``context`` is at its call into
+    the walker, and the context's ``_nodes`` is still below ``nodes``: the
+    call writes its count, ``nodes`` or more, to the context only as it
+    returns. The interpreter can run a signal handler or a collection right
+    after the call returns, on that same line, and one handler can run
+    inside another, so neither the line nor the innermost frame tells alone.
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        lines = _NATIVE_CALL_LINES.get(frame.f_code)
+        if (
+            lines is not None
+            and frame.f_locals.get("self") is context
+            and frame.f_lineno in lines
+        ):
+            return vars(context)["_nodes"] < nodes
+        frame = frame.f_back
     return False
 
 
@@ -3218,13 +3709,13 @@ def _collecting(callback):
 
 def test_capture_reentered_by_a_collection():
     """A collection callback that captures on the context while the native
-    walk runs is refused with RuntimeError; outside the walk it captures as
-    usual; and the outer capture is unchanged.
-
-    A collection runs inside a native call only at the walker's signal
-    checks, one per 4096 nodes, so the graph crosses many of them.
-    """
+    walk runs captures as it does outside the walk, and the outer capture is
+    unchanged: the context is captured again from inside its own capture as
+    in the Python walk. A collection runs inside a native call only at the
+    walker's signal check, where the node count is synced as around
+    application code, so the inner captures count toward the outer one's."""
     graph = [[i, str(i)] for i in range(20000)]
+    nodes = 1 + 3 * len(graph)  # The list, and each pair, its int and its str.
     results = {}
     for native in (True, False):
         with _mode(native):
@@ -3235,39 +3726,215 @@ def test_capture_reentered_by_a_collection():
         def callback(phase, info, context=context, calls=calls, native=native):
             if phase != "start" or len(calls) >= 50:
                 return
-            inside = native and _inside_the_walk(context)
-            try:
-                calls.append((inside, context.value(["inner", 2.5])))
-            except RuntimeError as error:
-                calls.append((inside, error))
+            inside = native and _inside_the_walk(context, nodes)
+            before = context._nodes
+            inner = context.value(["inner", 2.5])
+            calls.append((inside, inner, context._nodes - before))
 
         with _collecting(callback):
             captured = context.value(graph)
-        inside = [outcome for within, outcome in calls if within]
-        outside = [outcome for within, outcome in calls if not within]
-        assert all(copy == ["inner", 2.5] for copy in outside)
-        if native:
-            assert inside, "no collection ran during the native walk"
-            assert all(
-                isinstance(error, RuntimeError) and "already capturing" in str(error)
-                for error in inside
-            )
-        else:
-            assert outside and not inside
+        inside = [outcome for within, outcome, _ in calls if within]
+        assert all(inner == ["inner", 2.5] for _, inner, _ in calls)
+        assert inside if native else calls and not inside
+        assert context._nodes == nodes + sum(counted for _, _, counted in calls)
         results[native] = pickle.dumps(captured, protocol=5)
     assert results[True] == results[False]
 
 
-_REENTRY_AUDIT_SCRIPT = """
-import copy, pickle, sys, threading
+def _restore(cls, state):
+    """An instance of ``cls`` whose instance dict is updated from ``state``."""
+    instance = object.__new__(cls)
+    instance.__dict__.update(state)
+    return instance
+
+
+def _reduce(context):
+    """Reduce a context from a copy of its instance dict, bypassing its class."""
+    return _restore, (type(context), dict(vars(context)))
+
+
+def _shallow_copy(context, how):
+    """A shallow copy of ``context`` sharing the values of its instance dict,
+    made with ``copy.copy``, through ``copyreg``, or by hand."""
+    if how == "by_hand":
+        return _restore(type(context), dict(vars(context)))
+    if how == "copyreg":
+        copyreg.pickle(SnapshotContext, _reduce)
+    try:
+        return copy.copy(context)
+    finally:
+        copyreg.dispatch_table.pop(SnapshotContext, None)
+
+
+@pytest.mark.parametrize("how", ["copy", "copyreg", "by_hand"])
+def test_a_shallow_copy_captures_inside_its_originals_call(how):
+    """A shallow copy captures with its original's walk and shares
+    ``objects``. A capture through it from a collection callback while the
+    original's native call runs captures as it does outside the call, as in
+    the Python walk, and the original's capture is unchanged."""
+    graph = [[i, str(i)] for i in range(20000)]
+    nodes = 1 + 3 * len(graph)  # The list, and each pair, its int and its str.
+    results = {}
+    for native in (True, False):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_nodes=None, max_items=None))
+        twin = _shallow_copy(context, how)
+        assert twin.objects is context.objects
+        _check_walker(context, native)
+        _check_walker(twin, native)
+        calls = []
+
+        def callback(
+            phase, info, context=context, twin=twin, calls=calls, native=native
+        ):
+            if phase != "start" or len(calls) >= 50:
+                return
+            inside = native and _inside_the_walk(context, nodes)
+            calls.append((inside, twin.value(["inner", 2.5])))
+
+        before = _fallbacks()
+        with _collecting(callback):
+            captured = context.value(graph)
+        assert _fallbacks() == before
+        assert all(inner == ["inner", 2.5] for _, inner in calls)
+        assert any(inside for inside, _ in calls) if native else calls
+        results[native] = pickle.dumps(captured, protocol=5)
+    assert results[True] == results[False]
+
+
+_REBASED_COUNT = 6000
+
+
+def _rebased_mid_call(native):
+    """Capture ``_REBASED_COUNT`` instances while the first collection past
+    node 4096 rebases their class, then three new instances in a second
+    call. Returns each copy's ``x`` attribute (None where it has none) for
+    both calls, the ``unsupported_type`` tally after the first, and whether
+    the class changed during the first call."""
+
+    class WithDict:
+        pass
+
+    class Planted:
+        @property
+        def __dict__(self):
+            return {}
+
+    class Child(Planted):
+        pass
+
+    def instances(count):
+        made = [Child() for _ in range(count)]
+        for index, instance in enumerate(made):
+            instance.x = index
+        return made
+
+    first = instances(_REBASED_COUNT)
+    with _mode(native):
+        context = SnapshotContext(DumpOptions(max_nodes=None, max_items=None))
+    _check_walker(context, native)
+    rebased = []
+
+    def rebase(phase, info):
+        if phase != "start" or rebased:
+            return
+        # The native call counts the list and every instance.
+        if (
+            _inside_the_walk(context, _REBASED_COUNT)
+            if native
+            else context._nodes >= 4096
+        ):
+            Child.__bases__ = (WithDict,)
+            rebased.append(True)
+
+    before = _fallbacks()
+    with _collecting(rebase):
+        captured = context.value(first)
+    tally = context._truncation["unsupported_type"]
+    assert _fallbacks() == before
+    later = context.value(instances(3))
+    return (
+        [vars(copy).get("x") for copy in captured],
+        tally,
+        [vars(copy).get("x") for copy in later],
+        bool(rebased),
+    )
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["python", "native"])
+def test_a_class_rebased_by_a_collection_mid_call(native):
+    """A collection callback past node 4096 rebases a class whose
+    ``__dict__`` is a property onto one with the real instance-dict
+    descriptor. The instances captured after the collection carry their
+    attributes, and only those before it count as ``unsupported_type``, in
+    both walks: a collection runs inside a native call only at the walker's
+    signal check, after which, as after application code, the walker
+    forgets what it read about types. The next call reads the attributes
+    too."""
+    xs, tally, later, rebased = _rebased_mid_call(native)
+    assert rebased, "no collection ran during the walk"
+    hidden = xs.count(None)
+    assert 0 < hidden < _REBASED_COUNT
+    assert xs == [None] * hidden + list(range(hidden, _REBASED_COUNT))
+    assert tally == hidden
+    assert later == [0, 1, 2]
+
+
+def _held_by_a_frame(context):
+    """Capture this frame, whose one variable is ``context``, through it."""
+    head = context.from_frame(sys._getframe())
+    return head.tb_frame.f_locals["context"]
+
+
+@pytest.mark.parametrize(
+    "by, counted", [("itself", 2), ("its own frame", 3), ("another context", 0)]
+)
+@pytest.mark.parametrize("native", [False, True], ids=["python", "native"])
+def test_a_context_captured_as_a_value(native, by, counted):
+    """A context captured by itself, through ``value`` or a frame that holds
+    it, shows the count the walk had reached when it selected the instance
+    dict's entries: two nodes past the call's start through ``value``,
+    three through a frame namespace. The walker writes its count to the
+    instance dict before it reads that dict. Captured by another context,
+    it shows the count its last call left. Its copy holds every copy made so
+    far, the capturing call's own included."""
+    with _mode(native):
+        context = SnapshotContext(DumpOptions(max_frames=1))
+        other = SnapshotContext(DumpOptions())
+    _check_walker(context, native)
+    _check_walker(other, native)
+    data = [1, "a"]
+    context.value(data)
+    nodes = context._nodes
+    before = _fallbacks()
+    if by == "itself":
+        copied = context.value(context)
+    elif by == "its own frame":
+        copied = _held_by_a_frame(context)
+    else:
+        copied = other.value(context)
+    assert _fallbacks() == before
+    attrs = vars(copied)
+    earlier = [id(data), id(data[0]), id(data[1])]
+    objects, sources = list(attrs["objects"]), list(attrs["_sources"])
+    if counted:
+        assert objects[:3] == sources[:3] == earlier
+        assert {id(context), id(vars(context))} <= set(objects)
+    else:
+        assert objects == sources == earlier
+    assert attrs["_nodes"] == nodes + counted
+
+
+_REENTRY_SCRIPT = """
+import copy, gc, pickle, sys, threading
 from pydumpling.options import DumpOptions
-from pydumpling.snapshot import SnapshotContext
+from pydumpling.snapshot import SnapshotContext, values
 
 mode = sys.argv[1]
-context = SnapshotContext(DumpOptions())
-assert context._walker is not None
+context = SnapshotContext(DumpOptions(max_nodes=None, max_items=None))
+assert context._native_walk
 entered, done = threading.Event(), threading.Event()
-errors, independent = [], []
+errors, independent, captures = [], [], []
 fired = False
 
 def capture_same():
@@ -3275,19 +3942,36 @@ def capture_same():
         if mode == 'copy':
             copy.copy(context)
         elif mode == 'deepcopy':
-            assert copy.deepcopy(context)._walker is None
+            copy.deepcopy(context)
         elif mode == 'pickle':
-            assert pickle.loads(pickle.dumps(context))._walker is None
+            pickle.loads(pickle.dumps(context))
         else:
-            context.value([1])
+            captures.append(context.value([1]))
     except RuntimeError as error:
         errors.append(str(error))
     finally:
         done.set()
 
-def audit(event, args):
+native_lines = {
+    values.ValuesMixin.value.__code__: next(
+        number for number, line in enumerate(open(values.__file__), 1)
+        if "captured = _native_value(" in line
+    )
+}
+
+def inside():
+    # The native call runs beneath its entry's frame, at that call.
+    frame = sys._getframe(1)
+    while frame is not None:
+        if native_lines.get(frame.f_code) == frame.f_lineno:
+            return True
+        frame = frame.f_back
+    return False
+
+def collected(phase, info):
+    # A collection runs inside the native call at one of its signal checks.
     global fired
-    if event != 'sys._getframe' or fired:
+    if phase != 'start' or fired or not inside():
         return
     fired = True
     if mode == 'other':
@@ -3305,23 +3989,22 @@ if mode == 'other':
     thread = threading.Thread(target=other)
     thread.start()
 
-sys.addaudithook(audit)
-def descend(depth):
-    if depth:
-        return descend(depth - 1)
-    return context.value(['outer'])
-
-assert descend(600) == ['outer']
+graph = [[i, str(i)] for i in range(20000)]
+gc.callbacks.append(collected)
+gc.set_threshold(1, 1, 1)
+captured = context.value(graph)
+gc.set_threshold(700, 10, 10)
+assert len(captured) == len(graph)
 if mode == 'other':
+    entered.set()
     thread.join(5)
     assert not thread.is_alive()
-assert fired
+assert fired, 'no collection ran inside the native call'
+assert errors == [], errors
 if mode == 'separate':
     assert independent == [[1]]
-elif mode in ('copy', 'deepcopy', 'pickle'):
-    assert errors == []
-else:
-    assert len(errors) == 1 and 'already capturing' in errors[0], errors
+elif mode in ('same', 'other'):
+    assert captures == [[1]], captures
 print('ok')
 """
 
@@ -3330,10 +4013,12 @@ print('ok')
     "mode", ["same", "other", "copy", "deepcopy", "pickle", "separate"]
 )
 def test_unanticipated_capture_reentry(mode):
-    """Unknown same-context reentry fails closed; independent contexts work,
-    and so does copying or pickling the context, which captures nothing."""
+    """A capture through the context from a collection inside its native
+    call, or from another thread meanwhile, captures as in the Python walk;
+    so do independent contexts, and copying or pickling the context, which
+    captures nothing."""
     process = subprocess.run(
-        [sys.executable, "-c", _REENTRY_AUDIT_SCRIPT, mode],
+        [sys.executable, "-c", _REENTRY_SCRIPT, mode],
         capture_output=True,
         text=True,
         env=_child_environment(),
@@ -3341,19 +4026,6 @@ def test_unanticipated_capture_reentry(mode):
     )
     assert process.returncode == 0, process.stderr
     assert process.stdout.strip() == "ok"
-
-
-def test_descriptor_without_an_owner_or_arguments():
-    """A descriptor built without an owner cannot be pickled, and a call with
-    no context fails as the function's own does."""
-    function = vars(values_module.ValuesMixin)["value"].__wrapped__
-    with pytest.raises(TypeError, match="without an owner"):
-        pickle.dumps(values_module._native.Dispatch(function))
-    with pytest.raises(TypeError) as native_error:
-        vars(values_module.ValuesMixin)["value"]()
-    with pytest.raises(TypeError) as pure_error:
-        function()
-    assert str(native_error.value) == str(pure_error.value)
 
 
 @pytest.mark.parametrize("method", ["value", "_mapping"])
@@ -3372,36 +4044,8 @@ def test_keyword_self_preserves_memo(method):
         assert not context._truncation
 
 
-def test_same_size_instance_change_honors_walk_override():
-    """Replacing an unrelated attribute with a helper must retire the walker."""
-    for native in (False, True):
-        with _mode(native):
-            context = SnapshotContext(DumpOptions())
-        context.scratch = None
-        context.value(1)
-        size = len(vars(context))
-        del context.scratch
-        context._text = lambda value: "<redacted>"
-        assert len(vars(context)) == size
-        assert context.value("secret") == "<redacted>"
-
-
-def test_class_change_after_construction_honors_walk_override():
-    """A helper installed on the context class also invalidates native dispatch."""
-    for native in (False, True):
-
-        class Context(SnapshotContext):
-            pass
-
-        with _mode(native):
-            context = Context(DumpOptions())
-        context.value(1)
-        Context._text = lambda self, value: "<redacted>"
-        assert context.value("secret") == "<redacted>"
-
-
-def test_deleted_unused_helper_retires_walker(monkeypatch):
-    """A missing helper need not fail a Python capture that never calls it."""
+def test_a_deleted_helper_a_capture_never_calls(monkeypatch):
+    """A missing helper need not fail a capture that never calls it."""
     for native in (False, True):
         with _mode(native):
             context = SnapshotContext(DumpOptions())
@@ -3412,20 +4056,61 @@ def test_deleted_unused_helper_retires_walker(monkeypatch):
 
 
 @contextlib.contextmanager
-def _walk_callback(kind, callback):
-    """Run a callback at a Python helper, restoring any test runner hook."""
-    getter = sys.getprofile if kind == "profile" else sys.gettrace
-    setter = sys.setprofile if kind == "profile" else sys.settrace
-    previous = getter()
+def _hooked(kind, on_call=None):
+    """Set a tracer, a profiler, ``cProfile`` or a ``sys.monitoring`` tool for
+    the block, and restore a test runner's hook after it. The list it yields
+    gets the code of each Python function the hook sees start, and
+    ``on_call`` is called with that code as it starts; ``cProfile`` lists
+    what it saw only when the block ends, and calls nothing."""
+    seen = []
+
+    def record(code):
+        seen.append(code)
+        if on_call is not None:
+            on_call(code)
+
+    if kind == "cprofile":
+        profiler = cProfile.Profile()
+        profiler.enable()
+        try:
+            yield seen
+        finally:
+            profiler.disable()
+        seen.extend(entry.code for entry in profiler.getstats())
+        return
+    if kind == "monitoring":
+        monitoring = sys.monitoring
+        tool = next(
+            (tool for tool in reversed(range(6)) if monitoring.get_tool(tool) is None),
+            None,
+        )
+        if tool is None:
+            pytest.skip("all monitoring tool ids are in use")
+        start = monitoring.events.PY_START
+        monitoring.use_tool_id(tool, "pydumpling-test")
+        monitoring.register_callback(tool, start, lambda code, offset: record(code))
+        monitoring.set_events(tool, start)
+        try:
+            yield seen
+        finally:
+            monitoring.set_events(tool, 0)
+            monitoring.register_callback(tool, start, None)
+            monitoring.free_tool_id(tool)
+        return
+    getter, setter = {
+        "profile": (sys.getprofile, sys.setprofile),
+        "trace": (sys.gettrace, sys.settrace),
+    }[kind]
 
     def hook(frame, event, arg):
-        if event == "call" and frame.f_code is SnapshotContext._bounded_text.__code__:
-            callback()
+        if event == "call":
+            record(frame.f_code)
         return hook
 
+    previous = getter()
     setter(hook)
     try:
-        yield
+        yield seen
     finally:
         setter(previous)
 
@@ -3444,175 +4129,115 @@ def test_gc_callback_capture_shares_memo_and_budget():
 
         with _collecting(callback):
             captured = context.value(graph)
+            # A native call may run no collection: then one after it shares.
+            gc.collect()
         assert inner and inner[0] is captured[0]
         assert context.value(graph[0]) is captured[0]
         copy.copy(context)
         assert context._nodes == len(context.objects) <= 20
 
 
-def _handed_back():
-    """A value the walker leaves to the Python walk: its type has an odd name."""
-    return _odd_types()[0]()
+def _helpers_case():
+    """A case whose capture in Python runs pydumpling's helpers, which the
+    native walk does itself: ``_layout`` for container and scalar
+    subclasses, and ``_text`` and ``_bounded_bytes`` for long data; and
+    ``FakeContainer.__hash__`` for a named tuple key, which a dict insert
+    runs in both walks."""
+    point = _Record(1, "two")
+    values = [
+        OrderedDict(a=1, b=[2]),
+        defaultdict(list, k=[3]),
+        Counter("hello"),
+        point,
+        _Color.HUGE,
+        _Mode.WIDE,
+        "x" * 10_000,
+        bytearray(b"y" * 5_000),
+        {point: "keyed"},
+        {point, 4},
+    ]
+    ops = [
+        ("value", values, 0),
+        ("mapping", {"values": values, "point": point}, 0, (), False, dict),
+    ]
+    return _Case(-1, DumpOptions(), ops, None, [])
 
 
-@pytest.mark.parametrize("kind", ["profile", "trace"])
-def test_tracing_hook_reentering_a_hand_back(kind):
-    """A tracing hook runs only in the Python walk. One that captures there,
-    in a call the walker handed back, shares that call's copies."""
-    for native in (False, True):
-        with _mode(native):
-            context = SnapshotContext(DumpOptions(max_string_bytes=8))
-        shared, inner = [], []
-
-        def capture():
-            if not inner:
-                inner.append(context.value(shared))
-
-        with _walk_callback(kind, capture):
-            captured = context.value([shared, "x" * 100, _handed_back()])
-        assert len(inner) == 1
-        assert inner[0] is captured[0]
-        assert context.value(shared) is captured[0]
-        if native:
-            assert context._walker.handbacks == 1
-
-
-@pytest.mark.parametrize("local", [False, True], ids=["global", "local"])
-def test_monitoring_callback_reentering_a_hand_back(local):
-    """A monitoring callback, global or set on one code object, likewise."""
-    monitoring = sys.monitoring
-    tool_id = next(
-        (tool for tool in reversed(range(6)) if monitoring.get_tool(tool) is None),
-        None,
-    )
-    if tool_id is None:
-        pytest.skip("all monitoring tool ids are in use")
-    for native in (False, True):
-        with _mode(native):
-            context = SnapshotContext(DumpOptions(max_string_bytes=8))
-        shared, inner = [], []
-        code = SnapshotContext._bounded_text.__code__
-
-        def callback(started, offset):
-            if started is code and not inner:
-                inner.append(context.value(shared))
-
-        monitoring.use_tool_id(tool_id, "pydumpling-reentry-test")
-        try:
-            monitoring.register_callback(tool_id, monitoring.events.PY_START, callback)
-            if local:
-                monitoring.set_local_events(tool_id, code, monitoring.events.PY_START)
-            else:
-                monitoring.set_events(tool_id, monitoring.events.PY_START)
-            captured = context.value([shared, "x" * 100, _handed_back()])
-        finally:
-            monitoring.set_events(tool_id, 0)
-            monitoring.set_local_events(tool_id, code, 0)
-            monitoring.register_callback(tool_id, monitoring.events.PY_START, None)
-            monitoring.free_tool_id(tool_id)
-        assert len(inner) == 1
-        assert inner[0] is captured[0]
-        assert context.value(shared) is captured[0]
-        if native:
-            assert context._walker.handbacks == 1
-
-
-@pytest.mark.parametrize("kind", ["profile", "trace"])
-def test_tracing_hook_shares_the_node_budget(kind):
-    """The nested capture spends the remaining node budget of the call it
-    runs in, natively handed back or in Python."""
-    outcomes = {}
-    for native in (False, True):
-        with _mode(native):
-            context = SnapshotContext(DumpOptions(max_string_bytes=8, max_nodes=4))
-        inner = []
-
-        def capture():
-            if not inner:
-                inner.append(context.value(["inner", 2.5]))
-
-        with _walk_callback(kind, capture):
-            captured = context.value([1, "x" * 100, _handed_back()])
-        copy.copy(context)
-        assert inner == [[]]
-        assert context._nodes == len(context.objects) == 4
-        outcomes[native] = pickle.dumps(
-            (captured, inner, list(context._truncation.items()), context._nodes),
-            protocol=5,
-        )
-    assert outcomes[True] == outcomes[False]
-
-
-@contextlib.contextmanager
-def _recording(kind, seen, callers=None):
-    """Record each Python function a profiler, tracer or monitoring tool sees,
-    and in ``callers`` the file of the frame that called it."""
-
-    def record(frame):
-        seen.append(frame.f_code)
-        if callers is not None:
-            caller = frame.f_back
-            callers.append(caller.f_code.co_filename if caller else None)
-
-    if kind == "monitoring":
-        monitoring = sys.monitoring
-        tool_id = next(
-            (tool for tool in reversed(range(6)) if monitoring.get_tool(tool) is None),
-            None,
-        )
-        if tool_id is None:
-            pytest.skip("all monitoring tool ids are in use")
-        monitoring.use_tool_id(tool_id, "pydumpling-probe-test")
-        monitoring.register_callback(
-            tool_id,
-            monitoring.events.PY_START,
-            lambda code, offset: record(sys._getframe(1)),
-        )
-        monitoring.set_events(tool_id, monitoring.events.PY_START)
-        try:
-            yield
-        finally:
-            monitoring.set_events(tool_id, 0)
-            monitoring.register_callback(tool_id, monitoring.events.PY_START, None)
-            monitoring.free_tool_id(tool_id)
-        return
-    getter = sys.getprofile if kind == "profile" else sys.gettrace
-    setter = sys.setprofile if kind == "profile" else sys.settrace
-
-    def hook(frame, event, arg):
-        if event == "call":
-            record(frame)
-        return hook
-
-    previous = getter()
-    setter(hook)
+@pytest.mark.parametrize("kind", ["trace", "profile", "cprofile", "monitoring"])
+def test_parity_under_hooks(kind):
+    """Under a tracer, a profiler, ``cProfile`` or a ``sys.monitoring`` tool
+    the walker takes every call it takes without one, and its snapshot is
+    the Python walk's byte for byte: the hook sees none of pydumpling's
+    helpers, which the walker does itself, and changes nothing either walk
+    captures. (Seed 3 runs from deep in the stack, found by overflowing on
+    purpose, which unsets a Python trace function.)"""
+    cases = [_case(seed) for seed in (0, 1, 2, 4, 5)] + [_helpers_case()]
     try:
-        yield
+        for case in cases:
+            _run(case, native=False)
+            unhooked = _run(case, native=True)
+            with _hooked(kind) as seen:
+                native = _run(case, native=True)
+            with _hooked(kind):
+                pure = _run(case, native=False)
+            _assert_parity(case, native, pure)
+            assert native.fallbacks == unhooked.fallbacks, case.seed
     finally:
-        setter(previous)
+        for case in cases:
+            case.close()
+    assert native.fallbacks == 0
+    helpers = {
+        code.co_name
+        for code in seen
+        if getattr(code, "co_filename", None)
+        in (values_module.__file__, context_module.__file__)
+    }
+    # The context's own, the two methods the case calls the walker by, and
+    # the node check ``value`` makes before its entry.
+    assert helpers <= {"__init__", "value", "_mapping", "_has_nodes"}
+
+
+class _HookedName(str):
+    """A ``__qualname__`` whose ``+`` is application code ``_type_name``
+    runs, and a hook can see start."""
+
+    def __radd__(self, other):
+        return str.__add__(other, str(self))
 
 
 @pytest.mark.parametrize("kind", ["profile", "trace", "monitoring"])
-def test_tracing_hooks_never_see_the_stack_checks(kind):
-    """Under a profiler, tracer or monitoring tool a capture that needs no
-    Python helper stays native and runs no Python code, shallow or deep
-    enough to look at the stack again: the walker looks from C."""
-    options = DumpOptions(max_depth=None, max_items=None, max_nodes=None)
-    deep = [0]
-    for level in range(80):
-        deep = [level, deep]
-    with _mode(False):
-        expected = pickle.dumps(SnapshotContext(options).value(deep), protocol=5)
-    with _mode(True):
-        context = SnapshotContext(options)
-    seen = []
-    with _recording(kind, seen):
-        assert context.value([[1, "a"], {"k": (2.5,)}]) == [[1, "a"], {"k": (2.5,)}]
-        captured = context.value(deep)
-    assert context._walker.handbacks == 0
-    assert pickle.dumps(captured, protocol=5) == expected
-    walk_files = {values_module.__file__, context_module.__file__}
-    assert not [code for code in seen if code.co_filename in walk_files]
+def test_a_hook_capturing_inside_application_code_matches_python(kind):
+    """A profiler, tracer or monitoring callback that captures through the
+    context while the walk runs application code (here a ``__qualname__``'s
+    ``__radd__``) gets the copy the call made already, from the memo, and
+    captures a value not copied yet, counting its node on from the walk's
+    count, which it reads in ``_nodes`` as in the Python walk. The outer
+    capture then counts on from the hook's, and is the same either way."""
+    radd = _HookedName.__radd__.__code__
+    outcomes = {}
+    for native in (False, True):
+        Named = type("Named", (), {})
+        Named.__qualname__ = _HookedName("Named")
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_string_bytes=8))
+        shared, fresh, inner = [], [1], []
+
+        def capture(code, context=context, inner=inner, values=(shared, fresh)):
+            if code is radd and not inner:
+                inner.append(context._nodes)
+                inner.extend(context.value(value) for value in values)
+                inner.append(context._nodes)
+
+        before = _fallbacks()
+        with _hooked(kind, capture):
+            captured = context.value([shared, "x" * 100, Named()])
+        assert _fallbacks() == before
+        assert len(inner) == 4
+        assert inner[1] is captured[0]
+        assert inner[2] == [1]
+        state = (inner, captured, dict(context._truncation), context._nodes)
+        outcomes[native] = pickle.dumps(state, protocol=5)
+    assert outcomes[True] == outcomes[False]
 
 
 @pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="SIGUSR1 is unavailable")
@@ -3626,21 +4251,23 @@ def test_signal_handlers_and_asyncio_keep_the_native_walk():
     def handler(number, frame):
         pass
 
+    before = _fallbacks()
     previous = signal.signal(signal.SIGUSR1, handler)
     try:
         assert context.value([1, 2]) == [1, 2]
         assert signal.getsignal(signal.SIGUSR1) is handler
     finally:
         signal.signal(signal.SIGUSR1, previous)
-    assert context._walker.handbacks == 0
+    assert _fallbacks() == before
 
     async def main():
         with _mode(True):
             inner = SnapshotContext(DumpOptions())
         assert inner.value({"a": [1]}) == {"a": [1]}
-        return inner._walker.handbacks
+        return inner._native_walk
 
-    assert asyncio.run(main()) == 0
+    assert asyncio.run(main())
+    assert _fallbacks() == before
 
 
 def test_native_calls_run_no_import_or_class_hooks():
@@ -3674,11 +4301,12 @@ def test_native_calls_run_no_import_or_class_hooks():
     class Hooked(SnapshotContext, metaclass=Meta):
         pass
 
+    before = _fallbacks()
     with _mode(True):
         hooked = Hooked(DumpOptions())
     assert hooked.value([1, "x"]) == [1, "x"]
-    assert hooked._walker is not None
-    assert hooked._walker.handbacks == 0 or _traced()
+    assert hooked._native_walk
+    assert _fallbacks() == before
     assert lookups == []
 
     class Context(SnapshotContext, metaclass=Logged):
@@ -3686,7 +4314,7 @@ def test_native_calls_run_no_import_or_class_hooks():
 
     with _mode(True):
         context = Context(DumpOptions(max_string_bytes=4))
-    assert context._walker is not None
+    assert context._native_walk
     imports = []
     real_import = builtins.__import__
 
@@ -3699,19 +4327,22 @@ def test_native_calls_run_no_import_or_class_hooks():
     try:
         for value in ([1, "abcdefgh"], {"k": (2.5, None)}, "x" * 50):
             context.value(value)
-        handbacks = context._walker.handbacks
+        fallbacks = _fallbacks() - before
         Context._text = Descriptor()
-        retired = context.value("y" * 50)
+        # In a list: ``value`` captures an exact str itself, before the
+        # walker's entry, through the class.
+        patched = context.value(["y" * 50])
     finally:
         builtins.__import__ = real_import
         del Context._text
-    assert handbacks == 0 or _traced()
+    assert fallbacks == 0
     assert not imports
-    # The patched helper retires the walker; only the Python walk, which
-    # calls it as a bound method, runs the descriptor.
-    assert context._walker is None
-    assert lookups == [("__get__", False)]
-    assert retired == SnapshotContext(DumpOptions(max_string_bytes=4)).value("y" * 50)
+    # The class changed after it was created, which a native context does
+    # not see: the walker bounds the text itself.
+    assert context._native_walk
+    assert lookups == []
+    expected = SnapshotContext(DumpOptions(max_string_bytes=4)).value(["y" * 50])
+    assert patched == expected
 
 
 # --- State the context reads through its class ------------------------------
@@ -3754,27 +4385,26 @@ def _logged_hooks(log):
     }
 
 
-def _logged_capture(install, when):
-    """Capture in each mode on a fresh context subclass that ``install``
-    changes, before construction or after a first call, and return the
-    pickled results and the log of what ``install`` added."""
+def _logged_capture(attributes, when):
+    """Capture in each mode on a fresh context subclass given the class
+    attributes ``attributes(log)`` returns, in its body (``subclass``) or set
+    on it after a first call (``patched``), and return the pickled results
+    and the log of what those attributes ran."""
     data = {"a": [1, 2, 3, 4], "b": "text" * 10, "c": _Record(1, [2]), "d": (2.5,)}
     outcomes = {}
     for native in (False, True):
         log = []
-
-        class Context(SnapshotContext):
-            pass
-
-        if when == "subclass":
-            install(Context, log)
+        added = attributes(log)
+        body = {} if when == "patched" else added
+        Context = type("Context", (SnapshotContext,), body)
         with _mode(native):
             context = Context(
                 DumpOptions(max_items=3, max_nodes=12, max_string_bytes=8)
             )
         first = context.value([1, "x" * 20])
         if when == "patched":
-            install(Context, log)
+            for name, attribute in added.items():
+                setattr(Context, name, attribute)
         results = (
             first,
             context.value(data),
@@ -3784,46 +4414,41 @@ def _logged_capture(install, when):
         )
         state = (results, list(context._truncation.items()), context._nodes)
         outcomes[native] = (pickle.dumps(state, protocol=5), list(log))
-        assert object.__getattribute__(context, "__dict__").get("_walker") is None
+        # The walk is chosen when the class is created.
+        assert context._native_walk is (native and when == "patched")
     return outcomes
 
 
-@pytest.mark.parametrize("when", ["subclass", "patched"])
-@pytest.mark.parametrize(
-    "name",
-    [
-        "options",
-        "objects",
-        "_sources",
-        "_nodes",
-        "_truncation",
-        "_layouts",
-        "_node_marker",
-        "_unlimited",
-    ],
+_STATE_NAMES = (
+    "options",
+    "objects",
+    "_sources",
+    "_nodes",
+    "_truncation",
+    "_layouts",
+    "_node_marker",
+    "_unlimited",
 )
-def test_state_behind_a_property_runs_as_in_python(name, when):
-    """A state attribute behind a property, on the class from the start or
-    patched on after a call, runs that property exactly as the Python walk
-    does: the walker never reads it, and gives the context to Python."""
+
+
+@pytest.mark.parametrize("name", _STATE_NAMES)
+def test_state_behind_a_property_runs_as_in_python(name):
+    """A context class with a state attribute behind a property captures in
+    Python, which runs that property exactly as the Python walk does."""
     outcomes = _logged_capture(
-        lambda cls, log: setattr(cls, name, _logged_property(name, log)), when
+        lambda log: {name: _logged_property(name, log)}, "subclass"
     )
     assert outcomes[True] == outcomes[False]
     assert outcomes[True][1], "the property never ran"
 
 
-@pytest.mark.parametrize("when", ["subclass", "patched"])
 @pytest.mark.parametrize("hook", ["__getattribute__", "__setattr__", "__delattr__"])
-def test_context_attribute_hooks_run_as_in_python(hook, when):
-    """The context class's own attribute hooks, defined on it or patched on
-    after a call, run exactly as often as in the Python walk: the walker
-    reads and clears its own attribute without them. Neither walk deletes
-    an attribute, so ``__delattr__`` checks only that the context goes to
-    the Python walk."""
-    outcomes = _logged_capture(
-        lambda cls, log: setattr(cls, hook, _logged_hooks(log)[hook]), when
-    )
+def test_context_attribute_hooks_run_as_in_python(hook):
+    """A context class with attribute hooks of its own captures in Python,
+    which runs them exactly as often as the Python walk does. Neither walk
+    deletes an attribute, so ``__delattr__`` checks only that the context
+    goes to the Python walk."""
+    outcomes = _logged_capture(lambda log: {hook: _logged_hooks(log)[hook]}, "subclass")
     assert outcomes[True] == outcomes[False]
 
 
@@ -3872,6 +4497,160 @@ def test_layouts_cache_of_another_class():
 
     native, _ = _same_in_both_modes(build, DumpOptions(), calls)
     assert native.hooks.count("layouts get") == 4
+
+
+class _LoggedList(list):
+    """A list whose iteration, truth and subscripts run Python code."""
+
+    def __init__(self, label, items):
+        super().__init__(items)
+        self.label = label
+
+    def __iter__(self):
+        _called(f"{self.label} __iter__")
+        return list.__iter__(self)
+
+    def __bool__(self):
+        _called(f"{self.label} __bool__")
+        return True
+
+    def __getitem__(self, index):
+        _called(f"{self.label} __getitem__ {index}")
+        return list.__getitem__(self, index)
+
+
+class _LoggedEntry:
+    """A ``(name, member)`` entry of a layout, unpacked through its own
+    ``__iter__``."""
+
+    def __init__(self, name, member):
+        self.name, self.member = name, member
+
+    def __iter__(self):
+        _called(f"entry {self.name}")
+        return iter((self.name, self.member))
+
+
+class _LoggedMember:
+    """A layout member whose ``__get__`` is Python code; one holding None
+    is unset."""
+
+    def __init__(self, name, held):
+        self.name, self.held = name, held
+
+    def __get__(self, instance, owner):
+        _called(f"__get__ {self.name}")
+        if self.held is None:
+            raise AttributeError(self.name)
+        return self.held
+
+
+class _HashedName(str):
+    """A slot name whose hash is Python code."""
+
+    def __hash__(self):
+        _called(f"__hash__ {str(self)}")
+        return str.__hash__(self)
+
+
+def test_a_layout_python_code_wrote():
+    """A layout Python code wrote into ``_layouts`` runs its own code where
+    ``_fill_copy`` and ``_filled_slot`` read it: the layout's subscripts,
+    iterating its members, unpacking each entry, each member's
+    ``__get__``, the fields' truth and iteration, and a slot name's hash,
+    the same number of times and in the same order in both walks."""
+
+    class Point(tuple):
+        pass
+
+    class Number(int):
+        pass
+
+    class Bag(list):
+        __slots__ = ("a",)
+
+    def build():
+        bag = Bag([1])
+        bag.a = "slot"
+        return (Point((1, 2)), Number(5), bag)
+
+    def calls(context, point, number, bag):
+        def planted():
+            members = [
+                _LoggedEntry("unset", _LoggedMember("unset", None)),
+                _LoggedEntry("held", _LoggedMember("held", [3])),
+            ]
+            context._layouts[id(Point)] = _LoggedList(
+                "layout",
+                [Point, _LoggedList("members", members), _LoggedList("fields", "xy")],
+            )
+            context._layouts[id(Number)] = (
+                Number,
+                _LoggedList("number members", members),
+                (),
+            )
+            name = _HashedName("a")
+            context._layouts[id(Bag)] = (Bag, [(name, vars(Bag)["a"])], ())
+            return context.value([point, [number], bag])
+
+        def unpacked(entry):
+            context._layouts[id(Point)] = (Point, [entry], ())
+            return context.value(Point((7, 8)))
+
+        return [
+            planted,
+            lambda: context.value(Point((5, 6))),
+            lambda: unpacked(["x", _LoggedMember("x", 1), "extra"]),
+            lambda: unpacked(("x",)),
+            lambda: unpacked(5),
+        ]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(max_depth=2), calls)
+    assert "entry held" in native.hooks and "__hash__ a" in native.hooks
+    assert [result[1] for result in native.results[2:]] == ["ValueError"] * 2 + [
+        "TypeError"
+    ]
+
+
+class _LoggedName(str):
+    """A ``__qualname__`` whose slicing, length, encoding and formatting
+    run Python code."""
+
+    def __getitem__(self, index):
+        _called("name __getitem__")
+        return _LoggedName(str.__getitem__(self, index))
+
+    def __len__(self):
+        _called("name __len__")
+        return str.__len__(self)
+
+    def encode(self, *args):
+        _called("name encode")
+        return str.encode(self, *args)
+
+    def __str__(self):
+        _called("name __str__")
+        return str.__str__(self)
+
+
+@pytest.mark.parametrize("length", [5, 5000])
+def test_a_type_name_that_is_a_str_subclass(length):
+    """A class in ``builtins`` whose ``__qualname__`` is a str subclass
+    names its instances with that object: bounding it as code text slices,
+    measures and encodes it through its own code, and formatting the copy's
+    representation runs its ``__str__`` when it fits, in both walks."""
+
+    def build():
+        Named = type("Named", (), {"__module__": "builtins"})
+        Named.__qualname__ = _LoggedName("N" * length)
+        return ([Named(), Named()],)
+
+    def calls(context, values):
+        return [lambda: context.value(values)]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(), calls)
+    assert "name encode" in native.hooks
+    assert ("name __str__" in native.hooks) is (length == 5)
 
 
 @pytest.mark.parametrize("then", ["call", "copy"])
@@ -3945,35 +4724,6 @@ def test_capturing_on_a_context_and_its_copy():
     assert native.results[-1][:3] == (True, True, True)
 
 
-@pytest.mark.parametrize("kind", ["profile", "trace", "monitoring"])
-def test_tracing_hooks_see_container_hashes_only_in_python(kind):
-    """Hashing a copy of a named tuple runs ``FakeContainer.__hash__``, which
-    is Python code: under a profiler, tracer or monitoring tool, a call
-    that would hash one goes to the Python walk before the hash runs."""
-    point = _Record(1, 2)
-    values = [{point}, {point: "v"}, frozenset({point, 3})]
-    with _mode(False):
-        pure = SnapshotContext(DumpOptions())
-        pure.value(point)
-        expected = pickle.dumps([pure.value(value) for value in values], protocol=5)
-    with _mode(True):
-        context = SnapshotContext(DumpOptions())
-    context.value(point)
-    # Under a test runner's tracer the first call may have handed back too.
-    before = context._walker.handbacks
-    seen, callers = [], []
-    with _recording(kind, seen, callers):
-        captured = [context.value(value) for value in values]
-    hashed_from = {
-        caller
-        for code, caller in zip(seen, callers)
-        if code is FakeContainer.__hash__.__code__
-    }
-    assert pickle.dumps(captured, protocol=5) == expected
-    assert context._walker.handbacks - before == len(values)
-    assert hashed_from == {values_module.__file__}
-
-
 @pytest.mark.filterwarnings("ignore:non-string key:RuntimeWarning")
 def test_context_class_dict_key_that_is_not_str():
     """A context class whose dict holds a key other than an exact str captures
@@ -3998,7 +4748,7 @@ def test_context_class_dict_key_that_is_not_str():
             [context.value(["abcdefgh", (1, 2.5)]), context.value("x" * 20)],
             protocol=5,
         )
-        assert object.__getattribute__(context, "__dict__").get("_walker") is None
+        assert Context._native_walk is False
     assert results[True] == results[False]
     assert __file__ not in compared
 
@@ -4006,22 +4756,23 @@ def test_context_class_dict_key_that_is_not_str():
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="setitimer is unavailable")
 def test_signal_handler_capturing_inside_a_native_walk():
     """A signal handler runs inside a native call at the walker's signal
-    checks. One that captures on the context being walked is refused with
-    RuntimeError; the outer call stays native and its result unchanged."""
+    checks. One that captures on the context being walked captures as it
+    does outside the call, as the interpreter may run it right after the
+    call returns, reading and counting on from the walk's node count; the
+    outer call stays native and its result unchanged."""
     graph = [[i, str(i)] for i in range(100000)]
+    nodes = 1 + 3 * len(graph)  # The list, and each pair, its int and its str.
     options = DumpOptions(max_nodes=None, max_items=None)
     with _mode(False):
         expected = pickle.dumps(SnapshotContext(options).value(graph), protocol=5)
     with _mode(True):
         context = SnapshotContext(options)
+    before = _fallbacks()
     outcomes = []
 
     def handler(number, frame):
-        inside = _inside_the_walk(context)
-        try:
-            outcomes.append((inside, context.value([1])))
-        except RuntimeError as error:
-            outcomes.append((inside, error))
+        inside = _inside_the_walk(context, nodes)
+        outcomes.append((inside, context.value([1])))
 
     previous = signal.signal(signal.SIGALRM, handler)
     signal.setitimer(signal.ITIMER_REAL, 0.0005, 0.0005)
@@ -4030,18 +4781,17 @@ def test_signal_handler_capturing_inside_a_native_walk():
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+    assert _fallbacks() == before
     inside = [outcome for within, outcome in outcomes if within]
     assert inside, "no signal arrived during the native walk"
-    assert all(
-        isinstance(error, RuntimeError) and "already capturing" in str(error)
-        for error in inside
-    )
-    assert context._walker is not None
-    assert context._walker.handbacks == 0 or _traced()
+    assert all(copy == [1] for _, copy in outcomes)
+    # Each handler's list is a node of its own; its int is the graph's.
+    assert context._nodes == nodes + len(outcomes)
+    assert context._native_walk
     assert pickle.dumps(captured, protocol=5) == expected
 
 
-# --- Copies and hooks the interpreter alone shows ---------------------------
+# --- Copies and their placeholders ------------------------------------------
 
 
 def test_copy_replacing_a_placeholder_the_original_omitted():
@@ -4067,9 +4817,9 @@ def test_copy_replacing_a_placeholder_the_original_omitted():
 
 def test_instance_dict_descriptor_of_another_class():
     """A context class whose ``__dict__`` entry is another class's
-    descriptor captures as the Python walk does: in Python where that
-    descriptor refuses the context, natively where it accepts it, as from
-    3.15."""
+    descriptor, as a plain mixin gives it before 3.15, captures natively,
+    as the Python walk does: both read the state with attribute access,
+    which never looks ``__dict__`` up."""
 
     class Other:
         pass
@@ -4078,138 +4828,17 @@ def test_instance_dict_descriptor_of_another_class():
     results = {}
     for native in (False, True):
         Context = type("Context", (SnapshotContext,), {"__dict__": descriptor})
+        assert Context._native_walk is True
         with _mode(native):
             context = Context(DumpOptions(max_string_bytes=4))
+        _check_walker(context, native)
+        before = _fallbacks()
         captured = [context.value(["abcdefgh", (1, 2.5)]), context.value("x" * 20)]
         state = (captured, list(context._truncation.items()), context._nodes)
         results[native] = pickle.dumps(state, protocol=5)
-        try:
-            descriptor.__get__(context, Context)
-        except TypeError:
-            assert object.__getattribute__(context, "_walker") is None
+        if native:
+            assert _fallbacks() == before
     assert results[True] == results[False]
-
-
-@contextlib.contextmanager
-def _profiled_from_c(calls):
-    """Set a profile function from C without an object, as yappi sets one,
-    which ``sys.getprofile`` and ``sys.monitoring.get_tool`` cannot see,
-    recording each Python call with its caller's file."""
-    import ctypes
-
-    profile = ctypes.CFUNCTYPE(
-        ctypes.c_int, ctypes.c_void_p, ctypes.py_object, ctypes.c_int, ctypes.c_void_p
-    )
-
-    def record(obj, frame, what, arg):
-        if what == 0:  # PyTrace_CALL
-            caller = frame.f_back
-            calls.append((frame.f_code, caller.f_code.co_filename if caller else None))
-        return 0
-
-    callback = profile(record)
-    set_profile = ctypes.pythonapi.PyEval_SetProfile
-    set_profile.argtypes = [profile, ctypes.c_void_p]
-    set_profile.restype = None
-    previous = sys.getprofile()
-    set_profile(callback, None)
-    try:
-        assert sys.getprofile() is None
-        yield
-    finally:
-        set_profile(profile(0), None)
-        sys.setprofile(previous)
-
-
-@contextlib.contextmanager
-def _freed_tool(calls):
-    """A monitoring tool that freed its id with its events still set, which
-    3.12 and 3.13 keep running; ``sys.monitoring.get_tool`` no longer sees
-    it."""
-    monitoring = sys.monitoring
-    tool_id = next(
-        (tool for tool in reversed(range(6)) if monitoring.get_tool(tool) is None), None
-    )
-    if tool_id is None:
-        pytest.skip("all monitoring tool ids are in use")
-
-    def record(code, offset):
-        caller = sys._getframe(1).f_back
-        calls.append((code, caller.f_code.co_filename if caller else None))
-
-    monitoring.use_tool_id(tool_id, "pydumpling-freed-tool-test")
-    monitoring.register_callback(tool_id, monitoring.events.PY_START, record)
-    monitoring.set_events(tool_id, monitoring.events.PY_START)
-    monitoring.free_tool_id(tool_id)
-    try:
-        assert monitoring.get_tool(tool_id) is None
-        yield
-    finally:
-        monitoring.use_tool_id(tool_id, "pydumpling-freed-tool-test")
-        monitoring.set_events(tool_id, 0)
-        monitoring.register_callback(tool_id, monitoring.events.PY_START, None)
-        monitoring.free_tool_id(tool_id)
-
-
-@pytest.mark.parametrize("hook", [_profiled_from_c, _freed_tool], ids=["C", "freed"])
-def test_hooks_only_the_interpreter_shows_see_helpers_only_in_python(hook):
-    """A hook ``sys.getprofile`` and ``sys.monitoring.get_tool`` miss still
-    sends a call that runs pydumpling's helpers to the Python walk first:
-    the hook sees them called from the Python walk only."""
-    data = ["x" * 50, {"k": "y" * 50}]
-    options = DumpOptions(max_string_bytes=8)
-    with _mode(False):
-        expected = pickle.dumps(SnapshotContext(options).value(data), protocol=5)
-    with _mode(True):
-        context = SnapshotContext(options)
-    calls = []
-    with hook(calls):
-        captured = context.value(data)
-    assert pickle.dumps(captured, protocol=5) == expected
-    text = {caller for code, caller in calls if code.co_name == "_text"}
-    assert text <= {values_module.__file__}
-    if hook is _profiled_from_c or sys.version_info < (3, 14):
-        # From 3.14 a freed tool id runs no events.
-        assert text, "the hook never ran"
-        assert context._walker.handbacks == 1
-
-
-def test_profiler_set_while_a_native_walk_runs():
-    """A profiler that a collection sets while a native walk runs sees
-    pydumpling's helpers called from the Python walk only: the walker asks
-    for hooks again before each helper, and hands the call back."""
-    data = ["x" * 50, *([index] for index in range(200)), "y" * 50, "z" * 50]
-    options = DumpOptions(max_string_bytes=8, max_items=None, max_nodes=None)
-    with _mode(False):
-        expected = pickle.dumps(SnapshotContext(options).value(data), protocol=5)
-    with _mode(True):
-        context = SnapshotContext(options)
-    calls, inside = [], []
-
-    def profile(frame, event, arg):
-        if event == "call":
-            calls.append((frame.f_code.co_name, frame.f_back.f_code.co_filename))
-
-    def collected(phase, info):
-        # A collection runs at the next Python code, here inside one of the
-        # helpers: after the walker asked for hooks before calling it.
-        if phase == "start" and _inside_the_walk(context):
-            inside.append(phase)
-            sys.setprofile(profile)
-
-    previous = sys.getprofile()
-    try:
-        with _collecting(collected):
-            captured = context.value(data)
-    finally:
-        sys.setprofile(previous)
-    assert pickle.dumps(captured, protocol=5) == expected
-    text = {caller for name, caller in calls if name == "_text"}
-    assert text <= {values_module.__file__}
-    if not _traced():
-        assert inside, "no collection ran inside the native walk"
-        assert text, "the profiler never saw a helper"
-        assert context._walker.handbacks == 1
 
 
 # --- Python code that writes, removes or keys memo entries between calls ----
@@ -4321,7 +4950,7 @@ def test_a_placeholder_without_a_reason_raises_only_where_the_walk_reads_it(wher
             first, mapping, extra = [0], {"k": 1}, [0]
             context.value(first)
             context.value([mapping])  # the mapping is too deep: a placeholder
-            context.value(value=-1)  # a call handed back
+            context.value(_odd_types()[0]())  # a str-subclass ``__qualname__``
             if copied:
                 copy.copy(context)  # a copy shares the dicts
             if where.endswith("replaced dict"):
@@ -4334,12 +4963,12 @@ def test_a_placeholder_without_a_reason_raises_only_where_the_walk_reads_it(wher
                 del context.objects[id(first)]
             raised[native, copied] = []
             steps = (False, False, True, False, True, None, False, True)
-            for step, handed_back in enumerate(steps):
+            for step, odd in enumerate(steps):
                 try:
-                    if handed_back is None:
+                    if odd is None:
                         context._mapping(target)
-                    elif handed_back:
-                        context.value(value=step)
+                    elif odd:
+                        context.value([step, _odd_types()[0]()])
                     else:
                         context.value([step])
                 except AttributeError:
@@ -4404,13 +5033,14 @@ def test_a_fake_class_given_another_base_is_built_as_its_init_builds_it():
     _same_in_both_modes(build, DumpOptions(), calls)
 
 
-def test_a_fake_class_given_another_base_hands_back_before_running_anything():
+def test_a_fake_class_given_another_base_runs_objects_in_python():
     """``FakeClass`` given a base whose ``__getattribute__`` and ``__del__``
-    are application code: the walker hands the call back before it makes a
-    copy it would drop, whose ``__del__`` would run, as the import-time
-    instance-dict descriptor refuses it before 3.15, or reads a
-    ``FakeClass``'s representation through the base's ``__getattribute__``,
-    which the Python walk then runs again."""
+    are application code: the walker runs every object in the Python walk,
+    before it makes a copy it would drop, whose ``__del__`` would run, as
+    the import-time instance-dict descriptor refuses it before 3.15, or
+    reads a ``FakeClass``'s representation through the base's
+    ``__getattribute__``, which the Python walk runs a different number of
+    times."""
     originals = []
 
     class Other:
@@ -4439,13 +5069,12 @@ def test_a_fake_class_given_another_base_hands_back_before_running_anything():
     _same_in_both_modes(build, DumpOptions(), calls)
 
 
-def test_a_fake_class_hook_runs_once_when_a_later_value_hands_the_call_back(
-    monkeypatch,
-):
+def test_a_fake_class_hook_runs_once_where_its_repr_reads_the_dict(monkeypatch):
     """A ``__getattribute__`` application code gave ``FakeClass`` runs where
-    ``FakeClass.__repr__`` reads a copied ``FakeClass``'s ``__dict__``: the
-    walker hands such a call back before it runs, so a value it hands the
-    call back on later does not make it run twice."""
+    ``FakeClass.__repr__`` reads a copied ``FakeClass``'s ``__dict__``,
+    once: the walker reads it through the same attribute lookup, as
+    application code, and natively names the copy of a str-subclass
+    ``__qualname__`` after it."""
     originals = []
 
     def hooked(self, name):
@@ -4453,7 +5082,7 @@ def test_a_fake_class_hook_runs_once_when_a_later_value_hands_the_call_back(
             _called(f"FakeClass.__getattribute__ {name}")
         return object.__getattribute__(self, name)
 
-    odd_name = _odd_types()[0]  # a str subclass ``__qualname__``: handed back
+    odd_name = _odd_types()[0]  # a str subclass ``__qualname__``
 
     def build():
         originals[:] = [FakeClass("<copied snapshot>", {"odd": odd_name()})]
@@ -4473,7 +5102,8 @@ def test_a_fake_class_hook_runs_once_when_a_later_value_hands_the_call_back(
 def test_a_patched_fake_class_repr_names_the_copy(monkeypatch):
     """The Python walk calls ``FakeClass.__repr__`` as the class has it
     then: one application code patched in names the copy of a copied
-    ``FakeClass``, and runs once, as the walker hands such a call back."""
+    ``FakeClass``, and runs once, as the walker runs an exact ``FakeClass``
+    in the Python walk in place once its ``__repr__`` is replaced."""
 
     def patched(self):
         _called("FakeClass.__repr__")
@@ -4494,37 +5124,52 @@ def test_a_patched_fake_class_repr_names_the_copy(monkeypatch):
     assert vars(native.results[0])["_FakeClass__repr"] == "<patched>"
 
 
-@pytest.mark.parametrize("hook", ["__getattribute__", "a property"])
-def test_hooks_patched_onto_dump_options_run_as_in_the_python_walk(monkeypatch, hook):
-    """The walker reads every budget each call, the Python walk only those a
-    call uses: while ``DumpOptions`` holds a ``__getattribute__``, or under
-    a budget's name anything but ``None`` or an int, such as a property,
-    the walker leaves the context to the Python walk, so the hook runs as
-    often, and a property's answer is the budget."""
+@pytest.mark.parametrize("change", ["another base", "another __repr__"])
+def test_an_object_the_walker_runs_in_python_in_place(monkeypatch, change):
+    """While ``FakeClass`` has another base, the walker runs every object in
+    the Python walk; while ``FakeClass.__repr__`` is replaced, every exact
+    ``FakeClass``. Inside a call that has started, such an object runs
+    there in place, with nothing undone: the snapshot and the hooks are the
+    Python walk's, and only that one node goes to the Python walk."""
 
-    def items(options):
-        _called("DumpOptions.max_items")
-        return 1
+    class Other:
+        def __getattribute__(self, name):
+            _called(f"Other.__getattribute__ {name}")
+            return object.__getattribute__(self, name)
 
-    def get(options, name):
-        _called(f"DumpOptions.__getattribute__ {name}")
-        return object.__getattribute__(options, name)
+    def replaced(self):
+        _called("FakeClass.__repr__")
+        return "<replaced>"
+
+    sent = []
 
     def build():
-        return ([[1, 2, 3]],)
+        held = _Plain() if change == "another base" else FakeClass("<copy>", {})
+        held.field = [1]
+        return ([1, held, "after"],)
 
     def calls(context, value):
-        def hooked():
-            with monkeypatch.context() as patch:
-                if hook == "a property":
-                    patch.setattr(DumpOptions, "max_items", property(items))
-                else:
-                    patch.setattr(DumpOptions, "__getattribute__", get)
-                return context.value(value)
+        def changed():
+            # ``monkeypatch`` cannot restore ``__bases__``, which is no entry
+            # of the class dict.
+            if change == "another base":
+                FakeClass.__bases__ = (Other,)
+            else:
+                monkeypatch.setattr(FakeClass, "__repr__", replaced)
+            try:
+                before = _fallbacks()
+                captured = context.value(value)
+                sent.append(_fallbacks() - before)
+                return captured
+            finally:
+                FakeClass.__bases__ = (FakeType,)
+                monkeypatch.undo()
 
-        return [lambda: context.value(None), hooked, lambda: context.value(value)]
+        return [changed]
 
-    _same_in_both_modes(build, DumpOptions(), calls)
+    native, _ = _same_in_both_modes(build, DumpOptions(), calls)
+    assert native.hooks
+    assert sent == [0, 1, 0]  # The Python walk, the walker, the Python walk.
 
 
 _BYTES_WARNING_SCRIPT = """
@@ -4534,23 +5179,24 @@ from pydumpling.snapshot import SnapshotContext
 
 mixed = {"a": 1, b"a": 2}  # under -b, built with a warning
 counts = []
-for native in ("0", "1"):
-    os.environ["PYDUMPLING_NATIVE"] = native
+for native in (False, True):
     context = SnapshotContext(DumpOptions())
+    if not native:
+        context._native_walk = False
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", BytesWarning)
         context.value(mixed)  # the copy compares b"a" with "a" again
     counts.append(len(caught))
-print(vars(context).get("_walker") is not None, counts[0] == counts[1], counts[1] > 0)
+print(context._native_walk, counts[0] == counts[1], counts[1] > 0)
 """
 
 
 @pytest.mark.parametrize("flags", [[], ["-b"]], ids=["plain", "-b"])
 def test_under_python_b_a_context_captures_in_python(flags):
-    """Under ``python -b`` comparing bytes with str warns: the walker's own
-    lookups and inserts, which a call it hands back makes the Python walk
-    repeat, would warn where the Python walk does not, or twice, so a
-    context captures in Python there, and warns as the Python walk does."""
+    """Under ``python -b`` comparing bytes with str warns, and a warning the
+    walker's own lookups and inserts raised would be attributed to the line
+    that called it, so a context captures in Python there, and warns as the
+    Python walk does."""
     process = subprocess.run(
         [sys.executable, *flags, "-c", _BYTES_WARNING_SCRIPT],
         capture_output=True,
@@ -4655,7 +5301,7 @@ def test_a_sources_key_of_another_kind(native, how):
     if how == "added after a copy":
         copy.copy(context)
     else:
-        context.value(value="hand-back")
+        context.value(_odd_types()[0]())  # a str-subclass ``__qualname__``
     key = _CollidingKey(planted if how == "added with a copy" else removed, log)
     if how == "replaced sources":
         context._sources = {key: "tag"}
@@ -4697,13 +5343,12 @@ def test_a_copy_finds_a_sources_key_of_another_kind(native, change):
 
 @pytest.mark.parametrize("native", [False, True], ids=["pure", "native"])
 def test_a_walker_keeps_nothing_of_its_context_alive_between_calls(native):
-    """A walker holds none of the originals, dicts or keys of ``objects``
-    and ``_sources`` between calls, though Python code holds it: once
-    Python code replaces ``_sources``, its originals and keys go, as in the
-    Python walk."""
+    """The walker holds none of the originals, dicts or keys of ``objects``
+    and ``_sources`` between calls: once Python code replaces ``_sources``,
+    its originals and keys go, as in the Python walk."""
     with _mode(native):
         context = SnapshotContext(DumpOptions())
-    held = context._walker
+    _check_walker(context, native)
     original, key = _Plain(), _Plain()
     released = weakref.ref(original), weakref.ref(key)
     context.value(original)
@@ -4713,14 +5358,12 @@ def test_a_walker_keeps_nothing_of_its_context_alive_between_calls(native):
     del original, key
     gc.collect()
     assert [ref() for ref in released] == [None, None]
-    assert (held is not None) is native
 
 
-def test_copy_made_while_a_call_runs_in_python():
-    """A copy of the context that application code makes while the Python
-    walk takes a call from the walker shares the memo from then on, so it
-    sees the copies the original makes later, as when both capture in
-    Python."""
+def test_copy_made_by_application_code_mid_call():
+    """A copy of the context that application code the walker runs makes
+    mid-call shares the memo from then on, so it sees the copies the
+    original makes later, as when both capture in Python."""
     made = []
 
     class CopyingName(str):
@@ -4753,22 +5396,35 @@ def test_copy_made_while_a_call_runs_in_python():
     assert native.results[-1][2] is True
 
 
-def test_placeholder_of_an_interrupted_tuple_under_a_profiler(monkeypatch):
+class _FailingName(str):
+    """A ``__qualname__`` whose ``+``, application code ``_type_name`` runs,
+    raises while ``armed``."""
+
+    armed = False
+
+    def __radd__(self, other):
+        if _FailingName.armed:
+            raise _Error("interrupted")
+        return str.__add__(other, str(self))
+
+
+def test_placeholder_of_an_interrupted_tuple_under_a_profiler():
     """A tuple whose capture an error interrupted keeps its placeholder,
     which a later call returns, natively under a profiler too: naming a
     tuple needs no Python code at any code text limit the walker takes."""
 
     def build():
-        return (("x" * 50, [1]),)
+        Failing = type("Failing", (), {})
+        Failing.__qualname__ = _FailingName("Failing")
+        return (("x" * 50, [1], Failing()),)
 
     def calls(context, graph):
         def interrupted():
-            def fail(text, limit):
-                raise _Error("interrupted")
-
-            with monkeypatch.context() as patch:
-                patch.setattr(context_module, "_utf8_prefix", fail)
+            _FailingName.armed = True
+            try:
                 return context.value(graph)
+            finally:
+                _FailingName.armed = False
 
         def profiled():
             previous = sys.getprofile()
@@ -4788,27 +5444,167 @@ def test_placeholder_of_an_interrupted_tuple_under_a_profiler(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "text, stays",
-    [("abcdefgh", True), ("abcdefg\u00e9", False), ("abcdefghi", False)],
-    ids=["ascii", "wide", "long"],
+    "text", ["abcdefgh", "abcdefg\u00e9", "abcdefghi"], ids=["ascii", "wide", "long"]
 )
-def test_strings_that_fit_need_no_helper(text, stays):
-    """A str no longer than the limit, ASCII and so a byte per character,
-    is kept natively, under a profiler too; any other goes to the Python
-    helper, which the profiler sees from the Python walk."""
+def test_strings_need_no_helper(text):
+    """A str is bounded natively, whether it fits or not: a profiler sees
+    no helper of pydumpling's run, and the copy is the Python walk's."""
     options = DumpOptions(max_string_bytes=8)
     with _mode(False):
         expected = pickle.dumps(SnapshotContext(options).value([text]), protocol=5)
     with _mode(True):
         context = SnapshotContext(options)
-    previous = sys.getprofile()
-    sys.setprofile(lambda frame, event, arg: None)
-    try:
+    before = _fallbacks()
+    with _hooked("profile") as seen:
         captured = context.value([text])
-    finally:
-        sys.setprofile(previous)
     assert pickle.dumps(captured, protocol=5) == expected
-    assert context._walker.handbacks == (0 if stays else 1)
+    assert _fallbacks() == before
+    assert SnapshotContext._bounded_text.__code__ not in seen
+    assert SnapshotContext._text.__code__ not in seen
+
+
+# Around a budget of 8 bytes: under, at and over it, and cut inside a two-,
+# three- and four-byte character and a lone surrogate's three bytes.
+_BOUNDED_TEXTS = (
+    "abcdefg",
+    "abcdefgh",
+    "abcdefghi",
+    "abcdefg\u00e9",
+    "abcdef\u9903",
+    "abcdefg\U0001f600",
+    "abcdefg\ud800",
+    "\ud800\udc00\ud800",
+    "\u00e9" * 4,
+    "",
+)
+_BOUNDED_DATA = (b"", b"abcdefg", b"abcdefgh", b"abcdefghi")
+
+
+def test_bounded_text_bytes_and_layouts_match_python():
+    """Strings and bytes around the byte budget, names around the code text
+    limit (attribute names and a type name, cut inside a character), and
+    the layouts written for slotted and named tuple classes: the copies,
+    tallies, memo and ``_layouts`` are the Python walk's, byte for byte."""
+    Point = namedtuple("Point", "x y")
+
+    class Slotted(list):
+        __slots__ = ("a", "b")
+
+    class Count(int):
+        pass
+
+    def build():
+        held = _Plain()
+        for name in ("short", "a_name_past_twelve_bytes", "na\u00efve_\u540d\u524d"):
+            setattr(held, name, 1)
+        vars(held)["abcdefghijk\ud800"] = 2
+        Named = type("Named", (), {"__module__": "builtins"})
+        Named.__qualname__ = "abcdefghijk\u00e9"
+        slotted = Slotted([1])
+        slotted.a = "set"
+        data = [*_BOUNDED_DATA, *map(bytearray, _BOUNDED_DATA)]
+        return (
+            list(_BOUNDED_TEXTS),
+            data,
+            [held, Named()],
+            [Point(1, 2), slotted, Count(3)],
+        )
+
+    def calls(context, texts, data, objects, subclasses):
+        def limited():
+            context._code_text_limit = 12
+
+        def layouts():
+            return [
+                (cls.__qualname__, [name for name, _ in members], fields)
+                for cls, members, fields in context._layouts.values()
+            ]
+
+        return [
+            limited,
+            lambda: context.value(texts),
+            lambda: context.value(data),
+            lambda: context.value(objects),
+            lambda: context.value(subclasses),
+            layouts,
+        ]
+
+    native, _ = _same_in_both_modes(build, DumpOptions(max_string_bytes=8), calls)
+    assert dict(native.truncation)["max_string_bytes"] == 8  # six texts, two bytes
+    assert [name for name, _, _ in native.results[-1]] == [
+        "Point",
+        "test_bounded_text_bytes_and_layouts_match_python.<locals>.Slotted",
+        "test_bounded_text_bytes_and_layouts_match_python.<locals>.Count",
+    ]
+
+
+# Each budget at 1, its least valid value, alone and all at once. A forged 0
+# is among ``_STATE_CHANGES``.
+_BUDGETS = ("max_items", "max_nodes", "max_string_bytes", "max_depth")
+_AT_ONE = {name: {name: 1} for name in _BUDGETS} | {"all": dict.fromkeys(_BUDGETS, 1)}
+
+_AT_ONE_SOURCE = """
+def holder(values, text):
+    local = [text, values]
+    yield sys._getframe()
+"""
+
+
+@pytest.mark.parametrize("budgets", list(_AT_ONE))
+def test_each_budget_at_one(budgets):
+    """With a budget at 1, alone or all at once, each kind of value, a root
+    namespace with priority names, a nested mapping, an attribute mapping
+    with a private name and a frame, each captured on a context of its own,
+    give the Python walk's copies, tallies, node counts and memo, byte for
+    byte."""
+    options = DumpOptions(**_AT_ONE[budgets])
+
+    def build():
+        held = _Plain()
+        held.name, held.items = "é", [1, 2]
+        slotted = _Slotted()
+        slotted.first = b"ab"
+        label = _SlotText("ab")
+        label.child = "c"
+        values = [
+            *("", "a", "é", "ab", b"", b"a", b"ab", bytearray(b"ab")),
+            *(0, 255, 256, -129, 2**70, True, None, 1.5),
+            *(_Count(300), _Ratio(2.5), label, _Record(1, 2), held, slotted),
+            *([], [1], [1, [2, [3]]], (), (1, 2), frozenset({1}), {1, 2}),
+            *({}, {"a": 1}, {"a": {"b": 1}, "c": 2}, OrderedDict(a=1, b=2)),
+            Counter("ab"),
+        ]
+        namespace = {"self": held, "a": values[1:4], "b": "text", "c": 2**9}
+        scope = {"sys": sys, "__name__": "at_one"}
+        exec(_AT_ONE_SOURCE, scope)
+        generator = scope["holder"](values[:4], "été")
+        return values, namespace, generator, next(generator)
+
+    def calls(context, values, namespace, generator, frame):
+        def alone(capture):
+            def call():
+                fresh = SnapshotContext(options)
+                captured = capture(fresh)
+                truncation = list(fresh._truncation.items())
+                return captured, truncation, fresh._nodes, _memo(fresh)
+
+            return call
+
+        return [
+            lambda: context.value(values),
+            *(alone(lambda fresh, value=value: fresh.value(value)) for value in values),
+            alone(lambda fresh: fresh._mapping(namespace, priority=("b", "self"))),
+            alone(lambda fresh: fresh._mapping(namespace, 1)),
+            alone(lambda fresh: fresh._attribute_mapping(namespace, 1, private="b")),
+            alone(lambda fresh: fresh.from_frame(frame)),
+        ]
+
+    native, _ = _same_in_both_modes(build, options, calls)
+    # Each budget at 1 cuts something.
+    reasons = {reason for reason, _ in native.truncation}
+    for _, tallies, _, _ in native.results[1:]:
+        reasons.update(reason for reason, _ in tallies)
+    assert set(_AT_ONE[budgets]) <= reasons
 
 
 class _Tally:
@@ -5020,7 +5816,7 @@ def test_context_class_with_a_copy_hook_of_its_own(cls, how):
     instance or, for the class lookups of ``copy.copy`` and
     ``copy.replace``, the metaclass, copies as in the Python walk: whatever
     state the hook builds, ``objects`` holds every copy made so far, and a
-    copy given the walker itself shares it."""
+    copy captures with its original's walk."""
     _same_through_a_copy_hook(
         cls,
         {
@@ -5063,7 +5859,7 @@ def test_a_dataclass_context(native):
     with _mode(native):
         context = Context(DumpOptions())
     assert context.value(["first"]) == ["first"]
-    assert (vars(context).get("_walker") is not None) is native
+    _check_walker(context, native)
 
 
 def _same_through_a_copy_hook(cls, copied):
@@ -5105,7 +5901,7 @@ def test_a_metaclass_dict_key_of_another_kind():
     with _mode(True):
         context = Context(DumpOptions())
     assert context.value(["first"]) == ["first"]
-    assert context._walker is not None
+    assert context._native_walk
     assert log == []
 
 
@@ -5191,11 +5987,12 @@ class _AddingName(str):
         return str.__add__(other, str(self))
 
 
-def test_replacement_a_hand_back_undid_is_forgotten():
-    """A call that replaces a written depth placeholder, then goes to the
-    Python walk, leaves no replacement for the walker to write later; the
-    Python walk makes its own, after the copies made before it, and its
-    original, which Python code then removes, stays removed."""
+def test_a_replaced_placeholder_s_original_removed_by_python_code():
+    """A call that replaces a written depth placeholder, here an instance's
+    attributes captured too deep before, and runs application code on the
+    way (a class name's ``__radd__``), makes its replacement where the
+    Python walk does, after the copies made before it, and its original,
+    which Python code then removes, stays removed."""
 
     def build():
         Odd = type("Odd", (), {})
@@ -5238,10 +6035,10 @@ class _CountedTally(int):
 
 
 @pytest.mark.parametrize("helper", ["text", "bytes", "code"])
-def test_tally_a_helper_adds_to_once(helper):
-    """A tally that one of pydumpling's Python helpers adds to with its own
-    ``__add__`` runs it once, in the Python walk, when the call goes there
-    after the helper would have run: the walker hands it back first."""
+def test_a_tally_a_bound_adds_to_runs_once(helper):
+    """A tally that the bound of a string, bytes or a class name adds to,
+    with an ``__add__`` of its own, runs it once, natively as in the Python
+    walk, and so does a later ``max_items`` tally's."""
     reason = "code_metadata" if helper == "code" else "max_string_bytes"
 
     def build():
@@ -5265,13 +6062,10 @@ def test_tally_a_helper_adds_to_once(helper):
     assert native.hooks == ["counted __add__", "tally __add__"]
 
 
-def test_a_hand_back_starts_from_the_dicts_as_the_call_found_them():
-    """A call the walker hands back partway first takes out of ``objects``
-    and ``_sources`` what it wrote there. Application code the Python walk
-    then runs, here a tally's ``__add__``, finds the copies of earlier
-    calls and, of this one, those the Python walk has made by then: had the
-    walker's stayed, the Python walk would return the unfinished copy it
-    found and never count."""
+def test_application_code_mid_call_finds_the_copies_made_so_far():
+    """Application code the walker runs, here a tally's ``__add__``, finds
+    in ``objects`` and ``_sources`` the copies of earlier calls and, of
+    this one, those made by then, as in the Python walk."""
 
     def build():
         return (["earlier"], [["first"], ["second"], ["third"]])
@@ -5300,11 +6094,10 @@ def test_a_hand_back_starts_from_the_dicts_as_the_call_found_them():
 
 
 @pytest.mark.parametrize("native", [False, True], ids=["pure", "native"])
-def test_a_context_a_class_its_walker_met_refers_to_is_collected(native):
-    """Between calls the walker keeps what it learned about the classes its
-    last call met, and shows the cyclic collector what that holds: a context
-    such a class refers back to is freed by one collection, as in the
-    Python walk."""
+def test_a_context_a_class_it_captured_refers_to_is_collected(native):
+    """The walker keeps nothing of a context, or of the classes of the
+    values a call met, once the call ends, so a context that such a class
+    refers back to is freed by one collection, as in the Python walk."""
     with _mode(native):
         context = SnapshotContext(DumpOptions())
     _check_walker(context, native)
@@ -5350,11 +6143,10 @@ def test_capturing_the_context_s_own_dicts():
         assert native.results[2][0] > 2 * 16  # each key counted in both dicts
 
 
-def test_a_hand_back_keeps_the_namespaces_of_earlier_calls():
-    """A call the walker hands back takes out of ``_namespaces`` the ids it
-    added itself, which the Python walk then adds again, and only those:
-    the attribute dicts of objects earlier calls captured stay in it, as in
-    the Python walk."""
+def test_namespaces_after_application_code_mid_call():
+    """A call that runs application code, a tally's ``__add__``, holds in
+    ``_namespaces`` the attribute dicts of the objects captured by earlier
+    calls and by this one, as in the Python walk."""
 
     def build():
         made = [_Plain() for _ in range(4)]
@@ -5367,7 +6159,7 @@ def test_a_hand_back_keeps_the_namespaces_of_earlier_calls():
             def __add__(self, other):
                 return int(self) + other
 
-        def handed_back():
+        def tallied():
             context._truncation["max_items"] = Tally(0)
             return context.value(later)
 
@@ -5378,7 +6170,7 @@ def test_a_hand_back_keeps_the_namespaces_of_earlier_calls():
                 len(context._namespaces),
             )
 
-        return [lambda: context.value(earlier), handed_back, namespaces]
+        return [lambda: context.value(earlier), tallied, namespaces]
 
     native, _ = _same_in_both_modes(build, DumpOptions(max_items=2), calls)
     assert native.results[2] == ([True, True, True, False], 3)

@@ -17,7 +17,7 @@ from ..options import DumpOptions
 from .exceptions import ExceptionsMixin
 from .frames import FramesMixin
 from .identity import _CLASS_MODULE, _CLASS_QUALNAME
-from .values import ValuesMixin, _walk_methods
+from .values import ValuesMixin, _choose_walk, _stock
 
 # Code metadata (file names, function and class names, variable and name
 # tables) is diagnostic structure, not application data. Truncating it yields
@@ -77,7 +77,10 @@ class SnapshotContext(ValuesMixin, FramesMixin, ExceptionsMixin):
             if options.is_unlimited
             else (_CODE_TEXT_LIMIT, _CODE_BYTES_LIMIT)
         )
-        self._start_walker()
+        if self._native_walk and self._native_walk_class is not type(self):
+            # A class created past ``ValuesMixin.__init_subclass__``, by a
+            # base whose own ``__init_subclass__`` does not call ``super()``.
+            _choose_walk(type(self))
 
     def metadata(self):
         return {
@@ -203,5 +206,6 @@ class SnapshotContext(ValuesMixin, FramesMixin, ExceptionsMixin):
             return False
 
 
-# The native walker stands in for exactly these methods; see _start_walker.
-SnapshotContext._stock_walk = _walk_methods(SnapshotContext)
+# The native walker stands in for this class's walk; each subclass is compared
+# with it when created (``ValuesMixin.__init_subclass__``).
+_stock(SnapshotContext)

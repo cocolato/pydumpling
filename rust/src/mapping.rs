@@ -2,39 +2,66 @@
 //!
 //! Values are read through the builtin base's `items`, so no subclass
 //! override or key hook runs; [`crate::keys`] selects which entries to copy.
-//! Any other mapping's own `items` is application code, so the Python walk
-//! reads it; only a frame's `f_locals` proxy is read here.
+//! Any other mapping's own `items` is application code, which the Python
+//! walk reads up to three times: such a mapping, which only a caller of
+//! `_mapping` passes, is the Python walk's from the entry. Only a
+//! `frozendict` (3.15) and a frame's `f_locals` proxy, whose `items()` runs
+//! no code, are read here too.
 
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{PyRecursionError, PyRuntimeError, PyTypeError};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySet};
 
 use crate::address::AddressMap;
 use crate::keys::{pair, Chosen};
+use crate::state::State;
 use crate::statics::{address, id, type_address};
-use crate::types::{plain_reason, reads_plainly, Base, Kind};
+use crate::types::{fresh_dict, Base, Kind};
 use crate::walk::is_exact_str;
-use crate::walker::{Halt, State, Walk};
+use crate::walker::{Halt, Walk};
 
 impl State {
-    /// `ValuesMixin._mapping`.
-    pub(crate) fn mapping<'py>(
+    /// `ValuesMixin._mapping` as its entry receives it: a source whose
+    /// items the walker does not read, decided from its type before
+    /// anything runs, is the Python walk's.
+    pub(crate) fn mapping_entry<'py>(
         &mut self,
         py: Python<'py>,
         source: &Bound<'py, PyAny>,
         depth: i64,
-        priority: Option<&Bound<'py, PyAny>>,
+        priority: &Bound<'py, PyAny>,
         counted: bool,
         container: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
-        self.enter(py)?;
-        let captured = self.mapping_body(py, source, depth, priority, counted, container);
-        self.leave();
-        captured
+        if self.reader(py, source)?.is_none() {
+            return Err(Halt::InPython);
+        }
+        self.mapping(py, source, depth, Some(priority), counted, container)
     }
 
-    fn mapping_body<'py>(
+    /// How `_mapping` reads the items of `source`, if the walker reads
+    /// them: through its builtin base's `items`, or a frame locals proxy's
+    /// own, which runs no code.
+    fn reader(&mut self, py: Python<'_>, source: &Bound<'_, PyAny>) -> Walk<Option<(Kind, bool)>> {
+        let s = self.s;
+        let source_type = type_address(source);
+        if source_type == s.dict {
+            // A frame namespace, mostly: no type facts to read.
+            return Ok(Some((Kind::Container(Base::Dict), false)));
+        }
+        let info = self.info(py, &source.get_type())?;
+        Ok(match info.kind {
+            Kind::Container(_) => Some((info.kind, info.ordered)),
+            _ if source_type == s.frame_locals && s.frame_locals != 0 => {
+                Some((Kind::Object, false))
+            }
+            _ => None,
+        })
+    }
+
+    /// `ValuesMixin._mapping`.
+    pub(crate) fn mapping<'py>(
         &mut self,
         py: Python<'py>,
         source: &Bound<'py, PyAny>,
@@ -46,46 +73,34 @@ impl State {
         let s = self.s;
         let id = &id(source);
         // Looked up twice, as the Python walk's `in` and subscript do.
-        let cached = match self.objects(py)?.contains(id)? {
-            true => self.objects(py)?.get_item(id)?,
-            false => None,
-        };
-        if let Some(cached) = cached {
+        if self.objects(py).contains(id)? {
+            let cached = self.objects(py).as_any().get_item(id)?;
             let cached_type = type_address(&cached);
             if cached_type == s.dict || cached_type == s.fake_dict_type {
                 return Ok(cached);
             }
-            // A mapping root may fit even when a deeper reference was omitted.
-            let mut reusable = false;
-            if cached_type == s.truncated_type {
-                // Reading an application's placeholder's `reason` may run
-                // its class's code, raise, or run the reason's own
-                // `__ne__`: only an exact str the read finds in the
-                // instance dict is read here.
-                let name = intern!(py, "reason");
-                if !reads_plainly(py, s, cached.get_type().as_any(), name)? {
-                    return Err(Halt::Bail);
-                }
-                let Some(reason) = plain_reason(py, s, &cached)? else {
-                    return Err(Halt::Bail);
-                };
-                reusable = reason.eq(intern!(py, "max_depth"))?;
-            } else if !s.plain_keys.contains(&cached_type)
-                && ![s.bytearray, s.list, s.tuple, s.set, s.frozenset].contains(&cached_type)
+            // A mapping root may fit even when a deeper reference was
+            // omitted: `not isinstance(cached, TruncatedValue) or
+            // cached.reason != "max_depth"`, which reads a builtin value's
+            // class running no code, and any other entry's `__class__`, a
+            // placeholder's `reason` and its `!=` with their own code.
+            let omitted = if s.plain_keys.contains(&cached_type)
+                || [s.bytearray, s.list, s.tuple, s.set, s.frozenset].contains(&cached_type)
             {
-                // The Python walk's `isinstance` reads any other entry's
-                // `__class__`, which its class may answer with its own
-                // code, and a placeholder's `reason`: it runs them once.
-                return Err(Halt::Bail);
-            }
-            if !reusable {
+                true
+            } else {
+                let truncated = s.truncated.bind(py);
+                self.application(py, || {
+                    Ok(!cached.is_instance(truncated)?
+                        || cached
+                            .getattr(intern!(py, "reason"))?
+                            .ne(intern!(py, "max_depth"))?)
+                })?
+            };
+            if omitted {
                 self.count(py, intern!(py, "unsupported_type"))?;
                 return Ok(PyDict::new(py).into_any());
             }
-            // The copy below goes in its place, where a hand-back puts the
-            // placeholder back.
-            self.replaced
-                .push((id.clone().into_any().unbind(), cached.unbind()));
         }
         if !counted {
             if !self.has_nodes() {
@@ -103,16 +118,24 @@ impl State {
         let captured = self.remember(py, id, source, empty)?;
         // Frame variable names are identifiers, not application string
         // values, so a string budget must not rewrite them.
-        let names = self.namespaces.bind(py).contains(id)?;
-        let preferred = PySet::empty(py)?;
-        if let Some(priority) = priority {
-            for name in priority.try_iter()? {
-                preferred.add(name?)?;
+        let names = self.named(py, id)?;
+        // `set(priority)`, of exact strs; an empty one selects nothing.
+        let preferred = match priority {
+            Some(priority) if priority.len()? > 0 => {
+                let preferred = PySet::empty(py)?;
+                for name in priority.try_iter()? {
+                    preferred.add(name?)?;
+                }
+                Some(preferred)
             }
-        }
-        match self.fill_mapping(py, source, depth, &captured, names, &preferred) {
+            _ => None,
+        };
+        match self.fill_mapping(py, source, depth, &captured, names, preferred.as_ref()) {
             Ok(()) => {}
-            Err(Halt::Py(err)) if err.is_instance_of::<PyRuntimeError>(py) => {
+            Err(Halt::Py(err))
+                if err.is_instance_of::<PyRuntimeError>(py)
+                    && !err.is_instance_of::<PyRecursionError>(py) =>
+            {
                 self.count(py, intern!(py, "concurrent_mutation"))?;
             }
             Err(halt) => return Err(halt),
@@ -128,11 +151,12 @@ impl State {
         depth: i64,
         captured: &Bound<'py, PyAny>,
         names: bool,
-        preferred: &Bound<'py, PySet>,
+        preferred: Option<&Bound<'py, PySet>>,
     ) -> Walk<()> {
         let s = self.s;
-        let info = self.info(py, &source.get_type())?;
-        let (kind, mut ordered) = (info.kind, info.ordered);
+        let Some((kind, mut ordered)) = self.reader(py, source)? else {
+            unreachable!("the entry and the walk's own calls pass only mappings it reads");
+        };
         let view = match kind {
             Kind::Container(Base::Dict) => s.dict_items.bind(py).call1((source,))?,
             Kind::Container(Base::FrozenDict) => match &s.frozendict_items {
@@ -143,10 +167,7 @@ impl State {
                 .base_cls(py, base)
                 .getattr(intern!(py, "items"))?
                 .call1((source,))?,
-            _ if type_address(source) == s.frame_locals => {
-                source.call_method0(intern!(py, "items"))?
-            }
-            _ => return Err(Halt::Bail),
+            _ => source.call_method0(intern!(py, "items"))?,
         };
         if ordered {
             for key in s.dict_keys.bind(py).call1((source,))?.try_iter()? {
@@ -178,6 +199,7 @@ impl State {
             cap: limit.map(|limit| limit.saturating_add(1)),
         };
         self.select(py, source, &view, ordered, preferred, &mut chosen)?;
+        self.own_count(py, source, &mut chosen)?;
         if ordered {
             // Link order gave keys only; read their values from the view.
             let mut remaining = chosen.entries.len();
@@ -185,7 +207,7 @@ impl State {
                 if remaining == 0 {
                     break;
                 }
-                let (key, value) = pair(item?)?;
+                let (key, value) = pair(s, item?)?;
                 if let Some(&slot) = chosen.slots.get(&address(&key)) {
                     if chosen.entries[slot].1.is_none() {
                         chosen.entries[slot].1 = Some(value);
@@ -218,40 +240,53 @@ impl State {
             } else {
                 self.root_value(py, &item)?
             };
-            if !self.s.plain_key(&converted_key) {
-                // A copy's own `__hash__`, `FakeContainer`'s, is Python.
-                self.before_python(py)?;
-            }
             if let Err(err) = target.set_item(converted_key, converted_value) {
-                match Halt::from(err) {
-                    Halt::Py(err) if err.is_instance_of::<PyTypeError>(py) => {
-                        self.count(py, intern!(py, "unsupported_key"))?;
-                    }
-                    halt => return Err(halt),
+                if !err.is_instance_of::<PyTypeError>(py) {
+                    return Err(Halt::Py(err));
                 }
+                self.count(py, intern!(py, "unsupported_key"))?;
             }
             count += 1;
         }
         Ok(())
     }
 
-    /// `ValuesMixin._attribute_mapping`: an attribute dict, whose keys are
-    /// names, not string data. `private` is the bookkeeping attribute of a
-    /// snapshot copy captured again; its caller restores it.
-    pub(crate) fn attribute_mapping<'py>(
+    /// The context's own instance dict, captured from inside its own call
+    /// (through the context, or a reference to the dict): its `_nodes`
+    /// holds the running count when the Python walk reads its entries, so
+    /// the walk writes it there and takes it. Only a selected key that is
+    /// the very `"_nodes"` attribute names are interned as sends the walker
+    /// to compare `source` with that dict, which a lookup would not.
+    fn own_count<'py>(
         &mut self,
         py: Python<'py>,
-        attrs: &Bound<'py, PyAny>,
-        depth: i64,
-        private: Option<&Bound<'py, PyAny>>,
-    ) -> Walk<Bound<'py, PyAny>> {
-        self.enter(py)?;
-        let captured = self.attribute_mapping_body(py, attrs, depth, private);
-        self.leave();
-        captured
+        source: &Bound<'py, PyAny>,
+        chosen: &mut Chosen<'py>,
+    ) -> PyResult<()> {
+        let name = intern!(py, "_nodes");
+        if self.written == Some(self.nodes) {
+            return Ok(());
+        }
+        let Some(entry) = chosen.entries.iter_mut().find(|(key, _)| key.is(name)) else {
+            return Ok(());
+        };
+        if entry.1.is_none() || !source.is(&fresh_dict(&self.s.instance_dict, self.ctx(py))?) {
+            return Ok(());
+        }
+        let count = self.nodes.into_pyobject(py)?.into_any();
+        self.ctx(py).setattr(name, &count)?;
+        self.written = Some(self.nodes);
+        entry.1 = Some(count);
+        Ok(())
     }
 
-    fn attribute_mapping_body<'py>(
+    /// `ValuesMixin._attribute_mapping`: an attribute dict, whose keys are
+    /// names, not string data. `private` is the bookkeeping attribute of a
+    /// snapshot copy captured again; its caller restores it. Leaving it out
+    /// builds a dict of the other entries, which hashes a key that is not a
+    /// plain one with its own `__hash__`, as the Python walk's dict
+    /// comprehension does.
+    pub(crate) fn attribute_mapping<'py>(
         &mut self,
         py: Python<'py>,
         attrs: &Bound<'py, PyAny>,
@@ -263,38 +298,60 @@ impl State {
             Some(private) => {
                 let kept = PyDict::new(py);
                 for item in self.s.dict_items.bind(py).call1((attrs,))?.try_iter()? {
-                    let (key, value) = pair(item?)?;
-                    if !self.s.plain_key(&key) {
-                        // Building the filtered dict hashes every key.
-                        return Err(Halt::Bail);
+                    let (key, value) = pair(self.s, item?)?;
+                    if is_exact_str(self, &key) && key.eq(private)? {
+                        continue;
                     }
-                    if !is_exact_str(self, &key) || key.ne(private)? {
+                    if self.s.plain_key(&key) {
                         kept.set_item(key, value)?;
+                    } else {
+                        self.application(py, || kept.set_item(key, value))?;
                     }
                 }
                 kept.into_any()
             }
         };
-        let id = address(&attrs);
-        let namespaces = self.namespaces.bind(py);
-        if !namespaces.contains(id)? {
-            namespaces.add(id)?;
-            self.added_namespaces.push(id);
-        }
+        self.add_named(py, &id(&attrs))?;
         let dict = self.s.dict_cls.bind(py).clone();
         self.mapping(py, &attrs, depth, None, false, &dict)
     }
 
-    /// `ValuesMixin._root_value`. The native walk never overflows: where
-    /// the Python walk could, the whole call already went back to Python.
-    fn root_value<'py>(
+    /// `ValuesMixin._root_value`: a `RecursionError` while capturing `item`,
+    /// raised by application code the walk runs, a subtree it runs in the
+    /// Python walk, or CPython's own checks, forgets the copies the call
+    /// added since and leaves a placeholder, as there.
+    pub(crate) fn root_value<'py>(
         &mut self,
         py: Python<'py>,
         item: &Bound<'py, PyAny>,
     ) -> Walk<Bound<'py, PyAny>> {
-        self.enter(py)?;
+        let mark = self.objects(py).len();
         let captured = self.value(py, item, 1);
-        self.leave();
-        captured
+        match captured {
+            Err(Halt::Py(err)) if err.is_instance_of::<PyRecursionError>(py) => {
+                // Forget the copies the overflow left half built.
+                let objects = self.objects(py).clone();
+                forget_newest(py, &objects, objects.len().saturating_sub(mark))?;
+                let omitted = self.omit(py, intern!(py, "recursion"), item)?;
+                self.remember(py, &id(item), item, omitted)
+            }
+            other => other,
+        }
     }
+}
+
+/// Removes the `count` newest entries of `dict`.
+fn forget_newest(py: Python<'_>, dict: &Bound<'_, PyDict>, count: usize) -> PyResult<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let newest_first = dict.call_method0(intern!(py, "__reversed__"))?;
+    let keys: Vec<_> = newest_first
+        .try_iter()?
+        .take(count)
+        .collect::<PyResult<_>>()?;
+    for key in keys {
+        dict.del_item(key)?;
+    }
+    Ok(())
 }

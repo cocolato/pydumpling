@@ -1,44 +1,49 @@
 //! Native value walker for pydumpling's bounded snapshots.
 //!
 //! The pure-Python walk in `pydumpling/snapshot/values.py` is the reference
-//! implementation, and [`walker::Walker`] mirrors it step for step, on the
-//! context's own memo, node budget and truncation counters, so a snapshot
-//! pickles to the same bytes whichever walk produced it. The walker never runs
-//! application code: where the Python walk would, or where its result would
-//! depend on its own recursion limit, the walker undoes what the call did
-//! and hands the whole call back to Python before any such code runs, so
-//! that code runs exactly once.
+//! implementation, and the walker mirrors it step for step, on the
+//! context's own memo, node budget and truncation counters, so wherever the
+//! Python walk stays clear of its recursion limit a snapshot pickles to the
+//! same bytes whichever walk produced it, and application code runs at the
+//! same steps the same number of times. `ValuesMixin.value` and `_mapping`
+//! call the walker's entries ([`walker`]) on a context whose class was
+//! found, when it was created, to run the stock walk; an entry returns the
+//! copy, or `_IN_PYTHON` before the call has done anything, and the method
+//! then runs the call itself in its own frame. Once a call has started, the
+//! walker runs application code where the Python walk runs it, through the
+//! same C entry points, and runs a node it does not model, or one below its
+//! native stack budget, in the Python walk in place. It calls none of
+//! pydumpling's Python helpers, so tracing and profiling hooks see only
+//! that application code and those nodes. CPython's C recursion limit is
+//! excepted for both, which run beneath the walker's C frames (see the
+//! contract and "The C recursion limit" in `rust/DESIGN.md`).
 //!
-//! The module is optional and needs Python 3.12+: without it, or with
-//! `PYDUMPLING_NATIVE=0`, pydumpling captures with the Python walk alone.
+//! The module is optional and needs CPython 3.12+ with the GIL. Where it is
+//! not loaded, under `python -b`, or with `PYDUMPLING_NATIVE=0`, pydumpling
+//! captures with the Python walk alone.
 #![forbid(unsafe_code)]
 
 mod address;
-mod arguments;
 mod copies;
-mod dispatch;
 mod keys;
+mod layouts;
 mod mapping;
-mod shadow;
+mod objects;
+mod state;
 mod statics;
 mod text;
-mod transaction;
 mod types;
 mod walk;
 mod walker;
 
 use pyo3::prelude::*;
 
-pub use dispatch::Dispatch;
-pub use statics::StaticsHandle;
-pub use walker::Walker;
+pub use walker::StaticsHandle;
 
 /// The `pydumpling._native` extension module.
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<StaticsHandle>()?;
-    module.add_class::<Walker>()?;
-    module.add_class::<Dispatch>()?;
     // What `rust/build_native.py` built this from: see its `fingerprint`.
     module.add("fingerprint", option_env!("PYDUMPLING_NATIVE_FINGERPRINT"))?;
     Ok(())

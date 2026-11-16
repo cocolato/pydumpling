@@ -34,21 +34,21 @@ def deny(event, arguments):
 loaded = set(sys.modules)
 sys.addaudithook(deny)
 from pydumpling.options import DumpOptions
-from pydumpling.snapshot import SnapshotContext
+from pydumpling.snapshot import SnapshotContext, values
+
+def fallbacks():
+    return values._STATICS.fallbacks if NATIVE else 0
 
 context = SnapshotContext(DumpOptions())
+assert context._native_walk is NATIVE
+before = fallbacks()
 assert context.value([1, 2]) == [1, 2]
-walker = context._walker
-if NATIVE:
-    assert walker is not None
-    assert walker.handbacks == 0
-else:
-    assert walker is None
+assert fallbacks() == before
 assert context._mapping(source) == {"value": [1, 2]}
 if NATIVE and type(source) is not dict:
     # Only frame access tells the walker the locals proxy's type; without it
-    # the walker hands the proxy to the Python walk.
-    assert walker.handbacks == int(DENY)
+    # the walker sends the proxy to the Python walk.
+    assert fallbacks() - before == int(DENY)
 
 def outside(name):
     # Aliases such as multiprocessing's __mp_main__ load with their module.
@@ -130,13 +130,8 @@ if sys.argv[1] == "statics":
 
     native.Statics = statics
 else:
-    # An older build's walker, which took the table alone.
-    def walker(statics):
-        return object()
-
+    # An older build's table, which has no native entries.
     native.Statics = lambda namespace, identity: object()
-    native.Walker = walker
-    native.Dispatch = lambda function, **options: function
 sys.modules["pydumpling._native"] = native
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
@@ -146,8 +141,9 @@ from pydumpling.options import DumpOptions
 assert values._native is None
 messages = [str(w.message) for w in caught if w.category is RuntimeWarning]
 assert len(messages) == 1 and "rust/build_native.py" in messages[0], messages
+assert values._STATICS is values._native_value is values._native_mapping is None
 context = SnapshotContext(DumpOptions())
-assert context._walker is None
+assert context._native_walk is False
 assert context.value([1, {"a": 2}]) == [1, {"a": 2}]
 print("ok")
 """
@@ -166,8 +162,9 @@ from pydumpling.options import DumpOptions
 
 assert values._native is None
 assert not [w for w in caught if w.category is RuntimeWarning], caught
+assert values._STATICS is values._native_value is values._native_mapping is None
 context = SnapshotContext(DumpOptions())
-assert context._walker is None
+assert context._native_walk is False
 assert context.value([1, {"a": 2}]) == [1, {"a": 2}]
 print("ok")
 """
@@ -197,10 +194,10 @@ def _run_script(script, *arguments):
     bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
     reason="a free-threaded build never imports it",
 )
-@pytest.mark.parametrize("mismatch", ["statics", "walker"])
+@pytest.mark.parametrize("mismatch", ["statics", "entries"])
 def test_an_extension_that_does_not_match_leaves_the_python_walk(mismatch):
     """An extension built for another version of ``values``, which lacks a
-    name it reads there or whose walker takes other arguments, is not used:
+    name it reads there or whose table has no native entries, is not used:
     the package still imports, warns once, and captures in Python."""
     _run_script(_MISMATCH_SCRIPT, mismatch)
 

@@ -1,838 +1,801 @@
 # Native value walker: design
 
 This crate builds `pydumpling._native`, an optional native implementation of
-the bounded value walk in `pydumpling/snapshot/values.py`. The pure-Python
-walk there is the reference and the fallback: the native walk must produce a
-snapshot that pickles to the same bytes, run application code exactly as
-often, and raise where the Python walk raises. It works on the context's own
-state: it looks copies up in `ctx.objects` and writes them there, as the
-Python walk does, and keeps no memo of its own. This document describes the
-design as it stands, for whoever changes it.
+the bounded value walk in `pydumpling/snapshot/values.py`. The Python walk
+there is the reference and the fallback. This document describes the design
+as it stands, for whoever changes it.
+
+## Contract
+
+As approved by the owner (2026-11-15): wherever the Python walk does not
+reach the recursion limit, a native capture writes the same snapshot (pickle
+bytes, truncation counters and their order, node counts, `objects` and
+`_sources` contents and order) and runs the same application code the same
+number of times. There is no promise about where recursion overflows: near
+the limit the native walk may capture more, never less. CPython's own C
+recursion and stack limit is excepted, narrowed as far as it goes: a capture
+that starts with too little C stack runs entirely in the Python walk; native
+code reaches Python code only through the C entry points the Python walk
+uses; what remains is that a Python-mode subtree starts one interpreter
+entry deeper, and on 3.14+ application code the native walk runs has the
+native frames beneath it ("The C recursion limit" states the remainder with
+measured shifts). There is no promise about what tracers, profilers,
+coverage, `sys.monitoring` or audit hooks see of the walk's internals, nor
+how often pydumpling's own helpers run.
+
+The walker undoes nothing to keep it: it runs application code where the
+Python walk runs it, and sends a node it does not model to the Python walk
+in place before that node has done anything. It works on the context's own
+state and keeps no memo of its own. The differences under "Accepted
+differences" go beyond the contract and wait for the owner's ruling.
 
 ## Scope
 
-Only the bounded capture walk is native: `ValuesMixin.value`, `_mapping`
-and the `SnapshotContext` helpers they call (`_attribute_mapping`,
-`_root_value`, `_fill_copy`, `_filled_slot`, `_scalar`, `_attributes`,
-`_remember`, `_has_nodes`, `_omit`, `_type_name`, and the fast paths of
-`_text`, `_code_text`, `_bounded_text`, `_bounded_bytes`). The walker calls
-the Python `_layout` once per type and call and caches its answer.
-The writer, reduction, the debugger, the report and the CLI stay in Python.
-Capture runs while the failing process waits, and profiling showed the
-value walk dominating bounded capture time, at about 1-3 us of interpreted
-dispatch per node. The rest is I/O bound or built on `pdb`; porting it
-would trade a pure-Python, all-platform wheel for per-platform builds with
-no measurable gain.
+Only the bounded capture walk is native: `ValuesMixin.value`, `_mapping` and
+the helpers they call (`_attribute_mapping`, `_root_value`, `_fill_copy`,
+`_filled_slot`, `_scalar`, `_layout`, `_attributes`, `_remember`,
+`_has_nodes`, `_omit`, `_type_name`, `_text`, `_code_text`,
+`_bounded_text`, `_bounded_bytes`, `context._utf8_prefix`), and
+`FakeClass.__repr__` as the walk calls it. The walker does what each does,
+in the same order, with the same tallies, and calls none of them. The
+writer, reduction, the debugger, the report and the CLI stay in Python: the
+value walk dominates capture, which runs while the failing process waits,
+and the rest is I/O bound or built on `pdb`.
 
 ## Build and supported range
 
     python rust/build_native.py [--debug] [cargo build arguments...]
 
-The script runs `cargo build --lib` against the running interpreter
-(`PYO3_PYTHON`), a release build unless `--debug`, `--release` or
-`--profile` says otherwise, and copies the library to
-`pydumpling/_native<suffix>` (the interpreter's `.abi3` suffix, or `.pyd` on
-Windows) through a temporary file and a rename, so an interrupted build
-never leaves a partial extension; it removes other builds of `_native`
-that would shadow it. `RUSTFLAGS` and extra cargo arguments pass through,
-which is how instrumented and profile-guided builds are made. The release
-profile is `opt-level = 3`, fat LTO, `codegen-units = 1`.
+The script runs `cargo build --lib --locked` for the running interpreter
+(`PYO3_PYTHON`), in release unless `--debug`, `--release` or `--profile`
+says otherwise, and installs the library as `pydumpling/_native<suffix>`
+through a temporary file and a rename, removing other builds that would
+shadow it. `RUSTFLAGS` and extra cargo arguments pass through, for
+instrumented and profile-guided builds. The release profile is
+`opt-level = 3`, fat LTO, `codegen-units = 1`. The extension carries a
+fingerprint of the crate's sources (`pydumpling._native.fingerprint`), and
+`tests/conftest.py` refuses to run the suite on a build from other sources.
+An extension that lacks a name the crate reads from `values`, or has other
+entries, is not used: `values` warns and captures in Python.
 
-The crate uses PyO3 0.30.1 with `abi3-py312` (one binary for CPython 3.12
-and later), `#![forbid(unsafe_code)]`, and `stacker` for the thread's real
-stack bounds. The built extension is git-ignored, and the published wheel
-stays pure Python.
+The crate uses PyO3 0.30.1 with `abi3-py312`, `stacker` for the thread's
+stack bounds and `#![forbid(unsafe_code)]`, and needs Rust 1.88. The
+extension is git-ignored; the wheel stays pure Python. CI's `native` job
+builds it and runs the suite on Linux for 3.12 to 3.15 and on Windows and
+macOS for 3.14; the `rust` job runs `cargo fmt --check`, clippy with
+`-D warnings` and `cargo test`; the `tests` job checks the Python walk
+without the extension, 3.11 included.
 
-The script builds with `--locked`, as CI's clippy and tests do, so a
-`Cargo.toml` changed without `Cargo.lock` fails the build until the lock is
-updated (`cargo update -p <crate>`, or any cargo command without the flag),
-and passes cargo a fingerprint of the crate's sources (`Cargo.toml`, `Cargo.lock`, `build.rs`, `src/`), which the
-extension carries as `pydumpling._native.fingerprint`. A build stays in the
-package across checkouts and edits of the crate, and one built from other
-sources still imports and captures as the crate no longer does, so
-`tests/conftest.py` compares the fingerprint with the checkout's and refuses
-to run the suite on a stale build. An extension that lacks a name the crate
-reads from `values` when it is imported, or whose walker or descriptors
-take other arguments (one built for another version of that module), is not
-used: `values` warns and captures in Python. The crate needs Rust 1.88
-(`rust-version`), the newest minimum among its locked dependencies.
+Supported: CPython 3.12 to 3.15. 3.11 runs the Python walk only, because
+the extension is built for the stable ABI of 3.12. Free-threaded builds run
+the Python walk too: a stable-ABI extension does not fit their object
+layout and the walker relies on the GIL, so `values` does not import it
+where `Py_GIL_DISABLED` is set and `build_native.py` refuses to build
+there. The extension has been developed and benchmarked on macOS arm64
+only.
 
-CI's `native` job builds the extension and runs the whole suite on it, on
-Linux for CPython 3.12 to 3.15 and on Windows and macOS for 3.14; its `rust`
-job runs `cargo fmt --check`, clippy with `-D warnings` and `cargo test`.
-The `tests` job stays without the extension and checks the Python walk.
+## Choosing the walk
 
-Supported: CPython 3.12 to 3.15, where the suite has run in both modes.
-3.11 always uses the Python walk (`values.py` does not import the extension
-there): on 3.11 C calls count toward the Python recursion limit, so a call
-handed back from native code would overflow earlier than the Python walk
-alone, at any limit. From 3.12 they count only toward CPython's own C
-recursion limit (see "Accepted, documented differences"). Free-threaded
-builds use the Python walk: `values` does not import the extension where
-`Py_GIL_DISABLED` is set, as a stable-ABI build does not fit their object
-layout and the walker relies on the GIL, and `build_native.py` refuses to
-run on one, where PyO3 would build a version-specific extension under the
-stable-ABI name. The extension was developed, and its benchmarks run, on
-macOS arm64 only.
+**Per process.** `values` imports the extension when it is itself imported,
+on 3.12+, if the build is not free-threaded, `PYDUMPLING_NATIVE` is not
+`"0"` (read then only), Python does not run under `-b`, and `sysconfig`
+loads. Under `-b` comparing bytes with str warns, and a warning raised by
+the walker's own dict and set operations would be attributed to the line
+that called the walker rather than to the Python walk's comparison. Without
+the extension every context captures in the Python walk: pure mode.
 
-## When a context captures natively
+**Per class.** `ValuesMixin._native_walk` is `False`. When the extension
+loaded, `values._stock`, called at the end of `context.py`, sets it `True`
+on `SnapshotContext` and records that class's walk attributes as
+`_STOCK_WALK`. `_choose_walk` judges every other class once, from
+`ValuesMixin.__init_subclass__`, or from `SnapshotContext.__init__` at the
+first instance of a class whose bases' `__init_subclass__` never reached
+`ValuesMixin`'s (`_native_walk_class` names the class judged). For each
+name in `_NATIVE_WALK` (17 walk methods), `_STATE_ACCESS`
+(`__getattribute__`, `__setattr__`, `__delattr__`) and `_NATIVE_STATE` (ten
+state names), it compares by identity the raw class attribute the MRO
+yields, read through `type.__dict__` without `__get__` or a metaclass hook.
+A class that differs in any of them (an override, a property in place of a
+state attribute, a slot of a state name), or along whose MRO a class dict
+holds a key that is not an exact str, gets `_native_walk = False` and
+captures in Python, which runs what it changed. A class that sets
+`_native_walk = False` itself keeps it, as do its subclasses, even one
+that restores the stock attributes; any other value it sets is replaced by
+the verdict. Nothing checks the class again. A subclass or an instance
+with `_native_walk = False` is a pure context in a native process, with
+exactly the Python walk's frames; tests compare the walks that way.
 
-A context gets a walker at the end of `SnapshotContext.__init__`
-(`ValuesMixin._start_walker`) when the extension imported, `PYDUMPLING_NATIVE`
-is not `"0"` when the context is created, and the class has a `_stock_walk`,
-which `context.py` records for `SnapshotContext` only; subclasses inherit it
-and face the per-call check. `values` imports the extension on CPython 3.12+,
-not a free-threaded build, when it is built, `PYDUMPLING_NATIVE` is not
-`"0"`, and Python does not run under `-b` (`sys.flags.bytes_warning`, fixed
-for the life of the process): there comparing bytes with str warns, and the
-walker's own dict and set lookups and inserts, which a call it hands back
-makes the Python walk repeat, would warn where the Python walk does not, or
-twice. A build whose configuration does not load (`sysconfig`, as in a
-frozen application without its data) captures in Python too.
+**Per instance.** An instance whose own `_native_walk` is `False` captures
+in Python for good. An entry sets it, *retiring* the context, when the call
+meets, before it has done anything, an argument or state only the Python
+walk reproduces: an argument shape pydumpling's callers never pass (a
+depth that is not an exact int or exceeds 2**62 in magnitude, a `priority`
+that is not an exact tuple, list, set or frozenset of exact strs, `counted`
+other than `True` or `False`, a `container` other than `dict` or
+`FakeDict`); `objects`, `_nodes` or `options` missing, `objects` not an
+exact dict, or `_nodes` not an exact int from 0 to 2**64 - 1; options the
+walker does not read ("State reads"), or a budget missing or not `None` or
+a positive exact int; `_unlimited` other than `False` (`value` offers a
+call where it is any false value). Other state of another kind does not
+retire (a `_truncation` that is not an exact `Counter` of exact str keys
+and int tallies, `_sources` that is not an exact dict or is `objects`
+itself, `_namespaces` not an exact set, `_layouts` not an exact dict, an
+unusual `_code_text_limit`): the walker runs its code in place.
 
-Before every call the walker checks the context without running any of its
-code (see "The class check"). If the class or state is one only the Python
-walk reproduces, the walker *retires*: it sets `_walker = None`, and the
-context captures in Python for good. That happens for:
+**Per call.** A call goes to the Python walk, and the context stays native,
+when its entry finds before the call has done anything that less than
+192 KiB of native stack is left ("The native stack"), that `_mapping` was
+given a source other than a dict, a dict subclass, a `frozendict` (3.15) or
+a `FrameLocalsProxy` (3.13+), whose own `items()`, read up to three times,
+is application code, or that the value is one Python mode takes (below).
+The entry returns `_IN_PYTHON` and the method runs the call itself, in the
+same frame. Frame proxies are read natively only if `sys._getframe` was
+allowed when `values` was imported.
 
-- a class along the MRO holding, for any walk method (`_NATIVE_WALK`),
-  attribute hook (`_STATE_ACCESS`) or state name (`_NATIVE_STATE`),
-  something other than the stock class's: an override, a property in place
-  of a state attribute other than `_walker` (see the accepted differences),
-  a `_walker` slot;
-- an instance attribute named like a walk method;
-- a class dict key that is not an exact str;
-- no plain `__dict__` getset, one that refuses the instance (such as
-  another class's planted there, before 3.15; 3.15 accepts it), or an
-  instance dict that is not an exact dict or holds a non-str key;
-- a missing state attribute; options not exactly `DumpOptions`, whose instance
-  dict (a dict subclass assigned as `__dict__` too, which attribute lookup
-  reads as a dict) holds a key other than an exact str or lacks a budget, or
-  whose class has an MRO other than at import, a `__getattribute__`, or under a
-  budget's name anything but `None` or an exact int (each call reads every
-  budget, the Python walk only those it uses, so neither may run code); a
-  budget that is not `None` or a positive exact int; `_unlimited` not `False`;
-  `_truncation` not an exact `Counter`, or with a key other than an exact str;
-  `_namespaces` not an exact set; `_layouts` not an exact dict; `_nodes` not
-  an exact non-negative int; `objects` or `_sources` not exact dicts, or one
-  dict for both.
+**Unlimited contexts** are never offered: `value` reads `_unlimited` before
+the flag, and `_mapping` offers a call only while `_unlimited is False`.
+Probing each original with `dill.dumps` dominates their cost, and the
+walker would run it beneath a C call the Python walk does not make. Nothing
+is written to such a context in either mode: storing `_native_walk` on an
+instance adds the name to the class's shared instance keys (3.13+), after
+which a load of the flag, on any context in the process, takes 6.0 to
+8.5 ns instead of 2.5 to 3.0 ns (3.13 and 3.14, 2026-11-16).
 
-Why these, where it is not obvious:
+### Python mode
 
-- One dict for `objects` and `_sources`: the Python walk writes every
-  original over its own copy there.
-- Unlimited snapshots: probing each original with the serializer
-  (`_serializable`, a `dill.dumps` per value) dominates their cost and runs
-  application code.
+Python mode is how the walker, once a call has done something, sends one
+node and everything under it to the Python walk without leaving the call.
+`State::python_value` sets `_native_walk = False` on the instance, writes
+its node count to `_nodes`, calls `ValuesMixin.value(ctx, value, depth)`
+with the arguments the Python walk passes there, reads `_nodes` back,
+drops its cached type facts and restores the flag as it was, removing the
+instance's entry where the context had found the class's `True`; it does
+so on every exit. While the flag is false every call in the subtree runs
+the reference body: no native frames, no extra Python frames, no C stack
+per level, and no child returns to the walker. `ValuesMixin.value` is the
+one Python function the walker calls. A node goes there, decided from the
+stack or its type before it has done anything, when it is:
 
-How a context is copied does not matter: the walker holds nothing of the
-context between calls, so a shallow copy, which shares `objects` and
-`_sources`, shares the walker too, whatever hook made it, and a pickle or
-deep copy, which has dicts of its own, holds `None` in its place
-(`Walker.__reduce__`) and captures in Python.
+- met past the native stack budget, since the native walk's recursion
+  takes C stack per level and the Python walk's none;
+- an object copied as `FakeClass` while `FakeClass` has another MRO than
+  at import: it would build its copies through other bases, and 3.12 to
+  3.14 refuse the instance-dict descriptor it had then;
+- a `FakeClass` instance while `FakeClass` holds, along its MRO, another
+  `__repr__` than at import, which the Python walk calls as it now is;
+- a value that is not an exact scalar, met after the call has done
+  something, on a context whose `_unlimited` is not `False`.
 
-A single call goes to the Python walk (a *hand-back*), and the context
-stays native, when its arguments are not in a shape the walker reads
-without running code (listed below); when the walk reaches a point where
-the Python walk would run application code (listed under "The
-transaction"); when the walker cannot show from the stack that the
-Python walk would stay 64 frames clear of the recursion limit (see
-"Recursion and the native stack"), any `RecursionError` is raised, or the
-native stack budget runs out; and when Python code is needed while a
-profiler, tracer or monitoring tool is set. `Walker.handbacks` counts them.
-These argument shapes hand a call back before the walk starts
-(`arguments.rs`), and the Python walk then raises or converts as it would:
-
-- no positional argument after the context (as when the value or source
-  is passed by keyword), or more than two;
-- a depth, positional or by keyword, that is not an exact int (a bool is
-  not) or exceeds 2**62 in magnitude, or a depth given both ways;
-- a keyword name that is not an exact str, or not valid UTF-8 (a lone
-  surrogate);
-- a keyword other than `depth` for `value`, or other than `depth`,
-  `priority`, `counted` and `container` for `_mapping`;
-- a `priority` that is not an exact tuple, list, set or frozenset of
-  exact str names;
-- `counted` other than `True` or `False`;
-- a `container` other than `dict` or `FakeDict`.
-
-## Module map
-
-    lib.rs          module `pydumpling._native`: Statics, Walker, Dispatch
-    dispatch.rs     Dispatch descriptor: routes calls to walker or Python
-    arguments.rs    the argument shapes the walker reads natively
-    walker.rs       Walker pyclass, State, per-call refresh of the state,
-                    GC traverse and clear
-    shadow.rs       per-call class check; finds the instance dict
-    transaction.rs  transaction, rollback, hand-back, retire, stack
-                    checks, hooks
-    walk.rs         value(): exact scalars, containers, FakeClass objects
-    copies.rs       _scalar, _fill_copy, _filled_slot, cached _layout calls
-    mapping.rs      _mapping, _attribute_mapping, _root_value
-    keys.rs         key selection: preferred names, link order, limit + 1
-    text.rs         budgets, tallies, _remember, text fast paths
-    types.rs        per-type facts from the MRO, cached for one call; plain
-                    reads of a placeholder's reason and the copy classes'
-                    instance dicts
-    statics.rs      per-import table of types, base methods and sys hooks
-    address.rs      maps keyed by object address
-
-`rust/bench/` holds the benchmark harness.
-
-## How Python hooks in
-
-Call sites do not change: `frames.py`, `exceptions.py` and the tests call
-`self.value(...)` and `self._mapping(...)`. At import, `values.py` builds
-one `_native.Statics(globals(), _identity)` table and replaces
-`ValuesMixin.value` and `ValuesMixin._mapping` with `_native.Dispatch`
-descriptors over the Python functions.
-
-`Dispatch.__get__` reads `_walker` with `object.__getattribute__` (no
-class hook runs). If it is a `Walker`, it returns a real `types.MethodType`
-binding the descriptor to the context; otherwise the Python function bound
-as usual. Called on the class, `Dispatch` routes `SnapshotContext.value(ctx,
-...)` and `SnapshotContext.value(self=ctx, ...)` the same way. The
-descriptor adds no Python frame, so the Python walk overflows its recursion
-limit exactly where it would without the extension. `__doc__`,
-`__wrapped__`, `__name__`, pickling (as `getattr(owner, name)`) and the rest
-follow the function. Why not instance attributes (`self.value =
-walker.value`): a throwaway context (`SnapshotContext(o).value(x)`) died
-while its bound method ran, and a strong walker-to-context reference would
-make a cycle that keeps originals alive until a full collection.
-
-`_start_walker` creates `_native.Walker(_STATICS, stock)` and sets it with
-`object.__setattr__`. Nothing else in Python knows the walker: the context
-has no `__getstate__`, finalizer or copy hook for it. `Walker.__reduce__`
-pickles and deep-copies it as `None`.
+At an entry the same nodes return `_IN_PYTHON` instead. `_STATICS.fallbacks`
+counts, process-wide, every call an entry sent to the Python walk and every
+node run in Python mode.
 
 ## One call
 
-`Dispatch` takes `try_borrow_mut` on the walker; a walker already borrowed
-refuses the call with `RuntimeError("this SnapshotContext is already
-capturing: a native context captures one call at a time, so reentrant or
-concurrent capture through it is unsupported")`. That one check covers
-re-entry and use from two threads at once (see "Accepted, documented
-differences"). Why not run a re-entrant call in Python: the outer call
-keeps its node count, and what a hand-back would undo, natively until it
-ends, so the Python walk would count from a stale `_nodes` and the outer
-call would write its own count over the inner one's.
+### How Python hooks in
 
-`State::run` then runs `refresh` (the class check, and reading the state
-from the instance dict), parses the arguments (a shape it cannot read hands
-back), and runs the call as a transaction. A class or state that only the
-Python walk reproduces retires the walker. When the call ends, the walker
-lets go of the context, its instance dict, `objects` and `_sources`.
+Call sites do not change: `frames.py`, `exceptions.py` and the tests call
+`self.value(...)` and `self._mapping(...)`, the plain functions of
+`ValuesMixin`. At import `values` builds one table,
+`_STATICS = _native.Statics(globals(), _identity)`, and binds its entries as
+`_native_value` and `_native_mapping`:
 
-### The class check
+    def value(self, value, depth=0):
+        cached = self.objects.get(id(value), _UNMEMOIZED)
+        if cached is not _UNMEMOIZED:
+            return cached
+        if not self._has_nodes():
+            self._truncation["max_nodes"] += 1
+            return self._node_marker
+        self._nodes += 1
+        ...  # TruncatedValue, None, bool, float, complex, int, str, bytes
+        if self._unlimited:
+            ...  # the serializer probe
+        elif self._native_walk:
+            captured = _native_value(self, value, depth)
+            if captured is not _IN_PYTHON:
+                return captured
+        ...  # the reference walk, unchanged
 
-`shadow.rs` reads each class dict through the `type.__dict__` descriptors,
-never through a metaclass, and takes a class attribute raw, without its
-`__get__`. For every name in `_NATIVE_WALK + _STATE_ACCESS + _NATIVE_STATE`
-it compares what the MRO yields with what `values._walk_methods` recorded on
-the stock class. The result is cached on the walker, so each new context
-computes it at its first call, and revalidated on every call: the MRO tuple
-by identity, then only the classes in front of each name's owner, skipping
-immutable builtin classes. The instance dict is scanned every call; its
-length is no mutation token. A class patched after its contexts were
-created is therefore seen at the next call, and nothing reads the context
-through a patched `__getattribute__` first.
+`_mapping` starts with `if self._native_walk and self._unlimited is
+False:` and the same call; the walker does its memo logic. `value` keeps its
+memo lookup, node check and count and its exact scalars before the entry,
+in the reference order, as each costs less in Python than the entry; the
+entry takes back the node `value` counted and counts it as the walk counts
+its own. The entry is a C call in the method's frame, so no path adds a
+Python frame: a call sent to Python, a pure context and a subclass's
+`value` calling `super().value` reach the recursion limit where the Python
+walk alone would.
 
-Once the class passes, the walker reads `options`, the budgets,
-`_truncation`, `_namespaces`, `objects`, `_sources`, `_nodes`,
-`_node_marker` and `_layouts` from the instance dict, and writes `_nodes`
-back there, as stock attribute access would. A class attribute of any of
-those names would be what the Python walk reads, which is why the check
-covers state names too.
+An entry returns the copy, raises what the Python walk would raise, or
+returns `_IN_PYTHON` before the call has done anything. When an exception
+ends a call, the walker writes `_nodes` and raises, keeping what it did, as
+the Python walk does. `_root_value` recovers a `RecursionError` under a
+root mapping's variable, `_mapping` re-raises it rather than counting
+`concurrent_mutation`, and `unless_exception` reproduces `except Exception`.
 
-Nothing else is cached across calls: budgets, counters, the node count and
-per-type facts are reread every call, because Python code runs between
-calls (an exception's `__reduce_ex__`, say) and may change a class's
-`__bases__` or the context. Within a call, native code runs no application
-code, so per-type facts (`types.rs`) are computed once per type and call;
-code that runs inside a call anyway (see "Hooks and signals") and changes
-a class is seen from the next call (see "Accepted, documented
-differences").
+### State reads
 
-### The transaction
+The walker reads the context's state with attribute access, as the Python
+walk does: `objects`, `_nodes`, `options` and the four budgets when the call
+starts; `_sources`, `_truncation`, `_namespaces`, `_node_marker`,
+`_layouts`, `_code_text_limit` and `_unlimited` where the call first needs
+each, which is where the Python walk first reads it. Each is read once per
+call, and only `_nodes` again, after Python code. On a judged class these
+reads run no code. The walker does not read `ctx.__dict__`: on 3.14 that
+turns the instance's inline values into a dict, after which every attribute
+access on the context, the Python walk's too, is slower.
 
-The walker writes each copy into `objects`, and its original into
-`_sources`, as it makes it (`State::remember`), and counts nodes natively.
-When a call starts, the transaction notes how many entries each dict holds
-and saves the node count, a copy of `_truncation` and, as the call goes, the
-namespace ids it adds and each copy it replaces in place (a depth
-placeholder that `_mapping` meets again as a root). On success it writes
-`_nodes`. On a Python exception (`Halt::Py`) it does the same and raises,
-because the Python walk keeps whatever it did before an error. On
-`Halt::Bail` it rolls back and hands the call back: each replaced copy goes
-back where it was, and the entries the call added, which a dict keeps after
-its older ones, are removed from both dicts, newest first (`dict.__reversed__`
-gives them without a scan). The Python walk then starts from the dicts as
-the call found them. A `RecursionError` from anywhere becomes `Bail`: only
-the Python walk has the Python stack the overflow depends on. `except
-Exception` clauses of the Python walk are reproduced by `unless_exception`,
-which also lets `RecursionError` bail.
+The budgets are read as attributes of options whose type passes a check
+made once per type and kept for the process (for `DumpOptions`, at import):
+along its MRO, read through `type.__dict__`, every class dict holds only
+exact str keys, no class but `object` holds `__getattribute__` or
+`__getattr__`, `DumpOptions` is there, and no class in front of it holds a
+budget's name. Any other options object retires the context.
 
-The hand-back sets `_walker` to `None`, runs the Python function with the
-original arguments, and puts the walker back. While it is `None`, the
-context's calls go to Python, and a copy made of the context then captures
-in Python from then on.
+### Python code inside a call
 
-Every place where the Python walk would run application code is a
-hand-back point reached before any of it runs; handing back afterwards ran
-that code twice. The points are:
+Where the Python walk runs Python code that is not pydumpling's, the walker
+makes the same operation once, in place (`State::application`), through the
+C entry point the Python walk goes through (a descriptor's `__get__`, a
+builtin method, `PyObject_GetItem`, `PyNumber_Add`, `operator.iadd`,
+`PyObject_SetItem`, `str.encode`):
 
-- a mapping that is neither a dict, a dict subclass, a `frozendict` (3.15)
-  nor a `FrameLocalsProxy` (3.13+), whose own `items()` is application
-  code. Dict subclasses are read through `dict.items`, frame proxies
-  through `items()`, which runs none. Frame proxies are read natively only
-  if `sys._getframe` was allowed when `values` was imported
-  (`_frame_locals_type`); if an audit hook refused it then, the walker does
-  not know the proxy type, and every `FrameLocalsProxy` namespace (function
-  locals on 3.13+) hands back, while dict namespaces such as globals stay
-  native;
-- a captured value whose class has, along its MRO, a class dict key other
-  than an exact str, or a getset not named `__dict__` planted as
-  `__dict__` (the same in the context's own class retires it; see "When a
-  context captures natively");
-- a type whose `__qualname__` is a str subclass;
-- a memo hit in `_mapping` on an entry that is not an exact `dict`,
-  `FakeDict`, `TruncatedValue`, builtin scalar or builtin container: the
-  Python walk's `isinstance` reads its `__class__`;
-- copying a `FakeClass` whose instance dict is not an exact dict of exact
-  str keys, or whose class holds, along its MRO, a `__repr__` other than
-  the one it had at import or a `__getattribute__` (the Python walk calls
-  `FakeClass.__repr__` as the class then has it);
-- any object while `FakeClass` has an MRO other than the one it had at
-  import, checked before anything runs: given other bases, it builds its
-  copies through theirs, and 3.12 to 3.14 refuse the instance-dict
-  descriptor it had at import;
-- a memo hit in `_mapping` on a placeholder whose `reason` the walker cannot
-  read without running code, as an exact str: one whose class holds, along its
-  MRO, `reason`, a `__getattribute__` but `object`'s, or a class dict key other
-  than an exact str, whose instance dict holds a key other than an exact str,
-  or that holds no `reason`, or one of another type (the Python walk then
-  raises or runs the hook once);
-- an item view yielding anything but exact 2-tuples;
-- filtering the private attribute of a captured snapshot copy, or reading
-  its own type name, from a dict whose keys are not all exact str;
-- a truncation tally that is not an exact int below 2**63 - 1, checked
-  before the walker or a Python helper adds to it;
-- adding a copy that is not a plain key to a set or dict, which may run
-  `FakeContainer.__hash__`, while a tracing hook is set.
+- a truncation tally on another kind of `_truncation`: subscript, in-place
+  add and store (an exact `Counter` of str keys and int tallies is counted
+  in the dict);
+- `_sources` other than an exact dict: `__setitem__`; `_namespaces` other
+  than an exact set: `in` and `add`; `_layouts` other than an exact dict:
+  `get` and `__setitem__`; an unusual `_code_text_limit`: `_bounded_text`'s
+  slice, `len`, `encode` and comparison;
+- a class along whose MRO a class dict holds a key that is not an exact
+  str: `_attributes`' `.get("__dict__")` per class dict, `_type_name`'s
+  `type.__dict__["__module__"].__get__`, and `_layout`'s pass with the same
+  set `in`/`add` and `name == "_fields"`, so such a key's `__hash__` and
+  `__eq__` run as often;
+- a getset other than the instance dict's planted as `__dict__`: its
+  `__get__`;
+- a `__qualname__` that is a str subclass: `module + "." + name`, whose
+  `__radd__` runs, and where the name is then not an exact str,
+  `"<%s snapshot>" % name` and the code-text bound, with its own code;
+- an own copy's attributes with a key that is not an exact str:
+  `attrs.get(key)`; a slot name that is not an exact str: the store into
+  the copy's namespace;
+- a `_layouts` entry `_layout` did not write: `layout[1]`, `layout[2]`,
+  iterating its members, `key, value = item`, `member.__get__(value, cls)`
+  and `namespace.update(zip(fields, copy))`;
+- a memo hit in `_mapping` on an entry other than a dict, `FakeDict` or a
+  builtin scalar or container: `isinstance(cached, TruncatedValue)` and
+  `cached.reason != "max_depth"`;
+- leaving a snapshot copy's private attribute out of a dict with a key that
+  is not plain: the dict insert, which hashes it;
+- the signal check, every 4,096 nodes.
 
-### Recursion and the native stack
+Around each, and around Python mode, the walker writes its node count to
+`_nodes` before and reads it back after, and drops its per-type facts,
+`FakeClass`'s state and whether `_truncation`'s keys are plain, which the
+next value of each type reads anew. It also writes `_nodes` before
+capturing the context's own instance dict, which holds it. Everything else
+the walker calls is C: descriptors' `__get__`, builtin types' unbound
+methods (`dict.items`, `set.__iter__`, `int.bit_length`, a builtin base's
+`__new__`), `slice`, `zip`, `operator.iadd` and the abstract object
+protocol. A call imports nothing (`builtins.__import__` may be the
+application's): `Statics` resolves every module-level object at import.
 
-The Python walk's result depends on the recursion limit (`_root_value`
-recovers from an overflow), so the walker hands back wherever it cannot
-show that the Python walk stays clear of it, and never recurses toward the
-limit itself. `sys._getframe(n)` fails exactly when fewer than `n + 1`
-frames are visible, and a visible frame counts at most twice toward the
-limit (3.13+ runs `__init__` under a hidden shim frame), so one call that
-fails proves room. Only that failure counts: CPython raises it in C before
-any audit event, as a `ValueError` with no traceback. Each walk frame, a
-call of one of the Python walk's recursive methods, must leave 64 frames
-of margin for helpers, generators and hash methods. At the start of a call
-one look at `min((limit - 97) / 2, 1024)` makes room for 32 walk frames,
-about twice what a walk to the default `max_depth` of 5 needs (up to 15);
-if the frame is there, the stack is too deep to tell, and the call goes to
-the Python walk before the walker writes anything. A walk that goes deeper
-looks again for twice the frames, at `min((limit - 65 - frames) / 2,
-1024)`, and hands back if that frame is there; the native stack budget
-ends a walk after a few such looks. A limit too low for the frames leaves
-no room without a look, so a call made from C on a thread with no Python
-frame, where every look fails, still hands back. At the default limit of
-1000, then, a call from more than 451 visible frames runs in Python, and
-so does a walk past 32, 64 or 128 walk frames from more than 435, 403 or
-339; under a limit of 2145 or more, a call from more than 1024.
+### Capturing again from inside a call
 
-A look that finds its frame raises the `sys._getframe` audit event, and the
-audit hooks run inside the native call. A hook that refuses the event,
-which it can only do on such a stack, hands the call back the same way,
-whatever it raises, except an exception that is not an `Exception`, such
-as a signal handler's `KeyboardInterrupt`, which goes on. One that refused
-it at import also turned off the frame-locals fast path (above).
+Nothing refuses a capture through a context while one of its calls runs.
+Code the walk runs (application code in place, Python mode, a signal
+handler or a collection at a synced point) may capture through the same
+context or a shallow copy sharing its dicts, and another thread can run
+only while the walker runs Python code. Such a capture counts on from the
+synced `_nodes`, the outer call on from its count, and it finds in
+`objects` every copy the outer call made, which the walker writes there as
+it makes it. A finalizer between two synced points sees a stale count
+("Accepted differences").
 
-An earlier walker measured the room exactly, by recursing into a Python
-helper until `RecursionError`. From a deep stack that cost about 100 us per
-call, so a dump from 700 frames deep took about 11 ms against 0.7 ms in
-Python, and a signal handler that ran inside that recursion, close to the
-limit, could fail with a `RecursionError` the probe took for its own.
+### The memo
 
-The native stack budget is `min(256 KiB, (remaining - 64 KiB) / 4)`, from
-`stacker::remaining_stack()` at the start of the call. A fixed 256 KiB
-crashed with SIGBUS on small thread stacks; the reserve covers the
-hand-back itself, and three quarters of the rest are left for collections
-and finalizers that run between two checks.
+The walker looks a value up in `ctx.objects` before copying it, and writes
+the copy to `objects` and the original to `_sources`, as `_remember` does,
+each under an int object of its own as that function's two `id()` calls
+make them (a walk that captures the dicts themselves copies every key). An
+exact tuple or frozenset gets its `TruncatedValue` placeholder while it is
+filled. What Python code does to the dicts the walk finds at its next
+lookup; a dict replaced on the context is found by the next call.
 
-### Hooks and signals
+## Recursion and the stack
 
-The walker runs Python code in a few places, pydumpling's own helpers
-(`_text`, `_code_text`, `_bounded_bytes`, `_layout`, `FakeClass.__repr__`,
-and `FakeContainer.__hash__` through a set or dict insert), and audit hooks
-from a stack check on a deep stack (see "Recursion and the native stack").
-Before each helper it asks `sys.monitoring._all_events()` (about 10 ns),
-which shows every profile or trace function, including one set from C
-without an object as yappi does, and every tool's global events, from any
-thread; without `_all_events` it asks `sys.getprofile` and `sys.gettrace`.
-The six tool ids, for a tool with only per-code events, are asked once per
-call; asking them every time cost about 15% on calls that truncate many
-strings. If a hook is set, the call hands back, so the hook
-runs exactly where the Python walk runs it (what it then sees is listed
-under the accepted differences). Strings that fit need no helper: an exact
-str whose length times four is within the limit, or an ASCII one
-(`str.isascii` is C) no longer than the limit, is kept as `_bounded_text`
-would keep it.
+### The native stack
 
-Signal handlers and collections (with their callbacks and finalizers) run
-only at the walker's signal check, every 4096 nodes so Ctrl-C interrupts a
-long capture, or inside its Python calls; an exception they raise ends the
-call as it would end the Python walk's. Why not hand back whenever a signal
-handler is installed: that turned the walker off in every `asyncio.run`
-program and every server with a SIGTERM handler.
+The walker reads neither the recursion limit nor the caller's depth, and
+pushes no Python frame per level. Its C stack is bounded instead, from
+`stacker::remaining_stack()` at the entry: `min(1536 KiB, (remaining -
+128 KiB) / 2)`. A node met past that budget goes to Python mode. The
+reserve and half of the rest are left for what runs beneath the walk:
+application code, Python mode, collections, finalizers, and from 3.14
+CPython's own C stack checks. A budget under 32 KiB, that is less than
+192 KiB left, sends the call to the Python walk without retiring the
+context. Cold paths (Python mode, the signal check, a state attribute's
+first read) are out of line, so their locals take no room in every level's
+frame.
 
-## The memo
+On macOS arm64 (release build, `max_depth=None`, 2026-11-16) the budget
+holds 1,424 levels of nested lists or tuples, 722 of dicts and 595 of
+objects on the main thread on 3.13 and 3.14, and on a 512 KiB thread 182,
+92 and 76 on 3.13 and 180, 91 and 75 on 3.14.
 
-The Python walk memoizes each copy in `ctx.objects[id(original)]` and keeps
-the original alive in `ctx._sources[id(original)]`. So does the walker: it
-reads both dicts from the instance dict at the start of every call, looks a
-value up in `objects` before copying it, and writes the copy and then the
-original as the Python walk's `_remember` does, each under an int object of
-its own, as that function's two `id()` calls make them: a walk that
-captures the dicts themselves copies every key as a value, and counts a
-node for each. An exact tuple or frozenset gets its `TruncatedValue`
-placeholder while it is filled and its copy afterwards, as in the Python
-walk. Whatever Python code does to the dicts between calls (adding,
-overwriting or removing entries, emptying or replacing a dict) the next
-call finds, since it reads nothing else.
+### Near the limit
 
-Why not a memo of the walker's own, written to the dicts lazily: an earlier
-version had one, which made capture about a fifth faster (see
-"Performance") and cost a sync of the memo with the dicts at every call, a
-write of the pending copies before any Python code could read them (a
-hand-back, a copy, a pickle), a finalizer to write them when the context
-died in a reference cycle, and about 1,200 lines of Rust; most of the
-differences from the Python walk that the design then accepted came from
-it.
+Where the Python walk overflows, the native walk may capture more. In the
+gate (2026-11-16, 3.13; 3.14 the same unless named), `_mapping` of a
+2,000-level list on the main thread captures all 2,003 nodes natively, the
+levels past the budget in Python mode, against 992 and a `'recursion'`
+placeholder in the Python walk; on a 512 KiB thread 1,172 nodes (3.14:
+1,169) against 991, both with the placeholder. A capture in an
+`except RecursionError` handler 30 frames below the limit captures the same
+339 nodes (3.14: 338) in both walks.
 
-## Invariants and why
+"Never less" is checked by a provisional definition the owner has yet to
+approve. Where the Python walk reached the limit: (i) no root variable both
+walks captured (an entry of a mapping captured at depth 0, of a captured
+exception's state, or of a captured frame's namespaces) reaches more
+`TruncatedValue('recursion')` placeholders natively; (ii) the native walk
+keeps at least as many originals in `objects`. Not nodes: the Python walk's
+`_nodes` also counts the copies `_root_value` drops after an overflow
+(parity seed 1279 on 3.13: 1,029 nodes natively against 1,955, while
+`objects` keeps 1,029 against 39). Under a binding `max_nodes`, capturing
+more of an earlier variable can leave a later one with fewer entries and a
+`max_nodes` cut the Python walk lacks, which the definition allows: with
+`max_nodes=150` 25 frames below the limit (`near_limit_nodes`), the native
+walk keeps a 41-level list whole and cuts the next variable at 150 nodes,
+where the Python walk gives the list a `'recursion'` placeholder and keeps
+the next variable whole (86 nodes). Of 3,000 parity seeds on 3.13
+(`PYTHONHASHSEED` 0, and again with 1), 245 reach the limit in the Python
+walk, 34 of them show that shift, and none violates (i) or (ii).
 
-- Native code never runs application code, but for the key comparisons listed
-  under the accepted differences (a key of `objects` or `_sources` not of a
-  plain kind that hashes like an id, an element of `_namespaces` that hashes
-  like the id of a dict the call captures, and a key other than a str planted
-  in a class dict of `DumpOptions` that hashes like a budget's name), and for
-  the finalizers and weak reference callbacks of objects whose last reference
-  a dict write or removal lets go of, as the Python walk's own writes do.
-  Types are compared by address, class attributes are read through
-  `type.__dict__` descriptors, containers through their builtin base's unbound
-  methods, and keys other than ids are hashed or compared only when they are
-  of a plain kind. Anything else hands back before it runs, so application
-  hooks run exactly as often as without the extension. A call imports nothing,
-  since `builtins.__import__` may be the application's: every module-level
-  object the walker needs is resolved when `Statics` is built.
-- The order of memo entries, node counts and truncation counters is part of the
-  snapshot, and so is object sharing (the pickle memo shows it). The walker
-  follows the Python walk step for step, builds every copy as its class's
-  constructor does while the class holds no hook of its own, and uses the same
-  reason objects (`_RECURSIVE_IMMUTABLE`, the node marker) so placeholders
-  pickle to the same bytes.
-- A call either commits what it did or rolls back to the exact state it
-  started from; the Python walk then runs from that state.
-- After every call `objects` and `_sources` hold what the Python walk would
-  leave in them, in its order: the walker makes the Python walk's lookups and
-  writes on the dicts themselves, the copy before its original and each under
-  a key object of its own, as `_remember` writes them, and a hand-back takes
-  out exactly what the call put in. The one exception is a walk that captures
-  the context itself, which finds the walker there (see the accepted
-  differences).
-- The walker reads the context only after the class check, and only
-  through its instance dict, `object.__getattribute__` and
-  `object.__setattr__`. It holds the context, its instance dict, `objects`
-  and `_sources` only during a call; between calls it keeps the
-  `_truncation`, `_namespaces`, node marker and string budget it last read
-  and what it learned of the types it last met. `__traverse__` visits all
-  of them, so a context in a cycle through any of them is collected as in
-  the Python walk.
-- The `Statics` table is built from the `values` module's own globals at
-  import and leaked for the life of the process: a reloaded or vendored
-  package gets its own table and copies into its own classes, and old
-  snapshots keep theirs.
-- `address::push` grows vectors into a fresh buffer of twice the capacity
-  instead of `realloc`: macOS caches the large blocks a chain of `realloc`
-  frees and does not reuse them, so each big capture would leave megabytes
-  resident.
-- Every source file stays at most 400 lines, and the crate forbids
-  `unsafe`.
+### The C recursion limit
 
-## Accepted, documented differences
+What remains of the contract's carve-out, measured on macOS arm64 (release
+build) on 2026-11-16, and for 3.12 and 3.15 also on 2026-11-15 with the
+same results.
 
-Each of these is a difference from the Python walk that remains by design.
+On 3.12 and 3.13 CPython counts C levels. The entry is a C call, so
+application code the walker runs in place starts one C level deeper than in
+the Python walk (two for a tally that is not an exact int: PyO3's safe API
+has no in-place add, so it goes through `operator.iadd`), and a Python-mode
+node two deeper (the entry and the call back into Python). The Python
+walk's `_mapping` resumes generators (`dict.fromkeys` over one,
+`itertools.islice`) that CPython counts too, which outweighs the entry's
+level where the value holds a dict or an object. Beneath nested `==` at the
+default limit, the deepest nesting at which each walk captures the value
+whole (3.12 / 3.13):
 
-- A key of `objects` or `_sources` not of a plain kind (an int subclass, an
-  object with its own `__hash__`) that hashes like an id runs its `__eq__`
-  when the walker looks that id up or writes it, as when the Python walk
-  does; and again in the Python walk when the walker hands the call back
-  after it, and when the hand-back takes the id out of a dict again, which
-  for `_sources` is the only lookup either walk makes. An exception it
-  raises while a hand-back takes entries out goes to the caller, where the
-  Python walk would have run. pydumpling writes only ids there.
-- An element of `_namespaces` that hashes like the id of a dict a call
-  captures runs its `__eq__` when the walker looks that id up, and again
-  in the Python walk when the walker hands the call back after it. A key
-  other than a str planted in a class dict of `DumpOptions` (through
-  `gc.get_referents`: `setattr` adds only str keys) that hashes like a
-  budget's name runs its `__eq__` at each call, as the walker looks every
-  budget's name up along the class's MRO, where the Python walk reads a
-  budget only when the call uses it, through CPython's attribute cache.
-- Near CPython's C recursion limit a call through the walker can raise
-  `RecursionError` where the Python walk returns. Python code reaches that
-  limit under a recursion limit raised past it when its recursion makes a C
-  call at each level (`list(map(f, ...))`, a property, a C-wrapped
-  function; plain Python-to-Python recursion stops at the Python limit in
-  both walks); at the default limit from a callback deep in recursion that
-  runs in C (a `__repr__` or `__eq__` of an item of deeply nested
-  containers); and from 3.14, where CPython bounds the C stack by its size,
-  in a thread with a small stack. Before it can hand back, the walker makes
-  nested C calls the Python walk does not (the descriptor call, reading
-  `_walker` and the context's state, and on a hand-back taking its entries
-  out of the dicts), and the hand-back runs the Python walk beneath them,
-  which may capture part of the value before it raises. Shifts measured
-  while the walker still kept a memo of its own, and not again since, which
-  depend on the value and the stack's layout: in `list(map(...))` recursion under a raised
-  limit, about one level on 3.12 and 3.13 and two to five from 3.14 (for
-  `save_dumping`, one on 3.14 and none elsewhere); in nested `repr` or
-  `==` at the default limit, two or three levels on 3.12 and 3.13, about
-  twenty on 3.14 and about ten on 3.15 (for `save_dumping`, none on 3.12
-  and 3.13 and three to six from 3.14); in a thread with a 512 KiB stack,
-  up to four levels from 3.14. Nothing short of a Python descriptor avoids
-  this. On 3.12 and 3.13 the limit can also move the other way: a call the
-  walker completes itself on a value holding a dict can return one or two
-  levels deeper than the Python walk, whose `_mapping` resumes generators
-  (`dict.fromkeys`, `itertools.islice`) that CPython counts as C levels.
-- A shallow copy of a native context shares its walker, as it shares
-  `objects` and `_sources`: capturing through one while the other's call
-  runs raises `RuntimeError`, as re-entry does (next), and
-  `Walker.handbacks` counts the calls of both. A pickle or deep copy holds
-  `None` under `_walker` in its instance dict, where the copy of a context
-  that captures in Python has no such entry, and captures in Python; so
-  does a shallow copy made while the Python walk takes a call from the
-  walker, during which the context itself holds `None`.
-- Code that runs inside a native call (a finalizer, a collection callback,
-  an audit hook, or a signal handler at one of the walker's signal checks)
-  and captures through the same context gets `RuntimeError` where the
-  Python walk would capture; so does using one context from two threads at
-  once (another thread can run while the walker runs Python code), instead
-  of interleaving the captures (see "One call"). Set `PYDUMPLING_NATIVE=0`
-  for such code. Such code that reads `ctx._nodes` finds the count as the
-  call began, and a count it writes there is overwritten when the call
-  ends: the walker counts natively and writes `_nodes` once.
-- Code that runs inside a native call (a signal handler at a signal
-  check, a collection's callbacks and finalizers, or another thread while
-  the walker runs one of pydumpling's helpers) and changes a class, such as
-  its `__bases__` or a `__dict__` descriptor, is seen by the walker from
-  the next call: it reads each type's facts once per call, where the
-  Python walk rereads them, apart from the layouts both cache per context,
-  for every value.
-- Code that runs inside a native call (as above) and replaces `objects` or
-  `_sources` is seen by the walker from the next call: it captures the rest
-  of the call against the dicts it read when the call began and writes the
-  call's copies there, where the Python walk puts the copies it makes
-  afterwards into the new dicts. A later call then captures those values
-  afresh and counts their nodes again.
-- Under a profiler, tracer or `sys.monitoring` tool, a call that needs
-  Python code runs in the Python walk; one that does not stays native, and
-  the hook sees none of it, as with any C accelerator. `_all_events` is
-  interpreter-wide, so a hook on another thread sends such calls to Python
-  too. A hook set inside one of pydumpling's helpers sees the rest of that
-  helper; the call is handed back if it needs Python code again, and
-  otherwise commits natively. A tool that takes an id during a call with
-  only per-code events is seen from the next call; on 3.12 and 3.13, one
-  that freed its id and kept only per-code events is seen by no check, and
-  sees the helpers the walker calls.
-- A context captured as a value (one a dumped frame holds, or one passed
-  to `value`) shows its `_walker` attribute, an unsupported-type
-  `FakeClass`. Captured through itself, it shows its node count as that
-  call began, where the Python walk shows the count it had reached (two
-  nodes on through `value`, three through a frame namespace); captured by
-  another context, the counts match. A self capture handed back to the
-  Python walk, as under a profiler, shows `None` as `_walker` and is
-  otherwise as in the Python walk. The capturing context spends a node and
-  an `unsupported_type` count on the walker's copy, which takes an entry in
-  each of its dicts, and a node on the count it shows unless the walk has
-  met that int already, as the Python walk does on its own, other count.
-  Under a node budget, the captures that follow such a one can therefore
-  be cut off a value sooner or later than in the Python walk. pydumpling
-  itself captures no frame that holds a context.
-- A call that passes the value or source by keyword runs in the Python
-  walk: correct, without the speed-up. pydumpling passes them positionally.
-- `_walker` is the walker's own attribute, set with `object.__setattr__`: a
-  class attribute of that name, such as a property, is unsupported; a slot
-  of that name makes the context capture in Python, and then holds `None`
-  where a context that never had a walker leaves it unset.
-- The walker's table is built when `values` is imported: patching its globals
-  afterwards (`FakeClass`, `TruncatedValue`, `DumpOptions`) is not
-  seen by any walker, and the walker never calls `_plain_key`. A call the
-  walker hands back runs in the Python walk, which sees them, so one context
-  can show a patch in some calls and not in others (under a tracer, an
-  `OrderedDict` is handed back). Patching the context's walk methods is seen.
-  To patch the module's helpers, set `PYDUMPLING_NATIVE=0`. Methods patched
-  onto `collections.Counter`, such as `__missing__`, are not run by the
-  walker's own counts, which write the tally dict directly. Hooks patched onto
-  the copy classes (`TruncatedValue`, `FakeClass`, and `FakeDict`, `FakeList`,
-  `FakeTuple`, `FakeSet`, `FakeFrozenSet`, `FakeStr`, `FakeBytes`, `FakeInt`,
-  `FakeFloat`: `__new__`, `__init__`, `__setattr__`, `__getattribute__`, a
-  `__dict__` descriptor, another `_type_key`) do not run, nor are seen, when
-  the walker builds a copy, with the builtin base's `__new__`
-  (`object.__new__`, `dict.__new__`, ...), the instance-dict descriptor and the
-  `_type_key` the class had at import. The Python walk calls the class, which
-  runs `__new__` and `__init__`, sets a placeholder's fields through
-  `__setattr__`, and reads a copy's `__dict__`, a list or set copy's `append`
-  or `add`, through its `__getattribute__` (a `FakeClass`'s once, and twice
-  more for an object with an instance dict); so those hooks run there alone,
-  and a planted `__dict__` descriptor sends the copy's attributes where it
-  points. Hooks that read a captured `FakeClass` (its `__repr__`, a
-  `__getattribute__`) or the options (a `__getattribute__` or property on
-  `DumpOptions`) do run as in the Python walk: the walker hands such a call
-  back, or retires the context.
-- Introspection of the entry points: once the extension is imported,
-  `SnapshotContext.value` and `_mapping` are `Dispatch` descriptors for
-  every context, whatever `PYDUMPLING_NATIVE` says when it is created, so
-  `inspect.isfunction` is false, `__module__` is `pydumpling._native`,
-  `inspect.getsourcefile` raises `TypeError` (`getsource` and `signature`
-  work through `__wrapped__`), and `mock.create_autospec`, of the
-  attribute or of the class, sees `(*args, **kwargs)`. A native context's
-  bound method reads the same way and forwards the descriptor's
-  `__wrapped__`, which a pure context's bound method lacks.
-- From a stack deeper than `min((limit - 97) / 2, 1024)` frames, counting
-  the calling frame (451 at the default limit of 1000), each call the
-  walker starts raises one `sys._getframe` audit event, from the start
-  check, and goes to the Python walk; so does a walk deeper than 32 walk
-  frames from a stack deeper than its next look (see "Recursion and the
-  native stack"). The audit hooks run there, where the Python walk runs
-  none. A call handed back before it starts (the value by keyword, a
-  non-int depth) raises none, nor does the Python walk.
-- If an audit hook refuses `sys._getframe` when `values` is imported,
-  frame namespaces (`FrameLocalsProxy`, 3.13+) capture in the Python walk
-  for the life of the process (see "The transaction").
-- A str-subclass keyword *name* in `**kwargs` has its `__hash__` run
-  before the walker hands the call back, where the Python walk runs none:
-  once while PyO3 collects `**kwargs`, and through a native context's
-  bound method once more, as `Dispatch` has no vectorcall and CPython
-  builds a keyword dict for it. A call through the class
-  (`SnapshotContext.value(ctx, ...)`) reaches `Dispatch` on any context
-  once the extension is imported, so it hashes once on a pure context
-  too, and a receiver passed there as `self=` runs one more `__eq__`.
+    captured                            Python        native        shift
+    [a dict, an object]                 9,989/9,990   9,992/9,993   3 later
+    a root namespace, string bounded    9,989/9,990   9,993/9,994   4 later
+    [a dict, an object whose class
+      name runs a __radd__]             9,989/9,990   9,991/9,992   2 later
+    [a dict, a long string],
+      a tally that is not an exact int  9,989/9,990   9,990/9,991   1 later
+    [a long string], the same tally     9,991/9,992   9,990/9,991   1 sooner
+    [a dict, a FakeClass copy] after
+      FakeClass.__repr__ was replaced
+      (a Python-mode node)              9,989/9,990   9,987/9,988   2 sooner
+
+From 3.14 CPython measures the C stack instead; those captures start with
+less than 192 KiB left and run in the Python walk from their start, so no
+form shifts on 3.14 or 3.15.
+
+In a capture that starts with more stack, application code the walker runs
+in place, and a Python-mode subtree, have up to the stack budget of native
+frames beneath them, where the Python walk's recursion takes no C stack.
+On a 512 KiB thread, 150 levels of lists deep (about 175 KiB of native
+frames), with a `__qualname__`'s `__radd__` there taking the `repr()` of a
+K-level nested list, the largest K that completes:
+
+    Python   Python walk   native   past it
+    3.12     1,584         1,086    the process crashes (SIGBUS)
+    3.13     1,584         1,086    the process crashes (SIGBUS)
+    3.14     2,206         1,455    RecursionError (stack overflow)
+    3.15     2,083         1,382    RecursionError (stack overflow)
+
+So on 3.12 and 3.13, which do not check the C stack, a native capture
+crashes for K from 1,087 to 1,584 where the Python walk completes. Python
+code reaches the C limit when its recursion makes a C call per level
+(`list(map(f, ...))`, a property, a C-wrapped function), from a callback
+deep in recursion that runs in C (a `__repr__` or `__eq__` of nested
+containers), and from 3.14 on a thread with a small stack. Other shapes
+have not been measured. A smaller stack share for the walker would narrow
+this and send more of a deep value to Python mode.
+
+## Hooks and signals
+
+During a native call a profiler, tracer, coverage or `sys.monitoring` tool
+sees only the application code the walker runs in place and Python-mode
+subtrees: the walk is one C call from `value` or `_mapping`. `cProfile`
+attributes its time to that call, coverage shows the walk's lines in
+`values.py` and `context.py` as not run, and `pdb` cannot step into it. An
+audit hook sees one `builtins.id` event per native call, from `value`'s
+memo lookup, where the Python walk raises one per `id()` (47 for
+`[1, "two", (3.0,), {"k": [None]}]`). To profile, trace, measure or debug
+pydumpling's own walk, set `PYDUMPLING_NATIVE=0` before `values` is
+imported, or `_native_walk = False` on the context class or instance.
+
+Signal handlers run at the walker's signal check, every 4,096 nodes, so
+Ctrl-C interrupts a long capture; an exception a handler raises ends the
+call as it would end the Python walk's. From 3.12 CPython runs the cyclic
+collector only where it checks for pending work or in
+`PyErr_CheckSignals`, so inside a native call a collection runs only at a
+synced point. Sending a call to Python whenever a signal handler is
+installed would turn the walker off in every `asyncio.run` program and
+every server with a SIGTERM handler.
+
+## Invariants
+
+- Native code runs application code only where the Python walk runs it,
+  once, through the same C entry point, with `_nodes` synced around it,
+  except for the finalizers and weak reference callbacks of objects the
+  walker lets go of and the key comparisons of objects planted in
+  `objects`, `_sources` or `_namespaces`. Types are compared by address,
+  class attributes read through `type.__dict__` descriptors, containers
+  through their builtin base's unbound methods, and keys other than ids
+  hashed or compared natively only when of a plain kind.
+- The order of memo entries, node counts and truncation counters is part of
+  the snapshot, as is object sharing. The walker follows the Python walk
+  step for step, builds each copy as its class's constructor does while the
+  class holds no hook of its own, and uses the same reason objects
+  (`_RECURSIVE_IMMUTABLE`, the node marker).
+- No native object per context and no memo of the walker's own: between
+  calls the table keeps only the options types it judged, so a context is
+  collected as in the Python walk. A memo of its own would need a sync with
+  the dicts at every call and its writes flushed before any Python code
+  reads them. The table is built from the `values` module's own globals and
+  kept for the process; a reloaded or vendored package gets its own.
+- `address::push` grows a vector into a fresh buffer of twice the capacity
+  instead of `realloc`, whose freed large blocks macOS keeps resident.
+- Every source file stays within 400 lines; the crate forbids `unsafe`.
+
+## Accepted differences
+
+Each goes beyond the approved contract and waits for the owner ("Open
+problems").
+
+- **The walk is chosen when a context class is created** (or at its first
+  instance). A walk method or state attribute changed on the class
+  afterwards, or a walk method set on an instance, is not seen by a native
+  context: a method patched onto `SnapshotContext` after import runs under
+  `PYDUMPLING_NATIVE=0` only. A state property or attribute hook patched on
+  later runs at the walker's reads, once per call per attribute, where the
+  Python walk runs it at every read; so does the `__eq__` of a key planted
+  in the instance dict that hashes like a state name. `value`'s memo
+  lookup, node check and exact scalars stay in Python, so changes there
+  run. A subclass of a class judged `False` captures in Python even if it
+  restores the stock attributes. To have a change run, set
+  `PYDUMPLING_NATIVE=0` or `_native_walk = False`, or subclass after it.
+- **Options are judged once per type, budgets read once per call.** A
+  property or `__getattribute__` patched onto `DumpOptions` or a subclass
+  after its verdict, or a key planted in its class dict that hashes like a
+  budget's name, runs once per call per budget natively, where the Python
+  walk runs it at each budget read; both take a property's answer. A call
+  that never needs a budget still reads it natively.
+- **State is read once per call.** Code that runs inside a native call
+  (application code it runs, a Python-mode node, a finalizer, a signal
+  handler, another thread while it runs Python code) and rebinds state
+  other than `_nodes` (`objects`, `_sources`, `_truncation`, `_namespaces`,
+  `_layouts`, `options`, a budget) after the call read it, or rebinds the
+  context's `__class__`, is seen from the next call; a Python-mode node
+  reads it anew. Replaced `objects` or `_sources` dicts get the rest of the
+  call's copies, where the Python walk puts them in the new dicts, so a
+  later call captures those values again and counts their nodes again.
+  Changes to the same dicts are seen at once.
+- **The count is stale between synced points.** Code that runs there runs
+  as often as in the Python walk but sees `_nodes` as of the last sync: a
+  finalizer or weak reference callback run as the walker lets go of a value
+  (the Python walk can let it go at another step), and the `__eq__` of an
+  object planted in `_namespaces`, or of a key of `objects` or `_sources`
+  not of a plain kind, that hashes like an id the walker looks up. A
+  capture through the same context from there starts from that count, and
+  the walker then writes its own count over the one it left, so its nodes
+  count toward no budget. pydumpling writes only ids there.
+- **A class changed mid-call may be seen late.** One changed by
+  application code the walker runs is seen at once, as the walker then
+  drops its type facts. One changed by a finalizer or weak reference
+  callback between synced points (its `__bases__`, a `__dict__`
+  descriptor) is seen, for a type whose facts the call holds, from the next
+  synced point or call; the Python walk rereads a type's facts for every
+  value (both walks cache layouts per context).
+- **The table is built at import.** `values`' globals patched afterwards
+  (`FakeClass`, `TruncatedValue`, `DumpOptions`) are not seen by the
+  walker, which never calls `_plain_key` either; a Python-mode node sees
+  them. Methods patched onto `collections.Counter`, such as `__missing__`,
+  do not run for counts on an exact `Counter`, which the walker writes to
+  the dict. Hooks patched onto the copy classes (`TruncatedValue`,
+  `FakeClass` and the `Fake*` containers and scalars: `__new__`,
+  `__init__`, `__setattr__`, `__getattribute__`, a `__dict__` descriptor,
+  another `_type_key`) neither run nor are seen when the walker builds a
+  copy with the builtin base's `__new__` and the descriptor and `_type_key`
+  of import time; the Python walk calls the class. Hooks that read a
+  captured `FakeClass` (`__repr__`, `__getattribute__`) run as in Python.
+- **A context captured as a value** (one a captured frame holds, or one
+  passed to `value`) shows `_native_walk = False` in its instance dict
+  where the Python walk never writes it: on a retired context for good, and
+  on a context while one of its nodes runs in Python mode, after which the
+  walker restores or removes the entry. A copy or pickle of the context
+  made there keeps the flag and captures in Python for good. An unlimited
+  context holds no flag in either mode. Either write adds the name to the
+  class's shared instance keys (3.13+), so from then on, in that process,
+  each flag load on any context costs 3 to 5 ns more, in either walk.
+- **Unpacking a `_layouts` entry Python code wrote.** For an item that is
+  not an exact pair, the walker raises the interpreter's errors but names a
+  non-iterable item's type by its `__name__`, where the interpreter prints
+  `tp_name` (with the module for a static extension type) cut at 200
+  characters, and decides whether the item is iterable by looking
+  `__iter__` and `__getitem__` up in its classes' dicts, which runs the
+  `__eq__` of a key there that is not an exact str and hashes alike.
+
+Within the contract: the C recursion limit, what hooks see, and capturing
+more near the recursion limit. One more changes only the cost: if an audit
+hook refuses `sys._getframe` when `values` is imported, every
+`FrameLocalsProxy` namespace runs in the Python walk for the process.
 
 ## Behaviours of the reference walk both walks keep
 
-The native walk reproduces these byte for byte, or hands the call back, so
-fixing one means changing both walks together: a non-dict namespace's own
-`items()` view is iterated up to three times, and a one-shot view loses
-entries in later passes; after a `RecursionError` in a frame variable,
-`_root_value` forgets the half-built copies but keeps their node count and
-counters; instances whose `__dict__` is a member descriptor
-(`SimpleNamespace`, modules) lose their attributes; the first capture of an
-exception materializes its `__dict__`, so a second capture differs; a
-str-subclass `__qualname__` runs its own `__radd__` and slicing (the walker
-hands such a call back); from 3.13.6 and 3.14 `reprlib` writes an int past
+The native walk reproduces these byte for byte, so fixing one means
+changing both: a non-dict namespace's own `items()` view is iterated up to
+three times, and a one-shot view loses entries in later passes; after a
+`RecursionError` in a frame variable, `_root_value` forgets the half-built
+copies but keeps their node count and counters; instances whose `__dict__`
+is a member descriptor (`SimpleNamespace`, modules) lose their attributes;
+the first capture of an exception materializes its `__dict__`, so a second
+capture differs; a str-subclass `__qualname__` runs its own `__radd__` and
+slicing; from 3.13.6 and 3.14 `reprlib` writes an int past
 `sys.get_int_max_str_digits()` with its address, so the message of an
-exception whose arguments hold one differs between dumps, and before
-that, where `reprlib` raises, the message is unavailable.
+exception whose arguments hold one differs between dumps.
+
+## Module map
+
+    lib.rs        module `pydumpling._native`: `Statics`, `fingerprint`
+    walker.rs     the Statics handle and its entries `value` and `mapping`:
+                  argument checks, retiring, the stack budget; the sync of
+                  `_nodes` around Python code (`application`), Python mode
+                  (`python_value`); the fallback counter
+    statics.rs    per-import table of types, base methods, descriptors
+    state.rs      State: the context state a call reads, at its start or
+                  when first needed; the options verdict
+    walk.rs       value(): the memo, exact scalars, containers, the signal
+                  check
+    objects.rs    objects copied as FakeClass, _attributes,
+                  FakeClass.__repr__
+    copies.rs     _scalar, _fill_copy, the copy classes as at import
+    layouts.rs    _layout, _filled_slot
+    mapping.rs    _mapping, _attribute_mapping, _root_value
+    keys.rs       key selection (preferred names, link order, limit + 1);
+                  `key, value = item`
+    text.rs       budgets, tallies, _remember, _omit, _type_name, the bounds
+                  of text, code text and bytes
+    types.rs      per-type facts from the MRO, cached until Python code
+                  runs; the class dicts along an MRO; FakeClass as it is now
+    address.rs    maps keyed by object address; a vector push macOS reuses
+
+The crate has 3,338 lines (`wc -l rust/src/*.rs`). `rust/bench/` holds
+`never_slower.py`, the gate; `bench_walk.py`, whole-workload timings; and
+`workloads.py`, the six workloads both use.
 
 ## Testing
 
-The whole suite runs with the native walker and with `PYDUMPLING_NATIVE=0`
-on CPython 3.12 to 3.15; 3.11 runs the Python walk only.
-`tests/test_native_parity.py` and `tests/test_native_differences.py` skip
-when `values` did not import the extension (not built, `PYDUMPLING_NATIVE=0`
-or `python -b`), and the native cases of `tests/test_native_import.py` and
-`tests/test_context_copy.py` skip then too. CI's `native` job builds the
-extension and runs them all; without it, as in the `tests` job, the suite
-checks the Python walk, the import guard and the fallback from an extension
-that does not match `values`. `tests/conftest.py` refuses to run on an
-extension built from other sources than the checkout's (see "Build and
-supported range").
+The suite runs with the native walker and with `PYDUMPLING_NATIVE=0` on
+CPython 3.12 to 3.15, and 3.11 runs it on the Python walk. The native tests
+skip when `values` did not import the extension.
 
 The parity oracle is byte identity. `test_walk_parity` draws, per seed,
 random `DumpOptions`, a random object graph (nested containers, subclasses,
 slots, named tuples, enums, cycles, shared references, long strings, big
 ints, `OrderedDict`s with non-plain keys, frame-like namespaces with
-priorities) and a random call stack and sequence of capture operations, and
-runs it on a native and a pure context over the same live objects. The
-pickles, the truncation counters in key order, the node counts, the kinds
-of what `objects` and `_sources` end up holding, in their order, and the
-application hooks run must match exactly; there is no tolerance, as values
-are copied, not computed. A first, discarded pure run materializes lazy
-state such as an exception's `__dict__`. No case starts near the
-recursion limit: the walker hands such calls back, and there the Python
-walk's own result depends on what the interpreter ran before, so the
-targeted tests below cover them. Deep chains (every seed ending in 9, and
-some others) still reach the limit through the walk's own depth, where the
-walker hands back and `_root_value` recovers. While the tests
-run, `TruncatedValue`, `FakeClass` and NaN `FakeFloat` copies hash by
-content, so sets iterate alike, and, so that no output carries an address,
-the harness lifts the int digit limit from 3.13 and drops the address from
-`reprlib`'s fallback for a failing `repr`. `PYDUMPLING_PARITY_SEEDS` sets
-the number of seeds (300 by default); `test_dump_parity` compares whole
-dumps, metadata included, from `save_dumping` and `dump_current_traceback`
-for each of 20 seeds. A seed reproduces under the same
-`PYTHONHASHSEED`; a failure prints the seed, the options, the first byte
-at which the pickles differ and the reproducing command. Outcomes that do
-not pickle compare by type and parts; `test_parity_check_detects_differences`
-checks that the comparison itself catches perturbations.
+priorities) and a random stack and sequence of captures, and runs it on a
+native and a pure context over the same objects. Pickles, truncation
+counters in key order, node counts, the kinds of what `objects` and
+`_sources` hold in order, and the application hooks run must match. Most
+seeds ending in 3 run 120 to 400 frames from the recursion limit; deep
+chains (seeds ending in 9, and some others) pass the stack budget or reach
+the limit, and where the Python walk reached it the test checks "never
+less" (`_captures_less`) instead of bytes. `PYDUMPLING_PARITY_SEEDS` sets
+the number of seeds (300 by default); a seed reproduces under the same
+`PYTHONHASHSEED`, and a failure prints the command. `test_dump_parity`
+compares whole dumps for 20 seeds, and
+`test_parity_check_detects_differences` checks the comparison itself.
 
-Beyond the random cases, each design decision above has a targeted regression
-test: hand-back points with hook counts equal to the Python walk's, a hand-back
-that starts from the dicts as the call found them, class and state changes
-between calls, copies and pickles, hooks and signals, re-entry, recursion and
-small thread stacks (in child processes), dict changes between calls, a walk
-that captures the dicts themselves, no import during a call, and the collection
-of a context that a class the walker met refers to. Accepted differences are pinned in both walks, so that changing
-either walk's behaviour fails a test; those no other test covers are in
-`tests/test_native_differences.py`. One is not pinned in full: of the C
-recursion limit, only the direction of the shifts (both directions on 3.12 and
-3.13), as their size depends on the value and the stack's layout. One rule has
-no test: that a hand-back takes the ids the call added out of `_namespaces`.
-The Python walk adds them again, but for the id of the dict the walker built
-for a snapshot copy's attributes, and the dict the Python walk builds in its
-place gets the freed one's address in every run tried, so the id is the same
-either way. A context's
-instance dict with a colliding key retires the context, and no test counts the
-Python walk's hooks there: its own `__eq__` count changes over its first runs as
-`LOAD_ATTR` specializes.
+Each decision above also has a targeted test against the Python walk's
+bytes and hooks: each operation run in place, each node run in Python mode,
+captures from inside a call, the native bounds of text and bytes, each
+budget at 1, changes between calls, recursion and small thread stacks in
+child processes, and that no path imports or adds a Python frame. Each
+accepted difference is pinned in both walks, in
+`tests/test_native_differences.py` where no other test covers it; of the C
+recursion limit only the direction per form is pinned.
+`tests/test_native_compat.py` checks in both modes that one state dumps to
+the same bytes twice, that a native dump loads and reports without the
+extension, and that a context holds the same attributes in both modes.
 
-A mutation check on 3.13 covers the rules of the memo: no removal of a call's
-entries on a hand-back, a replaced copy not put back, the type cache hidden
-from the collector, the walker not put back after a hand-back, no placeholder
-while an immutable container fills, an out-of-nodes check that ignores the
-memo, an original not kept in `_sources`, the node count not written, one key
-object for both dicts, and the journal of namespace ids not reset when a call
-starts. Each of the ten fails a test. Two more pass, for the rule without a
-test above: the ids a call added not taken out on a hand-back, and not
-journaled. A wider run (191 mutants) predates the removal
-of the walker's own memo, which most of it covered; the builds of copies and
-the plain reads of a placeholder's `reason` have not been mutated since. A
-test can stop guarding its rule without failing (a later helper of the same
-name in its module can shadow the one it uses), so rerun the mutants a changed
-test covers.
-
-Child interpreters get the repository root on `PYTHONPATH`, so they import
-the checkout from any directory.
-
-Rust tests: unit tests in `address.rs` and `text.rs` (`cargo test
---manifest-path rust/Cargo.toml`). Coverage: build with
+Rust unit tests are in `address.rs` and `text.rs`. For coverage, build with
 `RUSTFLAGS="-C instrument-coverage"` through `build_native.py`, run the
-suite and the parity harness, merge the `.profraw` files with
-`llvm-profdata` and report with `llvm-cov`. It has not been measured since
-the walker's own memo was removed.
+suite and the parity harness, and report with `llvm-profdata` and
+`llvm-cov`. Neither coverage nor the mutation check (last run before the
+memo was removed) has been run on this layout.
 
 ## Performance
 
-Capture is about 2.9 times as fast as the Python walk, and a full
-`save_dumping` about twice (geometric means over six workloads). A
-throwaway context that captures a scalar or a short list of scalars is
-slower natively: the per-call class check and state reading cost more than
-the walk they save.
+### The gate
 
-Environment: CPython 3.13, Apple M5 Pro (macOS, arm64),
-`PYTHONHASHSEED=0`, the six workloads of `rust/bench/workloads.py`: a
-typical small failure, two heavy ones (one with value budgets off), a deep
-stack, a trace through `argparse` and `json` with whole files embedded, and
-a stack over 20 large module namespaces. A fat-LTO release build without
-PGO, on a copy of this branch alone, median of 3 rounds, every build in one
-sitting; from one sitting to the next the Python walk's own times moved by
-up to 6%. Snapshots were byte-identical across implementations throughout.
+The owner's requirement is that a native capture is never slower than the
+Python walk; `rust/bench/never_slower.py` checks it. Each scenario runs in
+fresh child processes, one per mode, native (the extension must load) and
+pure (`PYDUMPLING_NATIVE=0`), with `PYTHONPATH` at the tree and
+`PYTHONHASHSEED=0`, alternating which runs first. A child builds the
+scenario once to hash its content (snapshot pickle, truncation counters in
+order, node count, kinds of what `objects` and `_sources` hold) and once to
+time it (median microseconds per op over at least 20 runs and 1 s).
 
-| Speed-up over the Python walk | Capture | save_dumping |
-| :-- | --: | --: |
-| Geometric mean of per-workload ratios | 2.87x | 1.96x |
-| Sum of per-workload medians | 3.97x | 2.39x |
+A scenario is judged on the median native/pure ratio of its rounds
+(`--rounds`, 3): at most 0.99 passes, at least 1.05 fails, and in between
+it runs alone for 12 more rounds in ABBA order and fails if the median of
+all its rounds exceeds 1.02 (`--tolerance`). Its content must match too;
+in a near-limit scenario (`~`) a round whose pure child reached the limit
+is held to "never less" instead, and reported as shifted when it shows the
+allowed shift. `--baseline DIR` compares this tree's pure walk with
+another tree's, both children pure, by the same rule, near-limit scenarios
+on content. Numbers that count come from an isolated copy: `--isolate DIR`
+copies the checkout with its built extension (without `.git`, `.venv`,
+`rust/target`, `_review`, `rust/migration`, `rust/bench/results` or
+caches) and runs the copy's own script, and every report records a digest
+of the tree it ran from.
 
-The sums are 73.78 ms to 18.58 ms for capture and 98.90 ms to 41.37 ms for
-`save_dumping`; per workload, capture is 1.5 to 5.9 times as fast. Peak RSS
-over the workloads is 72.6 MB natively and 73.9 MB in Python.
+The 49 scenarios cover per-call costs; `_mapping` of a frame namespace from
+20 to 950 frames deep; `from_frame` and `dump_current_traceback`; seven
+tracing and profiling hooks; option and context subclasses; unlimited
+contexts; a 2,000-level list and a 300-object chain on the main thread and
+a 512 KiB thread; a capture in `except RecursionError`; `near_limit_nodes`;
+five dense frames of about 300 non-builtin values each (dataclasses, enums,
+datetimes and str subclasses, namedtuples, `OrderedDict`s, `defaultdict`s
+and `Mapping`s), for the type-fact cache; a `max_depth=100` frame on both
+stacks, for Python mode; and the six workloads of `workloads.py`.
 
-What the memo in the context's own dicts costs. The walker that kept a memo
-of its own, measured in the same sitting, reached 3.43x and 2.08x as
-geometric means, 7.16x and 2.91x as sums, and 60.2 MB. The difference is a
-dict lookup, two dict writes and two key objects per value, so it shows most
-on a large, flat graph: `b2_heavy_nolimits` (152,643 nodes) captures in
-14.6 ms, against 6.5 ms then and 60.7 ms in Python. The second key object,
-which keeps a walk over the dicts themselves in step with the Python walk,
-is about 3% of the geometric mean (2.96x with one key object for both
-dicts) and 4 MB on that workload. An exact tuple or frozenset costs about
-0.28 us, against 0.09 us then and 1.15 us in Python: the walker now builds
-its placeholder at once, as the Python walk does, where it built one only
-when something referred back to the tuple.
+### Native against pure
 
-Not measured again: the speed-up over the Python walk as it was before this
-work (`ed7ae81`), which was 7.4x for capture and 3.0x for `save_dumping`
-with the walker's own memo, and a PGO build, which made that walker's
-capture about 7% faster and `save_dumping` no faster. SIMD has no target
-here; the walk is pointer chasing through Python objects.
+Gate run of 2026-11-16, 00:52 to 01:13 UTC, from an isolated copy (tree
+`cfb27f5659fd1945`): macOS 27 arm64, Apple M5 Pro, fat-LTO release build
+without PGO, CPython 3.13.18 and 3.14.10, load average 0.9 to 1.5. All 49
+scenarios pass on 3.13 and 48 on 3.14, where `call_live_bytes` failed the
+sweep at 1.052 but gives 1.003 alone over 15 rounds (0.989 in a later run);
+both modes run the same Python code for exact bytes. Contents match but
+where the native walk captures more near the limit. Native/pure:
 
-Small values. A memo hit costs about 1.1 us natively against 0.05 us in
-Python (a longer MRO or a metaclass adds to it), and a throwaway context
-that captures a scalar or a short list of scalars is faster in Python.
-Creating a context costs about 2.3 us natively and 1.75 us in Python.
-Creating one and capturing a single value costs, natively against Python:
-an int 4.9 us against 2.05 us, `[1, 2, 3]` 5.2 us against 3.5 us,
-`[1, {"a": "b"}, (2.5,)]` 6.5 us against 6.9 us, a 20-key dict 8.0 us
-against 20.6 us (medians of five rounds of 20,000 contexts, two runs, before
-`_sources` got a key object of its own).
-The walker wins once a value holds containers or many items.
+                                             3.13          3.14
+    six workloads, geometric mean            0.32          0.36
+      per workload                           0.16-0.68     0.19-0.71
+      b2, no budgets, ms native / pure       13.6 / 57.0   13.8 / 48.6
+    _mapping of a typical frame, any depth   0.16          0.19-0.20
+    from_frame, 20 / 700 frames deep         0.42 / 0.47   0.45 / 0.51
+    dump_current_traceback, 20 / 700         0.68 / 0.70   0.69 / 0.71
+    no hook                                  0.42          0.50
+    settrace / setprofile / cProfile         0.27/0.17/0.14  0.27/0.18/0.15
+    sys.monitoring / coverage sysmon, ctrace 0.38/0.41/0.16  0.44/0.49/0.17
+    dense frames                             0.18-0.25     0.21-0.30
+    options subclasses                       0.16-0.17     0.20-0.22
+    context subclass, unlimited (Python)     0.996-1.006   1.004-1.007
+    new context and a small dict             0.48          0.51
+    _mapping({}) on a live context           0.27          0.27
+    other per-call, answered before entry    0.975-1.012   0.981-1.052
+    2,000-level list, main / 512 KiB thread  0.74 / 0.96   0.73 / 0.92
+    300-object chain, main / 512 KiB thread  0.19 / 0.81   0.22 / 0.81
+    max_depth=100 frame, main / 512 KiB      0.18 / 0.21   0.20 / 0.24
+    except RecursionError                    0.31          0.35
+    near_limit_nodes                         0.35          0.44
 
-Deep stacks. A call from a stack too deep for the start check (see
-"Recursion and the native stack") goes to the Python walk and costs about
-2 us more than there, for the checks and the hand-back: 60 small calls from
-700 frames deep take 0.22 ms against 0.10 ms in Python, and
-`dump_current_traceback` from that depth 0.92 ms against 0.68 ms.
+### Pure mode against main
 
-To reproduce (results go to `rust/bench/results/`, which is git-ignored):
+Run of 2026-11-16, 01:13 to 02:07 UTC, same copy, `--baseline` at main
+(`ed7ae81`, from `git archive`), load average 1.3 to 1.7: 43 of 49
+scenarios pass on 3.13 and 44 on 3.14, and all contents match main's (the
+branch's one intended change to the Python walk, that an `islice` bound
+past `sys.maxsize` no longer raises, shows in no scenario). Each FAIL was
+rerun alone and split by source with scratch trees: (a) HEAD against main,
+the PR's committed Python changes; (b) the uncommitted walker hunks
+against (a); (c) the owner's uncommitted hunks against (b). Medians of 15
+rounds, or of 3 at 1.05 or more:
+
+    scenario                 Python  alone  (a)    (b)    (c)
+    call_new_int             3.13    1.326  1.017  0.993  1.311
+                             3.14    1.301  1.008  0.991  1.320
+    call_new_dict            3.13    1.120  1.012  0.994  1.101
+                             3.14    1.110  1.000  0.997  1.113
+    workload_d_stdlib_...    3.13    1.181  1.002  0.999  1.162
+                             3.14    1.189  1.000  0.997  1.180
+    near_limit_nodes         3.13    1.021  0.998  1.016  1.022
+                             3.14    1.024  0.998  1.000  1.023
+    hooks_setprofile         3.13    1.021  1.005  0.999  1.019
+    mapping_d950             3.13    1.022  1.011  0.999  1.005
+    call_live_mapping        3.14    1.019 (passes alone)
+
+Most of it is (c): a new context reads `options.is_unlimited` once more for
+the command line's byte allowance (`SnapshotContext()` takes 2.42 us
+against 1.84 us on 3.13, 2.59 against 1.97 on 3.14), and source embedding
+reads each file again per capture instead of through `linecache`. With the
+allowance derived from `_code_text_limit` and the lines read kept in
+`linecache`, those scenarios come to 1.000 to 1.018 of main, but for
+`hooks_setprofile` on 3.13 at 1.022, whose unchanged control gave 1.018 in
+the same period (load 2.8 to 4.1).
+
+(a) cost `mapping_d950` 1.1% on 3.13: HEAD bounded `islice` with
+`min(limit + 1, sys.maxsize)`, a call per mapping, which the tree has
+replaced with a `ValueError` handler that costs nothing unless raised.
+
+The current tree was rerun against main (isolated copy
+`06a373342c873f0b`, 03:45 to 04:22 UTC, load 2.5 to 10). As it stands:
+`mapping_*` and `call_live_mapping` 1.003 to 1.009 on 3.13 and 1.016 to
+1.024 on 3.14 (four fail in one run, two in another), on 3.13 and 3.14
+`near_limit_nodes` 1.042 and 1.039 and `hooks_setprofile` 1.022 and 1.015,
+and the (c) scenarios as above. With
+the owner's two hunks changed as above, all of those pass on both versions
+but `call_live_mapping` on 3.14 (1.028, then 1.030) and `near_limit_nodes`
+on 3.13 (1.023, then 1.014). An A/A control (04:09 to 04:19, load 3.8 to
+4.9) gave 0.986 to 1.006 for main against a copy of itself, where the tree
+as it stands gave 1.008 to 1.019 for `mapping_d20`, `mapping_d900` and
+`call_live_mapping` and 1.037 to 1.038 for `near_limit_nodes`.
+
+What pure mode itself costs against main is the walker's hook in the
+Python walk: a load of `_native_walk` per `value` of a value that is not an
+exact scalar, a load and an `_unlimited is False` test per `_mapping`, and
+the `try` around `islice`. Counted with `sys.monitoring`, capturing a
+typical frame on a new context runs 37,228 bytecode instructions on main
+and 37,594 on the tree with the owner's hunks changed as above (1.0% more;
+37,724 as the tree stands); in time, up to about 1.5% on 3.13 and 3% on
+3.14 for calls dominated by `_mapping`'s entry. Removing it would take a
+second copy of the walk body or an extra Python frame, which the design
+rules out.
+
+### Reproducing
+
+Not measured on this layout: `save_dumping` as a whole, the native walk
+against main's walk directly, and a PGO build. Results go to the
+git-ignored `rust/bench/results/`:
 
     python rust/build_native.py
-    mkdir -p /tmp/legacy
-    git archive ed7ae81 pydumpling | tar -x -C /tmp/legacy
-    python rust/bench/bench_walk.py --impl legacy \
-        --legacy-root /tmp/legacy --rounds 3 \
-        --json rust/bench/results/legacy.json
-    python rust/bench/bench_walk.py --impl pure --rounds 3 \
-        --json rust/bench/results/pure.json
+    python rust/bench/never_slower.py --isolate /tmp/gate313
+    python rust/bench/never_slower.py --isolate /tmp/gate314 \
+        --python /path/to/python3.14
+    mkdir -p /tmp/main && git archive main | tar -x -C /tmp/main
+    python rust/bench/never_slower.py --isolate /tmp/base \
+        --baseline /tmp/main
     python rust/bench/bench_walk.py --impl native --rounds 3 \
         --json rust/bench/results/native.json
-    python rust/bench/bench_walk.py --compare \
-        rust/bench/results/pure.json rust/bench/results/native.json
-    python rust/bench/bench_walk.py --compare \
-        rust/bench/results/legacy.json rust/bench/results/native.json
 
-Each workload runs in a fresh subprocess per round and is timed for the
-full `save_dumping(strict=True)` and for capture alone, at least
-`--min-runs` (15) runs and `--min-time` (0.5 s) each; peak RSS is
-`ru_maxrss`. `--compare BASE OTHER` prints speed-ups (BASE / OTHER) per
-workload and as sums and geometric means, and whether the capture pickles,
-node counts and truncation counters match. `--impl native` fails if a
-context has no walker. See `--help` for `--workloads` and `--hash-seed`.
-A PGO build passes `-Cprofile-generate=DIR` through `RUSTFLAGS`, runs the
-benchmark and the tests, merges with `llvm-profdata merge`, and rebuilds
-with `-Cprofile-use=FILE`.
+`--scenarios` takes names or glob patterns and `--list` lists them.
+`bench_walk.py` times `save_dumping(strict=True)` and capture alone per
+workload in a fresh subprocess, for `--impl legacy`, `pure` or `native`;
+see its `--help`. A PGO build passes `-Cprofile-generate=DIR` through
+`RUSTFLAGS`, runs the benchmark and the tests, merges with
+`llvm-profdata merge` and rebuilds with `-Cprofile-use=FILE`.
 
 ## Open problems
 
-- Packaging. `build_native.py` builds in place and the wheel stays pure
-  Python. Shipping the extension needs maturin or cibuildwheel and
-  per-platform abi3 wheels: a release decision.
-- Platforms. The extension has been built and run locally on macOS arm64
-  only; Linux and Windows are left to CI's `native` job.
-- Free-threaded CPython uses the Python walk (see "Build and supported
-  range"); the walker would need to work without the GIL.
-- Stack budget (see "Recursion and the native stack"): deep
-  `max_depth=None` captures beyond roughly 90-220 levels run in Python, as
-  does any capture from a stack too deep for the walker's looks to show
-  room.
-- Per-call overhead (see "Performance"): a memo hit costs about twenty
-  times as much as in Python, so small contexts lose.
-- Placeholders of exact tuples and frozensets (see "Performance"). Building
-  one only when something refers back to the container would bring a
-  tuple's cost near a list's, about 0.09 us, for a marker in `objects`
-  while the container fills and a pass that names the unfilled ones when
-  an error ends the call.
+- For the owner: the accepted differences; the "never less" definition;
+  what pure mode costs against main (up to about 3% on 3.14 for calls
+  dominated by `_mapping`'s entry, over the 2% allowed); and the gate's
+  rule, under which one noisy sweep at 1.05 fails a scenario that passes
+  alone.
+- The owner's uncommitted hunks cost both modes about 0.6 us per new
+  context, and source embedding rereads files ("Pure mode against main").
+- Past the stack budget a deep value runs in Python mode at the Python
+  walk's cost, and application code the walker runs has up to the budget
+  of native frames beneath it ("The C recursion limit").
+- The entry's C level and `operator.iadd`'s on 3.12 and 3.13: an in-place
+  add through `PyNumber_InPlaceAdd` would take one back; PyO3's safe API
+  has none.
+- Placeholders of exact tuples and frozensets: building one only when
+  something refers back to the container would bring a tuple's cost near a
+  list's.
+- Packaging needs maturin or cibuildwheel and per-platform abi3 wheels, a
+  release decision; the extension has run locally on macOS arm64 only.
+- Free-threaded CPython runs the Python walk; the walker would need to work
+  without the GIL.
