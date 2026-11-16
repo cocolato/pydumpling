@@ -2558,7 +2558,9 @@ def test_small_thread_stack(stack_kib):
     everything under it, to the Python walk in place, once. Either way a
     600-level list, where the Python walk has room, is captured as there,
     and a 3000-level one, where it overflows, leaves no more ``'recursion'``
-    placeholders."""
+    placeholders. On Windows the size ``threading.stack_size`` sets is the
+    stack a thread commits as it starts, while the stack it reserves comes
+    from the executable, so the walker finds room for the whole walk."""
     process = subprocess.run(
         [sys.executable, "-c", _THREAD_SCRIPT, str(stack_kib)],
         capture_output=True,
@@ -2571,6 +2573,8 @@ def test_small_thread_stack(stack_kib):
     assert found["600"]["same"]
     native, pure = found["3000"]["recursion"]
     assert native <= pure == 1
+    if sys.platform == "win32":
+        return
     if stack_kib == 512:
         assert found["600"]["fallbacks"] == 1
     else:

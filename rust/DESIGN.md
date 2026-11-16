@@ -378,7 +378,10 @@ reserve and half of the rest are left for what runs beneath the walk:
 application code, Python mode, collections, finalizers, and from 3.14
 CPython's own C stack checks. A budget under 32 KiB, that is less than
 192 KiB left, sends the call to the Python walk without retiring the
-context. Cold paths (Python mode, the signal check, a state attribute's
+context. On Windows, `threading.stack_size` sets the stack a thread
+commits as it starts, and the stack it reserves, which is what the walker
+measures, comes from the executable, so a "small" thread there has the
+budget of any other. Cold paths (Python mode, the signal check, a state attribute's
 first read) are out of line, so their locals take no room in every level's
 frame.
 
