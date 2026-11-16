@@ -119,6 +119,9 @@ pub(crate) struct Statics {
     /// context's instance dict, from [`dict_getter`]: for the one mapping
     /// the walk compares with it ([`crate::mapping`]).
     pub instance_dict: Py<PyAny>,
+    /// `gc.get_referents`, which walks an object's references without
+    /// making its instance dict: whether that dict exists already.
+    pub referents: Py<PyAny>,
     /// `object`.
     pub object: Py<PyAny>,
     /// `DumpOptions`, whether the walker reads its instances' budgets
@@ -262,6 +265,7 @@ impl Statics {
             class_qualname: getter("_CLASS_QUALNAME")?.unbind(),
             recursive_immutable: global("_RECURSIVE_IMMUTABLE")?.unbind(),
             instance_dict: dict_getter(&mixin)?.unbind(),
+            referents: py.import("gc")?.getattr("get_referents")?.unbind(),
             object: builtin("object")?.unbind(),
             dump_options: address(&options),
             dump_options_read: false,

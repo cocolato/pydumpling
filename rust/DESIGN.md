@@ -239,26 +239,27 @@ walk does: `objects`, `_nodes`, `options` and the four budgets when the call
 starts; `_sources`, `_truncation`, `_namespaces`, `_node_marker`,
 `_layouts`, `_code_text_limit` and `_unlimited` where the call first needs
 each, which is where the Python walk first reads it. Each is read once per
-call, and only `_nodes` again, after Python code. On a judged class these
-reads run no code.
+call, and only `_nodes` again: after Python code, and for a captured dict
+that holds a `_nodes` key while the context does not hold the walk's count
+(below). On a judged class these reads run no code.
 
 The walker reads `ctx.__dict__` itself in two cases only, both rare. One
 is to tell whether a mapping it captures is the context's own dict
-("Capturing again from inside a call"): only for an exact dict that holds
-the interned str `"_nodes"` (an attribute name, or a literal) as a key
-while the context does not hold the walk's count, whose `_nodes` is the
-object the context holds and whose `objects` is the context's, both read
-as attributes. That is the context's own dict or a copy of it, both made
-from that dict already, or a selection that a budget cut before
-`objects`. The other is to retire an instance of a class not judged,
-whose flag it writes there. The Python walk never reads it. Reading it
-makes the instance dict exist (3.12 to 3.15), after which attribute stores
-on that context take about twice as long, and on 3.12 loads too. When any
-object with a `_nodes` attribute, such as another context, made the walker
-read it, later calls of a small value on that context took 1.27 to 1.33
-times as long natively as in the Python walk on 3.12 and 1.2 times on
-3.14; with the checks above they cost the same in both walks
-(2026-11-16).
+("Capturing again from inside a call"): only for a dict that holds the
+interned str `"_nodes"` (an attribute name, or a literal) as a key while
+the context does not hold the walk's count, whose `_nodes` is the object
+the context holds (read as an attribute), and which the context's own
+references hold, as `gc.get_referents` walks them. That walk does not make
+the dict, and holds it only once it exists; then reading it makes nothing.
+The other is to retire an instance of a class not judged, whose flag it
+writes there. The Python walk never reads it. Reading it makes the
+instance dict exist (3.12 to 3.15), after which attribute stores on that
+context take about twice as long, and on 3.12 loads too. When an object
+with a `_nodes` attribute, such as another context, made the walker read
+it, later calls of a small value on that context took 1.2 to 1.33 times
+as long natively as in the Python walk on 3.12 and 3.14 (2026-11-16).
+Only a dict the context itself holds as an attribute, with a `_nodes` key
+that holds the context's count, still makes it.
 
 The budgets are read as attributes of options whose type passes a check
 made once per type (for `DumpOptions` at import, and kept for up to 64
@@ -579,7 +580,12 @@ problems").
   call, it cost 7 times the Python walk's time for a value on a context
   holding 2,000 layouts, and 1.13 times for a 2,000-frame stack whose
   frames each hold an instance of a record type of their own
-  (`call_live_subclass`, `record_stack_d2000`, 3.13).
+  (`call_live_subclass`, `record_stack_d2000`, 3.13). A context's instance
+  dict that application code replaced with one whose `_nodes` key is an
+  equal str, not the interned one, holds the count of the last sync when
+  the walker captures it from inside a call, where the Python walk's copy
+  holds the running count. The walker looks for that key by identity only,
+  which keeps a str comparison off every key of every mapping it captures.
 - **A class changed mid-call may be seen late.** One changed by
   application code the walker runs is seen at once, as the walker then
   drops its type facts. One changed between synced points (its

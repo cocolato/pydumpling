@@ -11,7 +11,7 @@
 use pyo3::exceptions::{PyRecursionError, PyRuntimeError, PyTypeError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PySet};
+use pyo3::types::{PyDict, PyList, PySet};
 
 use crate::address::AddressMap;
 use crate::keys::{pair, Chosen};
@@ -199,7 +199,6 @@ impl State {
             cap: limit.map(|limit| limit.saturating_add(1)),
         };
         self.select(py, source, &view, ordered, preferred, &mut chosen)?;
-        self.own_count(py, source, &mut chosen)?;
         if ordered {
             // Link order gave keys only; read their values from the view.
             let mut remaining = chosen.entries.len();
@@ -216,6 +215,7 @@ impl State {
                 }
             }
         }
+        self.own_count(py, source, &mut chosen)?;
         let target = captured.cast::<PyDict>().map_err(PyErr::from)?;
         let mut count = 0;
         for (key, item) in chosen.entries {
@@ -256,13 +256,13 @@ impl State {
     /// holds the running count when the Python walk reads its entries, so
     /// the walk writes it there and takes it. Only a selected key that is
     /// the interned `"_nodes"`, the very object attribute names are, while
-    /// the count is not written, can make `source` that dict. It is then an
-    /// exact dict whose `_nodes` is the object the context holds and whose
-    /// `objects` is the context's; both are read as attributes, which
-    /// leaves the dict unmade. Only a mapping that passes (that dict, or a
-    /// copy of it, both made from the dict) sends the walker to read the
-    /// dict and compare it with `source`; reading it makes the dict exist,
-    /// which the Python walk never does (`rust/DESIGN.md`, "State reads").
+    /// the count is not written, can make `source` that dict; its value is
+    /// then the object the context holds, read as an attribute. The dict
+    /// exists if `source` is it, and the context's references, which
+    /// `gc.get_referents` walks without making the dict, then hold it; only
+    /// then does the walker read the dict and compare it with `source`.
+    /// Reading a dict that does not exist makes it, which the Python walk
+    /// never does (`rust/DESIGN.md`, "State reads").
     fn own_count<'py>(
         &mut self,
         py: Python<'py>,
@@ -279,32 +279,18 @@ impl State {
         let Some(found) = &chosen.entries[slot].1 else {
             return Ok(());
         };
-        if type_address(source) != self.s.dict {
+        if !source.is_instance_of::<PyDict>() {
             return Ok(());
         }
         let ctx = self.ctx(py).clone();
         if !found.is(&ctx.getattr(name)?) {
             return Ok(());
         }
-        // A small int is one object wherever it is held, so `_nodes` alone
-        // passes another context's dict, or an object's, that holds the
-        // same count. `objects` tells them apart; a selection cut short by
-        // a budget may leave it out, and only then is the dict read.
-        let memo = intern!(py, "objects");
-        match chosen.entries.iter().find(|(key, _)| key.is(memo)) {
-            Some((_, Some(objects))) => {
-                if !objects.is(&ctx.getattr(memo)?) {
-                    return Ok(());
-                }
-            }
-            Some((_, None)) => return Ok(()),
-            None => {
-                if chosen.entries.len() >= source.len()? {
-                    return Ok(());
-                }
-            }
-        }
-        if !source.is(&fresh_dict(&self.s.instance_dict, &ctx)?) {
+        let referents = self.s.referents.bind(py).call1((&ctx,))?;
+        let held = referents.cast_into::<PyList>().map_err(PyErr::from)?;
+        if !held.iter().any(|referent| referent.is(source))
+            || !source.is(&fresh_dict(&self.s.instance_dict, &ctx)?)
+        {
             return Ok(());
         }
         let count = self.nodes.into_pyobject(py)?.into_any();

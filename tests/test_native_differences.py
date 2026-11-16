@@ -1323,3 +1323,40 @@ def test_audit_events_of_a_capture():
         "subclasses native": [{"builtins.id": 1}, 0],
         "subclasses python": [{"builtins.id": 50}, 0],
     }
+
+
+def test_a_replaced_instance_dict_with_an_equal_nodes_key():
+    """Application code that replaces a context's instance dict with one
+    whose ``_nodes`` key is an equal str, not the interned one every
+    attribute name is: a capture of that dict from inside a call holds the
+    count as of the walker's last sync natively, and the running count in
+    the Python walk. The walker looks for the count under the interned name
+    only. The walk is set on each class, so both dicts hold the same keys.
+    The copies then differ, and with them what later ints of the dict find
+    in ``objects``."""
+
+    class Native(SnapshotContext):
+        pass
+
+    class Pure(SnapshotContext):
+        pass
+
+    Pure._native_walk = False
+    found = {}
+    for cls in (Pure, Native):
+        context = cls(DumpOptions())
+        assert context._native_walk is (cls is Native)
+        context.value([1])
+        start = context._nodes
+        equal = "".join(["_no", "des"])
+        assert equal == "_nodes" and equal is not "_nodes"  # noqa: F632
+        context.__dict__ = {
+            (equal if name == "_nodes" else name): held
+            for name, held in vars(context).items()
+        }
+        captured = context.value([[1, 2], vars(context)])
+        found[cls] = captured[1]["_nodes"] - start
+    # Natively the count ``value`` wrote before the walker's entry, for the
+    # list; in Python the count as the walk reaches that entry.
+    assert found[Native] == 1
+    assert found[Pure] > 1

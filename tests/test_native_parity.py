@@ -6301,35 +6301,82 @@ def _has_instance_dict(context):
 
 
 @pytest.mark.parametrize("native", [False, True], ids=["pure", "native"])
-@pytest.mark.parametrize("holder", ["attributes", "dict", "context"])
+@pytest.mark.parametrize(
+    "holder", ["attributes", "dict", "context", "namespace", "cut"]
+)
 def test_a_nodes_key_leaves_the_context_s_dict_unmade(native, holder):
     """A captured mapping with a ``_nodes`` key holding the very int the
-    context holds (an object's attributes, a dict, another context) leaves
-    the context's instance dict unmade, as in the Python walk. Only the
-    context's own dict, or a copy made from it, sends the walker to read
-    ``ctx.__dict__``. Small ints are one object each, so one of the counts
-    below is the one the context holds while the walk selects that key."""
+    context holds when the walk reaches it (an object's attributes, a dict,
+    another context, an exec namespace whose ``__builtins__`` the selection
+    skips, a selection cut by ``max_items``) leaves the context's instance
+    dict unmade, as in the Python walk. Only the context's own dict, which
+    then exists, sends the walker to read ``ctx.__dict__``."""
+    options = DumpOptions(max_items=2) if holder == "cut" else DumpOptions()
     with _mode(native):
-        context = SnapshotContext(DumpOptions())
-        others = [SnapshotContext(DumpOptions()) for _ in range(32)]
+        context = SnapshotContext(options)
+        other = SnapshotContext(DumpOptions())
     _check_walker(context, native)
-    held = []
-    for count, other in enumerate(others):
-        if holder == "attributes":
+    for _ in range(3):
+        # ``value`` counts the root before the walker's entry; a small int
+        # is one object wherever it is held.
+        held = context._nodes + 1
+        assert held < 256
+        if holder in ("attributes", "cut"):
             value = _Plain()
-            value._nodes = count
-            value.count = 1
+            value._nodes = held
+            value.a, value.b, value.c = 1, 2, 3
         elif holder == "dict":
-            value = {"_nodes": count, "count": 1}
+            value = {"_nodes": held, "count": 1}
+        elif holder == "namespace":
+            value = {"__builtins__": builtins, "_nodes": held, "x": [1, 2]}
         else:
             value = other
-            value._nodes = count
-        held.append(value)
-    assert not _has_instance_dict(context)
-    context.value([[1, 2], held])
+            value._nodes = held
+        assert not _has_instance_dict(context)
+        # Inside a list, so the walker counts on past the count it started
+        # from before it reaches the mapping.
+        context.value([value])
     assert not _has_instance_dict(context)
     vars(context)
     assert _has_instance_dict(context)
+
+
+@pytest.mark.parametrize("kind", ["dict", "dict subclass", "OrderedDict"])
+def test_a_replaced_instance_dict_captured_inside_a_call(kind):
+    """Application code may replace a context's instance dict with another
+    dict, a dict subclass or an ``OrderedDict``. A capture of that dict from
+    inside a call shows the running count in it, as in the Python walk. The
+    walk is set on each class, so both instance dicts hold the same keys."""
+
+    class Replaced(dict):
+        pass
+
+    made = {"dict": dict, "dict subclass": Replaced, "OrderedDict": OrderedDict}
+
+    class Native(SnapshotContext):
+        pass
+
+    class Pure(SnapshotContext):
+        pass
+
+    Pure._native_walk = False
+    found = {}
+    for cls in (Pure, Native):
+        context = cls(DumpOptions())
+        assert context._native_walk is (cls is Native)
+        assert "_native_walk" not in vars(context)
+        context.__dict__ = made[kind](vars(context))
+        first = context.value([[1, 2], context.__dict__])
+        second = context.value([[3], [4, 5], vars(context)])
+        found[cls] = _Outcome(
+            [first[1]["_nodes"], second[2]["_nodes"]],
+            list(context._truncation.items()),
+            context._nodes,
+            [],
+            _memo(context),
+        )
+    assert found[Native].blob == found[Pure].blob, (found[Native], found[Pure])
+    assert found[Native].results[0] > 1
 
 
 def test_namespaces_after_application_code_mid_call():
