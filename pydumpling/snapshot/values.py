@@ -588,14 +588,12 @@ _NATIVE_STATE = (
 # extension loaded (``_stock``), and on each subclass whose walk attributes
 # are that class's; False on a subclass that overrides a walk method, an
 # attribute hook or a state attribute, whose walk only this module runs, and
-# on its subclasses.  ``_native_walk_class`` names the class it was chosen for:
-# ``SnapshotContext.__init__`` chooses it for a class whose
-# ``__init_subclass__`` chain never reached ``ValuesMixin``'s, and the
-# walker's entries check it, so an instance of such a class that no
-# ``__init__`` judged (unpickled, made by ``object.__new__``, or given the
-# class by assigning ``__class__``) captures in Python.  An instance set to
-# False captures in Python: the walker sets it so for a context whose state
-# or arguments it does not mirror, or whose class was not judged.  Changes to
+# on its subclasses.  ``_native_walk_class`` names the class it was chosen for.
+# The walker's entries check it and choose the walk, at its first native
+# call, of a class whose ``__init_subclass__`` chain never reached
+# ``ValuesMixin``'s, so ``SnapshotContext.__init__`` checks nothing.  An
+# instance set to False captures in Python: the walker sets it so for a
+# context whose state or arguments it does not mirror.  Changes to
 # a class after it was chosen are not seen.  An unlimited context, where
 # probing each original with the serializer dominates the cost, is never
 # offered to the walker (``value`` reads ``_unlimited`` first, ``_mapping``
@@ -654,7 +652,9 @@ def _choose_walk(cls):
     any other value it sets is replaced.  ``_native_walk_class`` records
     that the class was judged.  Class dicts are read through
     ``type.__dict__``, and both are set through ``type``, so no hook of a
-    metaclass, nor the value's own code, runs.
+    metaclass, nor the value's own code, runs.  Returns whether the class
+    keeps the walk it inherits, which the walker's entries, judging a class
+    at its first native call, read as "go on natively".
     """
     own = _CLASS_DICT.__get__(cls, type(cls)).get("_native_walk", _UNMEMOIZED)
     walk = _walk_methods(cls) if _STOCK_WALK is not None else None
@@ -666,6 +666,7 @@ def _choose_walk(cls):
     elif own is not _UNMEMOIZED and own is not False and own is not True:
         type.__setattr__(cls, "_native_walk", True)
     type.__setattr__(cls, "_native_walk_class", cls)
+    return stock and own is not False
 
 
 def _frame_locals_type():

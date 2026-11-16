@@ -2351,8 +2351,10 @@ def test_overriding_a_walk_method_keeps_the_python_walk():
 def test_a_class_past_a_non_cooperative_init_subclass():
     """A context class whose MRO puts a base whose ``__init_subclass__`` does
     not call ``super()`` ahead of ``ValuesMixin`` is judged at its first
-    instance: one that overrides a walk method captures in Python, which
-    calls it, and one that changes nothing captures natively."""
+    native call, not by ``__init__``, which checks nothing: one that
+    overrides a walk method captures in Python, which calls it, from that
+    call on, and one that changes nothing captures natively, that call
+    too."""
     registered = []
 
     class Registering:
@@ -2368,15 +2370,21 @@ def test_a_class_past_a_non_cooperative_init_subclass():
 
     assert registered == [Redacting, Composed]
     assert Redacting._native_walk_class is SnapshotContext
-    before = _fallbacks()
     with _mode(True):
         redacting = Redacting(DumpOptions())
         composed = Composed(DumpOptions())
-    assert (Redacting._native_walk, Composed._native_walk) == (False, True)
+    assert "_native_walk_class" not in vars(Redacting)
+    assert "_native_walk_class" not in vars(Composed)
+    before = _fallbacks()
+    assert redacting.value({"key": ["secret"]}) == {"<redacted>": ["<redacted>"]}
+    assert _fallbacks() == before + 1
     assert redacting.value({"key": ["secret"]}) == {"<redacted>": ["<redacted>"]}
     composed.value([1])
+    assert (Redacting._native_walk, Composed._native_walk) == (False, True)
+    assert vars(Redacting)["_native_walk_class"] is Redacting
+    assert vars(Composed)["_native_walk_class"] is Composed
     assert composed._native_walk
-    assert _fallbacks() == before
+    assert _fallbacks() == before + 1
 
 
 def _child_environment():
@@ -6525,7 +6533,7 @@ def test_namespaces_after_application_code_mid_call():
     assert native.results[2] == ([True, True, True, False], 3)
 
 
-# --- A class no ``__init__`` judged -------------------------------------------
+# --- A class nothing judged ---------------------------------------------------
 
 
 def _unjudged(log):
@@ -6548,11 +6556,12 @@ def _unjudged(log):
 
 @pytest.mark.parametrize("how", ["__class__", "object.__new__", "copy"])
 def test_a_class_no_init_judged_captures_in_python(how):
-    """An instance that reaches a class no ``__init__`` judged, by assigning
+    """An instance that reaches a class nothing judged, by assigning
     ``__class__``, through ``object.__new__`` or as a copy, captures in
-    Python, which calls the class's own walk method: the walker's entries
-    find the class was not judged and give the context to the Python walk
-    before anything of the class runs."""
+    Python, which calls the class's own walk method: the walker's entry
+    finds the class was not judged and judges it before anything of the
+    class runs, and as it overrides a walk method, gives the call to the
+    Python walk, and the class every later one."""
     data = {"key": ["secret", "x" * 20], "other": [1, (2,)]}
     outcomes = {}
     for native in (False, True):
@@ -6572,11 +6581,56 @@ def test_a_class_no_init_judged_captures_in_python(how):
         state = (results, list(context._truncation.items()), context._nodes)
         outcomes[native] = (pickle.dumps(state, protocol=5), list(log))
         assert context._native_walk is False
-        assert Masking._native_walk_class is not Masking
+        assert (vars(Masking).get("_native_walk_class") is Masking) is native
         if native:
+            assert "_native_walk" not in vars(context)
             assert _fallbacks() == before + 1
     assert outcomes[True] == outcomes[False]
     assert "secret" in outcomes[True][1]
+
+
+@pytest.mark.parametrize("override", [False, True], ids=["stock", "override"])
+def test_a_class_judged_near_the_recursion_limit(override):
+    """Judging a class at its first native call calls ``_choose_walk``, one
+    Python call. Where the stack has no room for it, the call goes to the
+    Python walk, so a capture of a class nothing judged never raises where
+    the Python walk returns, and then captures the same. A class that
+    overrides a walk method captures in Python in both modes, raising where
+    the Python walk raises."""
+    # One level, so the Python walk needs fewer frames than judging does.
+    data = [1, "x" * 20]
+    left = {}
+    for native in (False, True):
+        for frames in range(1, 40):
+
+            def capture():
+                class Registering:
+                    def __init_subclass__(cls, **kwargs):
+                        pass
+
+                namespace = {"_text": lambda self, value: "<masked>"}
+                masked = type(
+                    "Masked",
+                    (Registering, SnapshotContext),
+                    namespace if override else {},
+                )
+                with _mode(native):
+                    context = masked(DumpOptions())
+
+                def run():
+                    try:
+                        return context.value(data)
+                    except RecursionError:
+                        return "raised"
+
+                return _beneath(frames, run)
+
+            left.setdefault(frames, {})[native] = pickle.dumps(capture(), protocol=5)
+    raised = pickle.dumps("raised", protocol=5)
+    assert any(found[False] == raised for found in left.values())
+    for frames, found in left.items():
+        if override or found[False] != raised:
+            assert found[True] == found[False], frames
 
 
 _UNJUDGED_MODULE = """

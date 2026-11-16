@@ -4,8 +4,8 @@
 //! On a context whose class captures natively (`_native_walk`, chosen once
 //! per class), each of the two methods calls its entry here first, bound as
 //! `_STATICS.value` and `_STATICS.mapping`. An entry checks that the class
-//! was judged ([`Statics::judged`]), retiring an instance of one that was
-//! not, reads the context's state anew and walks. It returns the copy,
+//! was judged ([`Statics::judged`]), judging one that was not ([`judge`]),
+//! reads the context's state anew and walks. It returns the copy,
 //! raises what the Python walk would raise, or returns `_IN_PYTHON` when it
 //! decides, before the call has done anything, that the call is the Python
 //! walk's; the method then runs the call itself, in its own frame. Once the
@@ -23,14 +23,13 @@
 use std::ptr::addr_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pyo3::exceptions::PyAttributeError;
+use pyo3::exceptions::{PyAttributeError, PyRecursionError};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::state::State;
 use crate::statics::{type_address, Statics};
-use crate::types::fresh_dict;
 
 /// Why the walk stopped early.
 pub(crate) enum Halt {
@@ -93,17 +92,24 @@ pub(crate) fn retire<'py>(s: &Statics, ctx: &Bound<'py, PyAny>) -> PyResult<Boun
     Ok(in_python(py, s))
 }
 
-/// [`retire`] for a context whose class was never judged
-/// ([`Statics::judged`]), before anything of the class runs: the flag is
-/// written into the instance dict, past a `__setattr__` nothing compared
-/// with the stock one, which makes that dict exist. Out of line, as no
-/// stock context comes here.
+/// Judges the class of a context whose class was never judged
+/// ([`Statics::judged`]), one created past `ValuesMixin.__init_subclass__`,
+/// at its first native call, as `__init_subclass__` would have, before
+/// anything of the class runs: whether the call goes on natively. A class
+/// that does not keep the native walk now holds `_native_walk = False`, so
+/// its instances call no entry again. Judging calls `_choose_walk`, one
+/// Python call; where the stack has no room for it, the call goes to the
+/// Python walk, which has room for its own frames, and the class is judged
+/// at a later call. Out of line, as no stock context comes here.
 #[cold]
 #[inline(never)]
-fn unjudged<'py>(s: &Statics, ctx: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+fn judge(s: &Statics, ctx: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = ctx.py();
-    fresh_dict(&s.instance_dict, ctx)?.set_item(intern!(py, "_native_walk"), false)?;
-    Ok(in_python(py, s))
+    match s.choose_walk.bind(py).call1((ctx.get_type(),)) {
+        Ok(native) => native.is_truthy(),
+        Err(err) if err.is_instance_of::<PyRecursionError>(py) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// An exact int depth the walk can add to without overflow.
@@ -315,8 +321,8 @@ impl StaticsHandle {
         depth: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let s = self.table;
-        if !s.judged(ctx)? {
-            return unjudged(s, ctx);
+        if !s.judged(ctx)? && !judge(s, ctx)? {
+            return Ok(in_python(ctx.py(), s));
         }
         let Some(depth) = exact_depth(s, depth) else {
             // A depth pydumpling's own callers never pass.
@@ -343,8 +349,8 @@ impl StaticsHandle {
     ) -> PyResult<Bound<'py, PyAny>> {
         let s = self.table;
         let py = ctx.py();
-        if !s.judged(ctx)? {
-            return unjudged(s, ctx);
+        if !s.judged(ctx)? && !judge(s, ctx)? {
+            return Ok(in_python(py, s));
         }
         let counted = match counted {
             flag if flag.is(s.true_.bind(py)) => Some(true),

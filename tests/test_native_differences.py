@@ -639,7 +639,7 @@ def test_hooks_patched_onto_dump_options_later(monkeypatch, hook):
 class _Registering:
     """A base whose ``__init_subclass__`` does not call ``super()``: a context
     class on it is created past ``ValuesMixin.__init_subclass__``, and no
-    walk is chosen for it until its first ``__init__``."""
+    walk is chosen for it until its first native call."""
 
     def __init_subclass__(cls, **kwargs):
         pass
@@ -656,13 +656,13 @@ class _Getting:
 @pytest.mark.parametrize("planted", ["a key", "a descriptor"])
 @pytest.mark.parametrize("how", ["__init__", "__class__"])
 def test_a_name_planted_on_a_class_not_judged(planted, how):
-    """To tell whether a context class was judged, a native context reads
-    ``_native_walk_class`` from it: at the first ``__init__`` of a class
-    created past ``ValuesMixin.__init_subclass__``, and at the walker's
-    entry for an instance given such a class by assigning ``__class__``.
-    There a key planted in the class dict that hashes like the name runs its
-    ``__eq__``, and a descriptor defined under the name its ``__get__``. The
-    Python walk never reads the name. The captures are the same."""
+    """To tell whether a context class was judged, the walker's entries read
+    ``_native_walk_class`` from it, and judging a class created past
+    ``ValuesMixin.__init_subclass__`` at its first native call writes the
+    name. There a key planted in the class dict that hashes like the name
+    runs its ``__eq__``, and a descriptor defined under the name its
+    ``__get__``. The Python walk never reads the name. The captures are the
+    same."""
     found = {}
     for native in (False, True):
         if planted == "a key":

@@ -91,9 +91,11 @@ the extension every context captures in the Python walk: pure mode.
 loaded, `values._stock`, called at the end of `context.py`, sets it `True`
 on `SnapshotContext` and records that class's walk attributes as
 `_STOCK_WALK`. `_choose_walk` judges every other class once, from
-`ValuesMixin.__init_subclass__`, or from `SnapshotContext.__init__` at the
-first instance of a class whose bases' `__init_subclass__` never reached
-`ValuesMixin`'s (`_native_walk_class` names the class judged). For each
+`ValuesMixin.__init_subclass__`, or from a native entry at the first native
+call on a class whose bases' `__init_subclass__` never reached
+`ValuesMixin`'s (`_native_walk_class` names the class judged), so
+`SnapshotContext.__init__` checks nothing: it did, and a new context took
+1.5% longer to make natively than in the Python walk. For each
 name in `_NATIVE_WALK` (17 walk methods), `_STATE_ACCESS`
 (`__getattribute__`, `__getattr__`, `__setattr__`, `__delattr__`) and
 `_NATIVE_STATE` (ten state names), it compares by identity the raw class
@@ -116,15 +118,11 @@ Python walk reproduces: an argument shape pydumpling's callers never pass
 (a depth that is not an exact int or exceeds 2**62 in magnitude, a
 `priority` that is not an exact tuple, list, set or frozenset of exact
 strs, `counted` other than `True` or `False`, a `container` other than
-`dict` or `FakeDict`); a class not judged, whose `_native_walk_class` is
-not the class itself (an instance unpickled, made by `object.__new__` or
-given by assigning `__class__` a class created past
-`ValuesMixin.__init_subclass__`, which no `__init__` judged); `objects`,
-`_nodes` or `options` missing, `objects` not an exact dict, or `_nodes`
-not an exact int from 0 to 2**64 - 1; options the walker does not read
-("State reads"), or a budget missing or not `None` or a positive exact
-int; `_unlimited` other than `False` (`value` offers a call where it is
-any false value). Other state of another kind does not retire (a
+`dict` or `FakeDict`); `objects`, `_nodes` or `options` missing,
+`objects` not an exact dict, or `_nodes` not an exact int from 0 to
+2**64 - 1; options the walker does not read ("State reads"), or a budget
+missing or not `None` or a positive exact int; `_unlimited` other than
+`False` (`value` offers a call where it is any false value). Other state of another kind does not retire (a
 `_truncation` that is not an exact `Counter` of exact str keys and int
 tallies, `_sources` that is not an exact dict or is `objects` itself,
 `_namespaces` not an exact set, `_layouts` not an exact dict, an unusual
@@ -222,9 +220,12 @@ walk alone would.
 An entry first checks that the context's class was judged: the class
 `_stock` named, or one whose `_native_walk_class` names itself, read
 through the MRO, or from the class's own dict under a metaclass other than
-`type`; otherwise it retires the context ("Per instance"). On a class not
-judged, that read runs the code of a key or descriptor planted under the
-name, which the Python walk never reads ("Accepted differences"). It
+`type`; otherwise it judges the class with `_choose_walk`, and gives the
+call to the Python walk if the class does not keep the native walk, or if
+the stack has no room for that one Python call (the class is then judged
+at a later call). On a class not judged, that read runs the code of a key
+or descriptor planted under the name, which the Python walk never reads
+("Accepted differences"). It
 returns the copy, raises what the Python walk would raise, or returns
 `_IN_PYTHON` before the call has done anything. When an exception ends a
 call, the walker writes `_nodes` and raises, keeping what it did, as the
@@ -263,8 +264,7 @@ reads `ctx.__dict__` for this. Reading it makes the instance dict exist
 twice as long, and on 3.12 loads too: when an object with a `_nodes`
 attribute made an earlier build read it, later calls of a small value on
 that context took 1.2 to 1.33 times as long natively as in the Python walk
-on 3.12 and 3.14 (2026-11-16). The walker reads it only to retire an
-instance of a class not judged, whose flag it writes there.
+on 3.12 and 3.14 (2026-11-16).
 
 The budgets are read as attributes of options whose type passes a check
 made once per type (for `DumpOptions` at import, and kept for up to 64
@@ -538,11 +538,10 @@ problems").
   restores the stock attributes. To have a change run, set
   `PYDUMPLING_NATIVE=0` or `_native_walk = False`, or subclass after it.
   To tell whether a class was judged, pydumpling reads its private
-  `_native_walk_class` from it, natively only: at the first
-  `SnapshotContext.__init__` of a class created past
-  `ValuesMixin.__init_subclass__`, which then writes the name, and at a
-  native entry for an instance that reached such a class without
-  `__init__`. A key planted in the dict of such a class, or of a base ahead
+  `_native_walk_class` from it, natively only: at each native entry, and
+  judging a class created past `ValuesMixin.__init_subclass__` at its first
+  native call writes the name. A key planted in the dict of such a class,
+  or of a base ahead
   of `SnapshotContext`, that hashes like the name runs its `__eq__` there,
   once to three times, and a descriptor defined under the name its
   `__get__`, once (at an entry, under the metaclass `type` only). The
@@ -656,7 +655,7 @@ exception whose arguments hold one differs between dumps.
 
     lib.rs        module `pydumpling._native`: `Statics`, `fingerprint`
     walker.rs     the Statics handle and its entries `value` and `mapping`:
-                  argument checks, the judged check, retiring, the stack
+                  argument checks, judging a class, retiring, the stack
                   budget; the sync of `_nodes` around Python code
                   (`application`), Python mode (`python_value`); the
                   fallback counter

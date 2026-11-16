@@ -115,10 +115,9 @@ pub(crate) struct Statics {
     /// The reason of an immutable container's placeholder: the very object
     /// the Python walk uses, so placeholders pickle identically.
     pub recursive_immutable: Py<PyAny>,
-    /// The instance-dict getter of `ValuesMixin`, which reads any
-    /// context's instance dict, from [`dict_getter`]: to retire an instance
-    /// of a class not judged ([`crate::walker`]).
-    pub instance_dict: Py<PyAny>,
+    /// `values._choose_walk`, which an entry calls to judge a class at its
+    /// first native call ([`crate::walker`]).
+    pub choose_walk: Py<PyAny>,
     /// `object`.
     pub object: Py<PyAny>,
     /// `DumpOptions`, whether the walker reads its instances' budgets
@@ -261,7 +260,7 @@ impl Statics {
             class_module: getter("_CLASS_MODULE")?.unbind(),
             class_qualname: getter("_CLASS_QUALNAME")?.unbind(),
             recursive_immutable: global("_RECURSIVE_IMMUTABLE")?.unbind(),
-            instance_dict: dict_getter(&mixin)?.unbind(),
+            choose_walk: global("_choose_walk")?.unbind(),
             object: builtin("object")?.unbind(),
             dump_options: address(&options),
             dump_options_read: false,
@@ -295,10 +294,9 @@ impl Statics {
     /// composed class, or a class `_choose_walk` judged, which holds
     /// `_native_walk_class` naming itself. A class created past
     /// `ValuesMixin.__init_subclass__` (a base ahead of it whose own
-    /// `__init_subclass__` does not call `super()`) inherits its flag from
-    /// a class that was judged; until `SnapshotContext.__init__` judges it,
-    /// an instance that reached it otherwise (unpickled, `object.__new__`,
-    /// `__class__` assigned) finds a parent's name there. The name is read
+    /// `__init_subclass__` does not call `super()`) inherits its flag and
+    /// this name from a class that was judged, until an entry judges it at
+    /// its first native call. The name is read
     /// as `type` reads a class attribute, through the MRO and its cache,
     /// when the metaclass is `type`, and from the class's own dict, read
     /// through `type.__dict__`, past any other metaclass's hooks.
