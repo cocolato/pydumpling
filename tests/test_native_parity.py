@@ -6293,16 +6293,26 @@ def test_capturing_the_context_s_own_dicts():
 def _has_instance_dict(context):
     """Whether ``context``'s instance dict exists. Reading ``__dict__``
     makes it, and from then on attribute access on the context costs more
-    (3.12, 3.14)."""
+    (3.12, 3.14). ``gc.get_referents`` makes nothing; before gh-130327
+    (3.13.13, 3.14.4) it lists the inline values instead of a dict made
+    from them, so the test that asks skips there."""
     return any(
         type(referent) is dict and "objects" in referent
         for referent in gc.get_referents(context)
     )
 
 
+_REFERENTS_LIST_THE_DICT = sys.version_info[:2] not in ((3, 13), (3, 14)) or (
+    sys.version_info >= ((3, 13, 13) if sys.version_info[:2] == (3, 13) else (3, 14, 4))
+)
+
+
 @pytest.mark.parametrize("native", [False, True], ids=["pure", "native"])
 @pytest.mark.parametrize(
     "holder", ["attributes", "dict", "context", "namespace", "cut"]
+)
+@pytest.mark.skipif(
+    not _REFERENTS_LIST_THE_DICT, reason="gc.get_referents hides a made dict"
 )
 def test_a_nodes_key_leaves_the_context_s_dict_unmade(native, holder):
     """A captured mapping with a ``_nodes`` key holding the very int the
@@ -6339,6 +6349,33 @@ def test_a_nodes_key_leaves_the_context_s_dict_unmade(native, holder):
     assert not _has_instance_dict(context)
     vars(context)
     assert _has_instance_dict(context)
+
+
+@pytest.mark.parametrize("holder", ["attributes", "dict", "dict subclass"])
+def test_a_nodes_key_holding_the_context_s_count(holder):
+    """A captured mapping that is not the context's own dict, with a
+    ``_nodes`` key holding the very int the context holds when the walk
+    reaches it, keeps that int in its copy, as in the Python walk."""
+
+    class Held(dict):
+        pass
+
+    def calls(context):
+        def capture():
+            # ``value`` counts the list before the walker's entry.
+            held = context._nodes + 1
+            if holder == "attributes":
+                value = _Plain()
+                value._nodes = held
+                value.a = 1
+            else:
+                value = (dict if holder == "dict" else Held)(_nodes=held, a=1)
+            return context.value([[1, 2], value])
+
+        return [capture, capture, lambda: context._nodes]
+
+    native, _ = _same_in_both_modes(lambda: (), DumpOptions(), calls)
+    assert native.results[2] > 2
 
 
 @pytest.mark.parametrize("kind", ["dict", "dict subclass", "OrderedDict"])

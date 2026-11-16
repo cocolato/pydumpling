@@ -243,23 +243,22 @@ call, and only `_nodes` again: after Python code, and for a captured dict
 that holds a `_nodes` key while the context does not hold the walk's count
 (below). On a judged class these reads run no code.
 
-The walker reads `ctx.__dict__` itself in two cases only, both rare. One
-is to tell whether a mapping it captures is the context's own dict
-("Capturing again from inside a call"): only for a dict that holds the
-interned str `"_nodes"` (an attribute name, or a literal) as a key while
-the context does not hold the walk's count, whose `_nodes` is the object
-the context holds (read as an attribute), and which the context's own
-references hold, as `gc.get_referents` walks them. That walk does not make
-the dict, and holds it only once it exists; then reading it makes nothing.
-The other is to retire an instance of a class not judged, whose flag it
-writes there. The Python walk never reads it. Reading it makes the
-instance dict exist (3.12 to 3.15), after which attribute stores on that
-context take about twice as long, and on 3.12 loads too. When an object
-with a `_nodes` attribute, such as another context, made the walker read
-it, later calls of a small value on that context took 1.2 to 1.33 times
-as long natively as in the Python walk on 3.12 and 3.14 (2026-11-16).
-Only a dict the context itself holds as an attribute, with a `_nodes` key
-that holds the context's count, still makes it.
+A captured dict may be the context's own instance dict ("Capturing again
+from inside a call"), whose `_nodes` the Python walk reads as the running
+count. Only a dict that holds the interned str `"_nodes"` (an attribute
+name, or a literal) as a key while the context does not hold the walk's
+count, with the very object the context holds there (read as an
+attribute), can be. For such a dict the walker writes its count to the
+context, which the Python walk holds there at every step, and reads the
+dict's entry again by iterating its storage, which runs no code: only the
+context's own dict then holds the very int written. The walker never
+reads `ctx.__dict__` for this. Reading it makes the instance dict exist
+(3.12 to 3.15), after which attribute stores on that context take about
+twice as long, and on 3.12 loads too: when an object with a `_nodes`
+attribute made an earlier build read it, later calls of a small value on
+that context took 1.2 to 1.33 times as long natively as in the Python
+walk on 3.12 and 3.14 (2026-11-16). The walker reads it only to retire an
+instance of a class not judged, whose flag it writes there.
 
 The budgets are read as attributes of options whose type passes a check
 made once per type (for `DumpOptions` at import, and kept for up to 64
@@ -559,7 +558,11 @@ problems").
   reads it anew. Replaced `objects` or `_sources` dicts get the rest of the
   call's copies, where the Python walk puts them in the new dicts, so a
   later call captures those values again and counts their nodes again.
-  Changes to the same dicts are seen at once.
+  Changes to the same dicts are seen at once. `_nodes` rebound to an exact
+  int from 0 to 2**64 - 1 is read back at once; rebound to anything else
+  (a negative int or a larger one, a float, an int subclass), the walker
+  counts on from its own count and writes it there at its next sync, where
+  the Python walk counts on from that value.
 - **The count is stale between synced points.** Code that runs there runs
   as often as in the Python walk but sees `_nodes` as of the last sync: a
   finalizer or weak reference callback run as the walker lets go of a value

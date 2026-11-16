@@ -11,13 +11,13 @@
 use pyo3::exceptions::{PyRecursionError, PyRuntimeError, PyTypeError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySet};
+use pyo3::types::{PyDict, PySet};
 
 use crate::address::AddressMap;
 use crate::keys::{pair, Chosen};
 use crate::state::State;
 use crate::statics::{address, id, type_address};
-use crate::types::{fresh_dict, Base, Kind};
+use crate::types::{Base, Kind};
 use crate::walk::is_exact_str;
 use crate::walker::{Halt, Walk};
 
@@ -253,16 +253,16 @@ impl State {
 
     /// The context's own instance dict, captured from inside its own call
     /// (through the context, or a reference to the dict): its `_nodes`
-    /// holds the running count when the Python walk reads its entries, so
-    /// the walk writes it there and takes it. Only a selected key that is
-    /// the interned `"_nodes"`, the very object attribute names are, while
-    /// the count is not written, can make `source` that dict; its value is
-    /// then the object the context holds, read as an attribute. The dict
-    /// exists if `source` is it, and the context's references, which
-    /// `gc.get_referents` walks without making the dict, then hold it; only
-    /// then does the walker read the dict and compare it with `source`.
-    /// Reading a dict that does not exist makes it, which the Python walk
-    /// never does (`rust/DESIGN.md`, "State reads").
+    /// holds the running count when the Python walk reads its entries.
+    /// Only a selected key that is the interned `"_nodes"`, the very object
+    /// attribute names are, while the count is not written, whose value is
+    /// the object the context holds (read as an attribute), can make
+    /// `source` that dict. The walker then writes the count to the context,
+    /// which the Python walk holds there at every step, and reads the entry
+    /// of `source` again by iterating its storage, which runs no code: only
+    /// the context's own dict now holds the very int written. Neither step
+    /// reads `ctx.__dict__`, which would make the dict exist where the
+    /// Python walk never does (`rust/DESIGN.md`, "State reads").
     fn own_count<'py>(
         &mut self,
         py: Python<'py>,
@@ -279,24 +279,20 @@ impl State {
         let Some(found) = &chosen.entries[slot].1 else {
             return Ok(());
         };
-        if !source.is_instance_of::<PyDict>() {
+        let Ok(dict) = source.cast::<PyDict>() else {
             return Ok(());
-        }
+        };
         let ctx = self.ctx(py).clone();
         if !found.is(&ctx.getattr(name)?) {
-            return Ok(());
-        }
-        let referents = self.s.referents.bind(py).call1((&ctx,))?;
-        let held = referents.cast_into::<PyList>().map_err(PyErr::from)?;
-        if !held.iter().any(|referent| referent.is(source))
-            || !source.is(&fresh_dict(&self.s.instance_dict, &ctx)?)
-        {
             return Ok(());
         }
         let count = self.nodes.into_pyobject(py)?.into_any();
         ctx.setattr(name, &count)?;
         self.written = Some(self.nodes);
-        chosen.entries[slot].1 = Some(count);
+        let now = dict.iter().find(|(key, _)| key.is(name));
+        if now.is_some_and(|(_, value)| value.is(&count)) {
+            chosen.entries[slot].1 = Some(count);
+        }
         Ok(())
     }
 

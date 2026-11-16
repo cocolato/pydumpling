@@ -1360,3 +1360,36 @@ def test_a_replaced_instance_dict_with_an_equal_nodes_key():
     # list; in Python the count as the walk reaches that entry.
     assert found[Native] == 1
     assert found[Pure] > 1
+
+
+@pytest.mark.parametrize("rebound", [2**70, -50, 3.0], ids=["2**70", "-50", "3.0"])
+def test_nodes_rebound_to_a_count_the_walker_cannot_hold(rebound):
+    """Application code the walker runs (here a tally's ``__add__``) that
+    rebinds ``_nodes`` to anything but an exact int from 0 to 2**64 - 1: the
+    Python walk counts on from that value, and with 2**70 cuts the rest at
+    ``max_nodes``; the walker counts on from its own count and writes it
+    there at its next sync. A count it can hold is read back at once."""
+    found = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(DumpOptions(max_string_bytes=8, max_nodes=100))
+        _check_walker(context, native)
+
+        class Tally(int):
+            def __add__(self, other):
+                context._nodes = rebound
+                return int(self) + other
+
+        context._truncation["max_string_bytes"] = Tally(0)
+        captured = context.value(["x" * 50, list(range(5))])
+        found[native] = (captured, context._nodes)
+    whole = ["xxxxxxxx", [0, 1, 2, 3, 4]]
+    assert found[True] == (whole, 8)
+    assert (
+        found[False]
+        == {
+            2**70: (["xxxxxxxx"], 2**70),
+            -50: (whole, -44),
+            3.0: (whole, 9.0),
+        }[rebound]
+    )
