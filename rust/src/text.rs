@@ -51,9 +51,25 @@ pub(crate) fn budget(s: &Statics, value: &Bound<'_, PyAny>) -> Option<Option<u64
 }
 
 impl State {
-    /// `SnapshotContext._has_nodes`.
-    pub(crate) fn has_nodes(&self) -> bool {
-        self.max_nodes.is_none_or(|limit| self.nodes < limit)
+    /// `SnapshotContext._has_nodes`, which reads `_nodes` only under a node
+    /// budget.
+    pub(crate) fn has_nodes(&mut self, py: Python<'_>) -> PyResult<bool> {
+        let Some(limit) = self.max_nodes else {
+            return Ok(true);
+        };
+        if self.missing {
+            self.read_missing(py)?;
+        }
+        Ok(self.nodes < limit)
+    }
+
+    /// `self._nodes += 1`.
+    pub(crate) fn add_node(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.missing {
+            self.read_missing(py)?;
+        }
+        self.nodes += 1;
+        Ok(())
     }
 
     /// Whether `depth` reached `max_depth`.

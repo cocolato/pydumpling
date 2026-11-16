@@ -241,23 +241,29 @@ starts; `_sources`, `_truncation`, `_namespaces`, `_node_marker`,
 each, which is where the Python walk first reads it. Each is read once per
 call, and only `_nodes` again: after Python code, and for a captured dict
 that holds a `_nodes` key while the context does not hold the walk's count
-(below). On a judged class these reads run no code.
+(below). On a judged class these reads run no code. Where Python code
+deleted `_nodes`, the walker reads it again where the Python walk next
+reads it (the node check under `max_nodes`, or the next count), so the
+capture raises the same `AttributeError` there, and it writes no count
+that would make the attribute again.
 
 A captured dict may be the context's own instance dict ("Capturing again
 from inside a call"), whose `_nodes` the Python walk reads as the running
 count. Only a dict that holds the interned str `"_nodes"` (an attribute
 name, or a literal) as a key while the context does not hold the walk's
-count, with the very object the context holds there (read as an
-attribute), can be. For such a dict the walker writes its count to the
-context, which the Python walk holds there at every step, and reads the
-dict's entry again by iterating its storage, which runs no code: only the
-context's own dict then holds the very int written. The walker never
+count, with the very object the context holds there (read as an attribute),
+can be. For such a dict the walker writes its count to the context, which
+the Python walk holds there at every step, and reads the dict's entry again
+by iterating its storage, which runs no code: only the context's own dict
+then holds the very int written. A snapshot copy captured again has its
+attributes copied first, without its type name, and its `__dict__` may be
+that dict, so the walker writes its count before the copy. The walker never
 reads `ctx.__dict__` for this. Reading it makes the instance dict exist
 (3.12 to 3.15), after which attribute stores on that context take about
 twice as long, and on 3.12 loads too: when an object with a `_nodes`
 attribute made an earlier build read it, later calls of a small value on
-that context took 1.2 to 1.33 times as long natively as in the Python
-walk on 3.12 and 3.14 (2026-11-16). The walker reads it only to retire an
+that context took 1.2 to 1.33 times as long natively as in the Python walk
+on 3.12 and 3.14 (2026-11-16). The walker reads it only to retire an
 instance of a class not judged, whose flag it writes there.
 
 The budgets are read as attributes of options whose type passes a check
@@ -916,9 +922,7 @@ see its `--help`. A PGO build passes `-Cprofile-generate=DIR` through
 - Python code the walker does not sync around (`FakeContainer.__hash__`,
   finalizers) sees a stale count and may see a class change late; syncing
   around each hash of a container copy would cost it a `_nodes` write and
-  read. The read of `ctx.__dict__` for a `"_nodes"` key ("State reads")
-  could be skipped in most cases by first comparing the key's value with
-  `ctx._nodes`.
+  read.
 - Placeholders of exact tuples and frozensets: building one only when
   something refers back to the container would bring a tuple's cost near a
   list's.

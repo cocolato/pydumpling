@@ -154,7 +154,7 @@ impl State {
             self.count(py, intern!(py, "max_items"))?;
             return Ok(false);
         }
-        if !self.has_nodes() {
+        if !self.has_nodes(py)? {
             self.count(py, intern!(py, "max_nodes"))?;
             return Ok(false);
         }

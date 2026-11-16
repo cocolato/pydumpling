@@ -28,6 +28,10 @@ pub(crate) struct State {
     /// `_nodes` as the context holds it, if an exact int the walk reads:
     /// the walk writes its count there when it differs.
     pub(crate) written: Option<u64>,
+    /// Whether Python code the call ran deleted `_nodes`: the walk reads it
+    /// again where the Python walk next reads it, which raises there
+    /// ([`State::has_nodes`], [`State::add_node`]), and writes it nowhere.
+    pub(crate) missing: bool,
     sources: Option<Py<PyAny>>,
     truncation: Option<Py<PyAny>>,
     node_marker: Option<Py<PyAny>>,
@@ -140,6 +144,7 @@ impl State {
             max_string_bytes,
             nodes,
             written: Some(nodes),
+            missing: false,
             sources: None,
             truncation: None,
             node_marker: None,

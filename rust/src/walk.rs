@@ -91,11 +91,11 @@ impl State {
             Some(kind)
         };
         let id = &id(value);
-        if !self.has_nodes() {
+        if !self.has_nodes(py)? {
             self.count(py, intern!(py, "max_nodes"))?;
             return Ok(self.node_marker(py)?);
         }
-        self.nodes += 1;
+        self.add_node(py)?;
         if self.nodes.is_multiple_of(4096) {
             self.check_signals(py)?;
         }
@@ -307,7 +307,7 @@ impl State {
             self.count(py, intern!(py, "max_items"))?;
             return Ok(false);
         }
-        if !self.has_nodes() && !self.objects(py).contains(id(item))? {
+        if !self.has_nodes(py)? && !self.objects(py).contains(id(item))? {
             self.count(py, intern!(py, "max_nodes"))?;
             return Ok(false);
         }

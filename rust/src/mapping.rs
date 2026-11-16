@@ -103,11 +103,11 @@ impl State {
             }
         }
         if !counted {
-            if !self.has_nodes() {
+            if !self.has_nodes(py)? {
                 self.count(py, intern!(py, "max_nodes"))?;
                 return Ok(PyDict::new(py).into_any());
             }
-            self.nodes += 1;
+            self.add_node(py)?;
         }
         if self.depth_reached(depth) {
             self.count(py, intern!(py, "max_depth"))?;
@@ -226,7 +226,7 @@ impl State {
                 self.count(py, reason)?;
                 break;
             }
-            if !self.has_nodes() {
+            if !self.has_nodes(py)? {
                 self.count(py, intern!(py, "max_nodes"))?;
                 break;
             }
@@ -270,7 +270,7 @@ impl State {
         chosen: &mut Chosen<'py>,
     ) -> PyResult<()> {
         let name = intern!(py, "_nodes");
-        if self.written == Some(self.nodes) {
+        if self.written == Some(self.nodes) || self.missing {
             return Ok(());
         }
         let Some(slot) = chosen.entries.iter().position(|(key, _)| key.is(name)) else {
@@ -312,6 +312,10 @@ impl State {
         let attrs = match private {
             None => attrs.clone(),
             Some(private) => {
+                // The copy's `__dict__` may be the context's own, whose
+                // `_nodes` the Python walk's comprehension reads as the
+                // running count: write it before reading the entries.
+                self.sync_out(py)?;
                 let kept = PyDict::new(py);
                 let mut mixed = false;
                 for item in self.s.dict_items.bind(py).call1((attrs,))?.try_iter()? {

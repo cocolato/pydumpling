@@ -183,9 +183,10 @@ impl State {
     }
 
     /// Writes the node count to the context's `_nodes`, if it does not hold
-    /// it already.
+    /// it already. Where Python code deleted it, nothing is written: the
+    /// Python walk does not make it again.
     pub(crate) fn sync_out(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.written != Some(self.nodes) {
+        if self.written != Some(self.nodes) && !self.missing {
             self.ctx(py).setattr(intern!(py, "_nodes"), self.nodes)?;
             self.written = Some(self.nodes);
         }
@@ -195,9 +196,11 @@ impl State {
     /// Reads the node count back from the context, after Python code that
     /// may have captured through it. One that is not an exact int from 0 to
     /// 2**64 - 1 is not read: the walk counts on from its own, and writes it
-    /// there at the next sync.
+    /// there at the next sync. A deleted one is read again where the Python
+    /// walk next reads it ([`State::read_missing`]).
     fn sync_in(&mut self, py: Python<'_>) -> PyResult<()> {
         let found = self.ctx(py).getattr_opt(intern!(py, "_nodes"))?;
+        self.missing = found.is_none();
         self.written = found
             .filter(|count| type_address(count) == self.s.int)
             .and_then(|count| count.extract::<u64>().ok());
@@ -205,6 +208,16 @@ impl State {
             self.nodes = count;
         }
         Ok(())
+    }
+
+    /// `_nodes` read where the Python walk reads it, after Python code
+    /// deleted it: the read raises the interpreter's `AttributeError`, as
+    /// there, or takes the count something stored since.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn read_missing(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.ctx(py).getattr(intern!(py, "_nodes"))?;
+        self.sync_in(py)
     }
 
     /// Runs `operation`, a Python operation that may run application code,

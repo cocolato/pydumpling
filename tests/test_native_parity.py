@@ -6319,8 +6319,7 @@ def test_a_nodes_key_leaves_the_context_s_dict_unmade(native, holder):
     context holds when the walk reaches it (an object's attributes, a dict,
     another context, an exec namespace whose ``__builtins__`` the selection
     skips, a selection cut by ``max_items``) leaves the context's instance
-    dict unmade, as in the Python walk. Only the context's own dict, which
-    then exists, sends the walker to read ``ctx.__dict__``."""
+    dict unmade, as in the Python walk."""
     options = DumpOptions(max_items=2) if holder == "cut" else DumpOptions()
     with _mode(native):
         context = SnapshotContext(options)
@@ -6414,6 +6413,83 @@ def test_a_replaced_instance_dict_captured_inside_a_call(kind):
         )
     assert found[Native].blob == found[Pure].blob, (found[Native], found[Pure])
     assert found[Native].results[0] > 1
+
+
+@pytest.mark.parametrize(
+    "copy_class", [FakeClass, FakeList], ids=["FakeClass", "FakeList"]
+)
+def test_a_snapshot_copy_holding_the_context_s_dict(copy_class):
+    """A snapshot copy whose ``__dict__`` is the context's own instance dict,
+    captured again from inside a call, has its attributes copied first,
+    leaving out its type name; that copy shows the running count, as in the
+    Python walk. The walk is set on each class, so both instance dicts hold
+    the same keys."""
+
+    class Native(SnapshotContext):
+        pass
+
+    class Pure(SnapshotContext):
+        pass
+
+    Pure._native_walk = False
+    found = {}
+    for cls in (Pure, Native):
+        context = cls(DumpOptions())
+        assert "_native_walk" not in vars(context)
+        held = FakeClass("<held>", {}) if copy_class is FakeClass else FakeList([1])
+        held.__dict__ = vars(context)
+        captured = context.value([[1, 2, 3], held])
+        found[cls] = _Outcome(
+            [vars(captured[1]).get("_nodes")],
+            list(context._truncation.items()),
+            context._nodes,
+            [],
+            _memo(context),
+        )
+    assert found[Native].blob == found[Pure].blob, (found[Native], found[Pure])
+    assert found[Native].results[0] > 1
+
+
+@pytest.mark.parametrize("max_nodes", [None, 100], ids=["no budget", "max_nodes"])
+@pytest.mark.parametrize("after", ["a list", "a dict with a _nodes key", "nothing"])
+def test_nodes_deleted_mid_call(after, max_nodes):
+    """Application code the walker runs (here a tally's ``__add__``) that
+    deletes ``_nodes``: the capture raises ``AttributeError`` where the
+    Python walk next reads it (the node check under ``max_nodes``, otherwise
+    the next count), keeps what it did before, and leaves ``_nodes``
+    deleted, as in the Python walk."""
+    tails = {
+        "a list": lambda: [[1, 2]],
+        "a dict with a _nodes key": lambda: [{"_nodes": 0, "a": 1}],
+        "nothing": lambda: [],
+    }
+    found = {}
+    for native in (False, True):
+        with _mode(native):
+            context = SnapshotContext(
+                DumpOptions(max_string_bytes=8, max_nodes=max_nodes)
+            )
+        _check_walker(context, native)
+
+        class Tally(int):
+            def __add__(self, other):
+                del context._nodes
+                return int(self) + other
+
+        context._truncation["max_string_bytes"] = Tally(0)
+        try:
+            captured = context.value(["x" * 50, *tails[after]()])
+        except AttributeError as error:
+            captured = ("raised", str(error))
+        found[native] = (
+            captured,
+            hasattr(context, "_nodes"),
+            list(context._truncation.items()),
+            _memo(context),
+        )
+    assert found[True] == found[False]
+    assert found[True][1] is False
+    assert (found[True][0][0] == "raised") is (after != "nothing")
 
 
 def test_namespaces_after_application_code_mid_call():
