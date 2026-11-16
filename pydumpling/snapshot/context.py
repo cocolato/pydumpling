@@ -17,7 +17,7 @@ from ..options import DumpOptions
 from .exceptions import ExceptionsMixin
 from .frames import FramesMixin
 from .identity import _CLASS_MODULE, _CLASS_QUALNAME
-from .values import ValuesMixin
+from .values import ValuesMixin, _stock
 
 # Code metadata (file names, function and class names, variable and name
 # tables) is diagnostic structure, not application data. Truncating it yields
@@ -200,3 +200,8 @@ class SnapshotContext(ValuesMixin, FramesMixin, ExceptionsMixin):
             return True
         except Exception:
             return False
+
+
+# The native walker stands in for this class's walk; each subclass is compared
+# with it when created (``ValuesMixin.__init_subclass__``).
+_stock(SnapshotContext)
