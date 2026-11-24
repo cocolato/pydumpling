@@ -6,6 +6,7 @@ import linecache
 from collections import deque
 
 from ..fake_types import FakeCode, FakeFrame, FakeTraceback
+from . import _capture
 
 
 class FramesMixin:
@@ -98,14 +99,14 @@ class FramesMixin:
                 captured._co_position_count, len(captured._co_positions)
             )
         if not self._capturing_frames:
-            self._code_payload(code, captured)
+            _capture.run_python(self, self._code_payload(code, captured))
         return captured
 
     def _code_payload(self, original, captured):
         if self.minimal or id(original) in self._payload_codes:
             return
         self._payload_codes.add(id(original))
-        constants = self.value(original.co_consts)
+        constants = yield from _capture.frame_child(("value", original.co_consts, 0))
         captured.co_consts = constants if type(constants) is tuple else ()
         bytecode = original.co_code
         captured.co_code = (
@@ -154,9 +155,13 @@ class FramesMixin:
             self._truncation["frame_cycle"] += 1
         if self._original_frames > len(entries):
             self._truncation["max_frames"] += self._original_frames - len(entries)
-        return self._build(list(reversed(entries)))
+        return _capture.run(self, self._build(list(reversed(entries))))
 
     def from_traceback(self, traceback):
+        # The writer also uses this path to reduce an already-captured graph.
+        return _capture.run_python(self, self._traceback_steps(traceback))
+
+    def _traceback_steps(self, traceback):
         if traceback is None:
             raise ValueError("No traceback is available to capture")
         entries = deque(maxlen=self.options.max_frames)
@@ -171,7 +176,7 @@ class FramesMixin:
             self._truncation["traceback_cycle"] += 1
         if self._original_frames > len(entries):
             self._truncation["max_frames"] += self._original_frames - len(entries)
-        return self._build(list(entries))
+        return (yield from self._build(list(entries)))
 
     def _build(self, entries):
         self._capturing_frames = True
@@ -211,14 +216,15 @@ class FramesMixin:
                     + bool(code.co_flags & 4)
                     + bool(code.co_flags & 8)
                 )
-                frame.f_locals = self._mapping(
-                    local_names,
-                    priority=("self",) + code.co_varnames[:argument_count],
+                priority = ("self",) + code.co_varnames[:argument_count]
+                frame.f_locals = yield from _capture.frame_child(
+                    ("mapping", local_names, 0, priority, False, dict)
                 )
             for original, _, global_names in reversed(namespaces):
                 frame = self.frames[id(original)]
-                frame.f_globals = self._mapping(
-                    global_names, priority=("__name__",) + frame.f_code.co_names
+                priority = ("__name__",) + frame.f_code.co_names
+                frame.f_globals = yield from _capture.frame_child(
+                    ("mapping", global_names, 0, priority, False, dict)
                 )
         elif entries:
             self._truncation["minimal_snapshot"] += 1
@@ -226,7 +232,7 @@ class FramesMixin:
             self.frames[id(original)].f_back = self.frames.get(id(original.f_back))
         self._capturing_frames = False
         for identifier, captured in tuple(self.codes.items()):
-            self._code_payload(self._code_sources[identifier], captured)
+            yield from self._code_payload(self._code_sources[identifier], captured)
         head = None
         tail = None
         for original, lineno, lasti in entries:

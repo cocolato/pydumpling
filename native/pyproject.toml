@@ -1,0 +1,11 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pydumpling-native"
+dynamic = ["version"]
+description = "Optional native snapshot capture for pydumpling"
+requires-python = ">=3.12,<3.15"
+license = "MIT"
+license-files = ["LICENSE"]

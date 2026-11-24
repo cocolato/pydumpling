@@ -1,0 +1,16 @@
+[package]
+name = "pydumpling-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/cocolato/pydumpling"
+publish = false
+
+[lib]
+name = "pydumpling_native"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+pyo3 = { version = "=0.30.1", features = ["abi3-py312"] }

@@ -310,11 +310,8 @@ def save_dumping(
 
         def factory(minimal: bool) -> dict:
             context = SnapshotContext(settings, minimal=minimal)
-            payload = {
-                "traceback": context.from_traceback(exc_tb),
-                "version": __version__,
-                "exc_extra": context.exception(exc_value),
-            }
+            frames, extra = context.capture_exception(exc_tb, exc_value)
+            payload = {"traceback": frames, "version": __version__, "exc_extra": extra}
             return _complete_payload(context, payload)
 
         _write_snapshot(filename, factory, settings)

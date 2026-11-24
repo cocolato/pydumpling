@@ -82,6 +82,98 @@ def _scalar_copy_type(value):
 
 # The value memo legitimately stores None; only this sentinel means "new".
 _UNMEMOIZED = object()
+_RECURSIVE_IMMUTABLE = "recursive immutable reference"
+
+
+def _attribute_namespace(ctx, attrs, private):
+    if private is not None:
+        attrs = {
+            key: item
+            for key, item in dict.items(attrs)
+            if type(key) is not str or key != private
+        }
+    ctx._namespaces.add(id(attrs))
+    return attrs
+
+
+def _scalar_copy(ctx, value, copy_type):
+    """Remember a scalar subclass and say whether its fields still need a copy."""
+    base = copy_type._base
+    limit = ctx.options.max_string_bytes
+    if base is int:
+        if limit is not None and int.bit_length(value) > limit * 8:
+            return ctx._remember(value, ctx._omit("max_string_bytes", value)), False
+        plain = int.__int__(value)
+    elif base is float:
+        plain = float.__float__(value)
+    else:
+        # The base slice copies at most one item past the budget into an
+        # exact instance: enough to see the budget was exceeded.
+        head = base.__getitem__(value, slice(None if limit is None else limit + 1))
+        plain = (
+            ctx._text(head)
+            if base is str
+            else ctx._bounded_bytes(head, limit, "max_string_bytes")
+        )
+    return ctx._remember(value, copy_type(plain)), True
+
+
+def _object_copy(ctx, value, value_type):
+    """Memoize the shell before a caller descends into its attribute namespace."""
+    representation = (
+        FakeClass.__repr__(value)
+        if value_type is FakeClass
+        else "<%s snapshot>" % ctx._type_name(value)
+    )
+    captured = FakeClass(representation, {})
+    ctx._remember(value, captured)
+    attrs = ctx._attributes(value)
+    if attrs is None:
+        ctx._truncation["unsupported_type"] += 1
+    return captured, representation, attrs
+
+
+def _copy_attributes(ctx, value, copy, depth, namespace):
+    """Read the original type and attributes, applying the scalar depth limit."""
+    cls = type(value)
+    own = cls is type(copy)
+    key = type(copy)._type_key
+    attrs = ctx._attributes(value) or {}
+    type_name = attrs.get(key) if own else ctx._type_name(value)
+    limit = ctx.options.max_depth
+    if limit is not None and depth >= limit:
+        # Only a scalar copy gets here: its value is kept at any depth,
+        # like a plain value, but its attributes and slots are nested
+        # data and follow the depth budget.
+        # Only an exact str name is compared: a str subclass attribute name
+        # could run its own ``__ne__``, so any other name counts as data.
+        if any(
+            type(name) is not str or name != key for name in attrs
+        ) or ctx._filled_slot(value):
+            ctx._truncation["max_depth"] += 1
+        namespace[key] = type_name
+        return
+    return key, type_name, attrs, key if own else None
+
+
+def _filled_members(value, members):
+    cls = type(value)
+    for name, member in members:
+        try:
+            item = member.__get__(value, cls)
+        except Exception:
+            continue  # An unset slot holds nothing.
+        yield name, item
+
+
+def _slot_fits(ctx, namespace):
+    if ctx.options.max_items is not None and len(namespace) >= ctx.options.max_items:
+        ctx._truncation["max_items"] += 1
+        return False
+    if not ctx._has_nodes():
+        ctx._truncation["max_nodes"] += 1
+        return False
+    return True
 
 
 class ValuesMixin:
@@ -117,13 +209,7 @@ class ValuesMixin:
         ``private`` is the bookkeeping attribute of a snapshot copy captured
         again; its caller restores it, so it is not converted as data.
         """
-        if private is not None:
-            attrs = {
-                key: item
-                for key, item in dict.items(attrs)
-                if type(key) is not str or key != private
-            }
-        self._namespaces.add(id(attrs))
+        attrs = _attribute_namespace(self, attrs, private)
         return self._mapping(attrs, depth, priority=priority)
 
     def _fill_copy(self, value, copy, depth):
@@ -133,42 +219,15 @@ class ValuesMixin:
         tuple part, and named tuple fields all become attributes of the copy.
         """
         namespace = copy.__dict__
-        cls = type(value)
-        own = cls is type(copy)
-        key = type(copy)._type_key
-        attrs = self._attributes(value) or {}
-        type_name = attrs.get(key) if own else self._type_name(value)
-        limit = self.options.max_depth
-        if limit is not None and depth >= limit:
-            # Only a scalar copy gets here: its value is kept at any depth,
-            # like a plain value, but its attributes and slots are nested
-            # data and follow the depth budget.
-            # Only an exact str name is compared: a str subclass attribute name
-            # could run its own ``__ne__``, so any other name counts as data.
-            if any(
-                type(name) is not str or name != key for name in attrs
-            ) or self._filled_slot(value):
-                self._truncation["max_depth"] += 1
-            namespace[key] = type_name
+        attributes = _copy_attributes(self, value, copy, depth, namespace)
+        if attributes is None:
             return
+        key, type_name, attrs, private = attributes
         if attrs:
-            namespace.update(
-                self._attribute_mapping(attrs, depth + 1, private=key if own else None)
-            )
+            namespace.update(self._attribute_mapping(attrs, depth + 1, private=private))
         members, fields = self._layout(value)
-        for name, member in members:
-            try:
-                item = member.__get__(value, cls)
-            except Exception:
-                continue  # An unset slot holds nothing.
-            if (
-                self.options.max_items is not None
-                and len(namespace) >= self.options.max_items
-            ):
-                self._truncation["max_items"] += 1
-                break
-            if not self._has_nodes():
-                self._truncation["max_nodes"] += 1
+        for name, item in _filled_members(value, members):
+            if not _slot_fits(self, namespace):
                 break
             namespace[name] = self.value(item, depth + 1)
         if fields and type(copy) is FakeTuple:
@@ -177,14 +236,8 @@ class ValuesMixin:
 
     def _filled_slot(self, value):
         """Whether any slot of ``value`` holds a value; runs no application code."""
-        cls = type(value)
-        for _, member in self._layout(value)[0]:
-            try:
-                member.__get__(value, cls)
-            except Exception:
-                continue
-            return True
-        return False
+        members, _ = self._layout(value)
+        return next(_filled_members(value, members), None) is not None
 
     def value(self, value, depth=0):
         cached = self.objects.get(id(value), _UNMEMOIZED)
@@ -246,9 +299,7 @@ class ValuesMixin:
                 value,
                 captured
                 if mutable
-                else TruncatedValue(
-                    "recursive immutable reference", self._type_name(value)
-                ),
+                else TruncatedValue(_RECURSIVE_IMMUTABLE, self._type_name(value)),
             )
             count = 0
             # Iterate through the base type: a subclass ``__iter__`` must be
@@ -272,14 +323,7 @@ class ValuesMixin:
             if target is snapshot_type:
                 self._fill_copy(value, captured, depth)
             return captured
-        representation = (
-            FakeClass.__repr__(value)
-            if value_type is FakeClass
-            else "<%s snapshot>" % self._type_name(value)
-        )
-        captured = FakeClass(representation, {})
-        self._remember(value, captured)
-        attrs = self._attributes(value)
+        captured, representation, attrs = _object_copy(self, value, value_type)
         if attrs is not None:
             converted = self._attribute_mapping(
                 attrs,
@@ -288,8 +332,6 @@ class ValuesMixin:
             )
             captured.__dict__.update(converted)
             captured.__dict__["_FakeClass__repr"] = representation
-        else:
-            self._truncation["unsupported_type"] += 1
         return captured
 
     def _scalar(self, value, copy_type, depth):
@@ -299,25 +341,9 @@ class ValuesMixin:
         ``__getitem__``, ``__len__``, ``__int__``, or ``bit_length`` runs, and it
         has the budget of an exact instance.
         """
-        base = copy_type._base
-        limit = self.options.max_string_bytes
-        if base is int:
-            if limit is not None and int.bit_length(value) > limit * 8:
-                return self._remember(value, self._omit("max_string_bytes", value))
-            plain = int.__int__(value)
-        elif base is float:
-            plain = float.__float__(value)
-        else:
-            # The base slice copies at most one item past the budget into an
-            # exact instance: enough to see the budget was exceeded.
-            head = base.__getitem__(value, slice(None if limit is None else limit + 1))
-            plain = (
-                self._text(head)
-                if base is str
-                else self._bounded_bytes(head, limit, "max_string_bytes")
-            )
-        captured = self._remember(value, copy_type(plain))
-        self._fill_copy(value, captured, depth)
+        captured, fill = _scalar_copy(self, value, copy_type)
+        if fill:
+            self._fill_copy(value, captured, depth)
         return captured
 
     @staticmethod
@@ -335,6 +361,55 @@ class ValuesMixin:
             if descriptor is not None:
                 return None
         return None
+
+    def _mapping_items(self, source, names, preferred):
+        """Select a bounded mapping view before descending into any values."""
+        # The builtin base's items skip a subclass ``items`` override and
+        # run no key hash or equality method.
+        reader = _container_base(source)[0]
+        view = reader.items(source) if reader is not None else source.items()
+        ordered = _derives(source, OrderedDict)
+        if ordered and not all(map(_plain_key, dict.keys(source))):
+            # Reading link order would run a key's own __hash__; keep
+            # insertion order instead and say so.
+            ordered = False
+            self._truncation["mapping_order"] += 1
+        # Select the bounded keys first: preferred names first, then the
+        # rest, each group in the mapping's own order.
+        keys = (
+            key
+            for key in _key_order(source, view, ordered)
+            if type(key) is not str or key != "__builtins__"
+        )
+        if preferred:
+            keys = itertools.chain(
+                (
+                    key
+                    for key in _key_order(source, view, ordered)
+                    if type(key) is str and key in preferred and key != "__builtins__"
+                ),
+                (key for key in keys if type(key) is not str or key not in preferred),
+            )
+        limit, reason = self.options.max_items, "max_items"
+        nodes = self.options.max_nodes
+        if nodes is not None and not names and (limit is None or nodes < limit):
+            # Each entry not already memoized costs a node, so the node
+            # budget also bounds the selection and its temporary memory.
+            limit, reason = nodes, "max_nodes"
+        # One extra key lets the loop below report truncation.
+        chosen = dict.fromkeys(
+            id(key)
+            for key in itertools.islice(keys, None if limit is None else limit + 1)
+        )
+        remaining = len(chosen)
+        for key, item in view:
+            if not remaining:
+                break
+            if chosen.get(id(key), ()) is None:
+                chosen[id(key)] = (key, item)
+                remaining -= 1
+        items = (entry for entry in chosen.values() if entry is not None)
+        return items, limit, reason
 
     def _mapping(self, source, depth=0, *, priority=(), counted=False, container=dict):
         if id(source) in self.objects:
@@ -360,57 +435,7 @@ class ValuesMixin:
         count = 0
         preferred = set(priority)
         try:
-            # The builtin base's items skip a subclass ``items`` override and
-            # run no key hash or equality method.
-            reader = _container_base(source)[0]
-            view = reader.items(source) if reader is not None else source.items()
-            ordered = _derives(source, OrderedDict)
-            if ordered and not all(map(_plain_key, dict.keys(source))):
-                # Reading link order would run a key's own __hash__; keep
-                # insertion order instead and say so.
-                ordered = False
-                self._truncation["mapping_order"] += 1
-            # Select the bounded keys first: preferred names first, then the
-            # rest, each group in the mapping's own order.
-            keys = (
-                key
-                for key in _key_order(source, view, ordered)
-                if type(key) is not str or key != "__builtins__"
-            )
-            if preferred:
-                keys = itertools.chain(
-                    (
-                        key
-                        for key in _key_order(source, view, ordered)
-                        if type(key) is str
-                        and key in preferred
-                        and key != "__builtins__"
-                    ),
-                    (
-                        key
-                        for key in keys
-                        if type(key) is not str or key not in preferred
-                    ),
-                )
-            limit, reason = self.options.max_items, "max_items"
-            nodes = self.options.max_nodes
-            if nodes is not None and not names and (limit is None or nodes < limit):
-                # Each entry not already memoized costs a node, so the node
-                # budget also bounds the selection and its temporary memory.
-                limit, reason = nodes, "max_nodes"
-            # One extra key lets the loop below report truncation.
-            chosen = dict.fromkeys(
-                id(key)
-                for key in itertools.islice(keys, None if limit is None else limit + 1)
-            )
-            remaining = len(chosen)
-            for key, item in view:
-                if not remaining:
-                    break
-                if chosen.get(id(key), ()) is None:
-                    chosen[id(key)] = (key, item)
-                    remaining -= 1
-            items = (entry for entry in chosen.values() if entry is not None)
+            items, limit, reason = self._mapping_items(source, names, preferred)
             for key, item in items:
                 if limit is not None and count >= limit:
                     self._truncation[reason] += 1
@@ -451,8 +476,11 @@ class ValuesMixin:
         try:
             return self.value(item, 1)
         except RecursionError:
-            # Forget the copies the overflow left half built, so other
-            # references capture those objects afresh.
-            for identity in list(itertools.islice(self.objects, mark, None)):
-                del self.objects[identity]
-            return self._remember(item, self._omit("recursion", item))
+            return self._recover_root(item, mark)
+
+    def _recover_root(self, item, mark):
+        # Forget the copies the overflow left half built, so other
+        # references capture those objects afresh.
+        for identity in list(itertools.islice(self.objects, mark, None)):
+            del self.objects[identity]
+        return self._remember(item, self._omit("recursion", item))

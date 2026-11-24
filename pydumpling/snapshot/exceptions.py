@@ -7,6 +7,7 @@ import traceback
 from dataclasses import replace
 
 from ..fake_types import FakeStr, TruncatedValue
+from . import _capture
 from .identity import _derives
 
 _BUILTIN_EXCEPTIONS = {
@@ -57,7 +58,7 @@ class ExceptionsMixin:
 
     def _exception_message(self, exc):
         try:
-            return self._render_exception_message(exc)
+            return (yield from self._render_exception_message(exc))
         except Exception:
             self._truncation["exception_format"] += 1
             return self._text("<exception message unavailable>")
@@ -85,7 +86,7 @@ class ExceptionsMixin:
                     TruncatedValue("minimal_snapshot", self._type_name(arg))
                 )
             else:
-                converted.append(self.value(arg, 1))
+                converted.append((yield ("value", arg, 1)))
         if self.options.max_items is not None and len(args) > self.options.max_items:
             self._truncation["exception_items"] += 1
         converted = tuple(converted)
@@ -102,6 +103,9 @@ class ExceptionsMixin:
         return self._text(formatter.repr(converted))
 
     def exception(self, exc):
+        return _capture.run_python(self, self._exception_steps(exc))
+
+    def _exception_steps(self, exc):
         if not isinstance(exc, BaseException):
             raise TypeError("exc must be an exception instance")
         type_name = self._type_name(exc)
@@ -115,7 +119,7 @@ class ExceptionsMixin:
                 extra.update(exc_type=type(exc), exc_value=exc)
                 return extra
             self._truncation["unserializable_exception"] += 1
-        extra["message"] = self._exception_message(exc)
+        extra["message"] = yield from self._exception_message(exc)
         saved = self._builtin_exception(exc)
         if not self.minimal and saved is not None:
             extra.update(exc_type=type(saved), exc_value=saved)
@@ -129,7 +133,7 @@ class ExceptionsMixin:
             if id(current) in seen:
                 continue
             seen.add(id(current))
-            text = self._exception_message(current)
+            text = yield from self._exception_message(current)
             saved = self._builtin_exception(current)
             indent = "  " * min(depth, self.options.max_depth or 5)
             lines = [self._type_name(current) + ": " + text + "\n"]

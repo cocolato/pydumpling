@@ -14,6 +14,7 @@ import dill
 
 from ..fake_types import TruncatedValue
 from ..options import DumpOptions
+from . import _capture
 from .exceptions import ExceptionsMixin
 from .frames import FramesMixin
 from .identity import _CLASS_MODULE, _CLASS_QUALNAME
@@ -77,6 +78,16 @@ class SnapshotContext(ValuesMixin, FramesMixin, ExceptionsMixin):
             if options.is_unlimited
             else (_CODE_TEXT_LIMIT, _CODE_BYTES_LIMIT)
         )
+
+    def capture_exception(self, traceback, exc):
+        """Capture traceback roots and exception arguments with one shared walk."""
+
+        def roots():
+            frames = yield from self._traceback_steps(traceback)
+            extra = yield from self._exception_steps(exc)
+            return frames, extra
+
+        return _capture.run(self, roots())
 
     def metadata(self):
         return {
