@@ -1,6 +1,7 @@
 import builtins
 import os
 import pickle
+import subprocess
 import sys
 import threading
 import traceback
@@ -27,7 +28,7 @@ from pydumpling.fake_types import (
 )
 from pydumpling.options import DumpOptions
 from pydumpling.pydumpling import _capture_frame
-from pydumpling.snapshot import SnapshotContext
+from pydumpling.snapshot import SnapshotContext, _capture
 from pydumpling.snapshot.context import (
     _ARGV_LIMIT,
     _CODE_BYTES_LIMIT,
@@ -969,12 +970,36 @@ def test_deep_value_does_not_cost_the_rest_of_the_frame(tmp_path):
     metadata = result["snapshot_meta"]
     # (dill may still give up on the deep list; pickle then writes it.)
     assert all("serializer" in attempt for attempt in metadata["attempts"])
-    assert metadata["truncation"]["recursion"] == 1
     assert "concurrent_mutation" not in metadata["truncation"]
     variables = result["traceback"].tb_frame.f_locals
-    # The deep value is summarized; the other locals stay.
-    assert variables["deep"].reason == "recursion"
     assert variables["important"] == 42
+    value = variables["deep"]
+    if _capture.pydumpling_native is not None and type(value) is list:
+        # An iterative capture can save the entire chain.
+        assert "recursion" not in metadata["truncation"]
+        for _ in range(3000):
+            (value,) = value
+        assert value == []
+    else:
+        assert value.reason == "recursion"
+        assert metadata["truncation"]["recursion"] == 1
+    if reader := os.environ.get("PYDUMPLING_BASE_READER"):
+        code = """
+import sys
+from pydumpling import load_dumpling
+dump = load_dumpling(sys.argv[1])
+variables = dump["traceback"].tb_frame.f_locals
+value = variables["deep"]
+assert variables["important"] == 42
+if sys.argv[2] == "whole":
+    for _ in range(3000):
+        (value,) = value
+    assert value == []
+else:
+    assert value.reason == "recursion"
+"""
+        shape = "whole" if type(variables["deep"]) is list else "truncated"
+        subprocess.run([reader, "-I", "-c", code, path, shape], check=True, timeout=30)
 
 
 def test_recursion_overflow_in_a_nested_mapping_is_not_a_concurrent_mutation():

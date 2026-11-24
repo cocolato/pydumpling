@@ -17,6 +17,18 @@ pydumpling --version
 
 These examples describe 0.2.0.
 
+To try this branch's optional Rust capture engine, build and install the two
+packages from the same checkout. Building the extension requires Rust 1.85+
+and a GIL-enabled CPython 3.12–3.14. The branch has been tested on Linux x86-64.
+
+~~~sh
+python -m pip install . ./native
+~~~
+
+Both capture APIs use the extension for bounded snapshots. Install just `.`
+for the Python engine. `DumpOptions.unlimited()` always uses Python. See the
+[validation results and wheel build commands](benchmarks/rust-capture-validation.md).
+
 ## Save an exception
 
 Save this complete example as `example.py` and run `python example.py`:

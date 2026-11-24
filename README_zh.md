@@ -17,6 +17,16 @@ pydumpling --version
 
 以下示例对应 0.2.0。
 
+要试用本分支的 Rust 采集引擎，在同一份源码中构建并安装两个包。构建扩展需要
+Rust 1.85+ 和启用 GIL 的 CPython 3.12–3.14。本分支在 Linux x86-64 上验证。
+
+~~~sh
+python -m pip install . ./native
+~~~
+
+两个公开采集入口都会为有界快照选择扩展。只安装 `.` 使用 Python 引擎，
+`DumpOptions.unlimited()` 始终使用 Python。见[验证结果与 wheel 构建命令](benchmarks/rust-capture-validation.md)。
+
 ## 保存异常现场
 
 将下面的完整示例保存为 `example.py`，运行 `python example.py`：
