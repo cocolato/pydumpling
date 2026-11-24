@@ -4,16 +4,27 @@ Run from the repository root:
 
     uv run --locked python benchmarks/bench_capture.py
 
-The workload builds a caller chain of ``DEPTH`` frames whose locals hold
+For paired performance and content comparisons of installed wheels, run
+the same script with each version installed in its own Python environment::
+
+    python benchmarks/bench_capture.py --suite --compare-python /path/to/reference/python --json results.json
+
+The legacy workload builds a caller chain of ``DEPTH`` frames whose locals hold
 representative values (nested containers, strings, custom objects). Each case
 reports the best and median wall time per operation so regressions in capture
 or serialization show up as stable numbers. Compare output between revisions;
 there is no pass/fail threshold.
 """
 
+import argparse
+import gzip
+import hashlib
+import json
 import os
+import pickle
 import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -21,7 +32,8 @@ import warnings
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+if not any(flag in sys.argv for flag in ("--case", "--suite")):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pydumpling import (  # noqa: E402
     DumpOptions,
@@ -189,5 +201,215 @@ def main():
         shutil.rmtree(directory)
 
 
+CASES = ("small", "shared", "mixed", "budget")
+
+
+def snapshot_digest(name, payload):
+    """Compare frame data, aliases, exception details and bounded capture results."""
+    frames = []
+    entry = payload["traceback"]
+    while entry is not None:
+        frame = entry.tb_frame
+        frames.append(
+            (frame.f_code.co_name, entry.tb_lineno, frame.f_locals, frame.f_globals)
+        )
+        entry = entry.tb_next
+    locals_ = frames[-1][2]
+    meta = payload["snapshot_meta"]
+    if name == "shared":
+        batch = locals_["batch"]
+        assert len(frames) == 12 and len(batch) == 500
+        assert all(frame[2]["batch"] is batch for frame in frames)
+    elif name == "mixed":
+        nested = locals_["order"].lines
+        for level in reversed(range(8)):
+            assert nested["level"] == level
+            nested = nested["children"][0]
+        assert nested["lines"][-1].lines[-1] == (60, "60")
+    else:
+        assert locals_["request_id"] == "r-42"
+        if name == "budget":
+            assert meta["truncation"].get("max_nodes", 0) > 0
+            assert len(locals_["rows"]) < 1000
+    record = (
+        frames,
+        payload["exc_extra"],
+        payload.get("source"),
+        meta["limits"],
+        meta["original_frames"],
+        meta["captured_frames"],
+        meta["truncation"],
+    )
+    return hashlib.sha256(pickle.dumps(record, protocol=5)).hexdigest()
+
+
+def suite_worker(name, runs):
+    from capture_workloads import exception_case
+
+    import pydumpling
+    from pydumpling import pydumpling as writer
+
+    exc_info, kwargs = exception_case(name)
+    options = DumpOptions(**kwargs)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "example.dump"
+
+        def save():
+            save_dumping(path, exc_info=exc_info, options=options, strict=True)
+
+        def samples(operation):
+            operation()  # warm up outside the timed samples
+            elapsed = []
+            for _ in range(runs):
+                start = time.perf_counter_ns()
+                operation()
+                elapsed.append((time.perf_counter_ns() - start) / 1e6)
+            return elapsed
+
+        # Obtain the public API's factory once so capture-only measures its
+        # actual backend without gzip, fsync or setting up a different graph.
+        build = None
+
+        def keep_factory(filename, factory, options):
+            nonlocal build
+            build = factory
+
+        original = writer._write_snapshot
+        try:
+            writer._write_snapshot = keep_factory
+            save()
+        finally:
+            writer._write_snapshot = original
+        assert build is not None
+        capture_ms = samples(lambda: build(False))
+        save_ms = samples(save)
+        peak = peak_rss_bytes()
+        capture_digest = snapshot_digest(name, build(False))
+        with gzip.open(path, "rb") as stream:
+            serialized_bytes = len(stream.read())
+        public = load_dumpling(path)
+        assert not public["snapshot_meta"].get("attempts"), "serialization retried"
+        public_digest = snapshot_digest(name, public)
+        return {
+            "package": pydumpling.__file__,
+            "python": sys.version.split()[0],
+            "capture_ms": capture_ms,
+            "save_ms": save_ms,
+            "peak_rss_bytes": peak,
+            "dump_bytes": path.stat().st_size,
+            "serialized_bytes": serialized_bytes,
+            "capture_digest": capture_digest,
+            "save_digest": public_digest,
+            "truncation": public["snapshot_meta"]["truncation"],
+        }
+
+
+def peak_rss_bytes():
+    try:
+        import resource
+    except ImportError:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak * (1 if sys.platform == "darwin" else 1024)
+
+
+def run_suite(args):
+    interpreters = {"current": sys.executable}
+    if args.compare_python:
+        interpreters["reference"] = args.compare_python
+    samples = {name: {mode: [] for mode in interpreters} for name in CASES}
+    env = {**os.environ, "PYTHONHASHSEED": "0"}
+    env.pop("PYTHONPATH", None)
+    with tempfile.TemporaryDirectory() as scratch:
+        for name in CASES:
+            for round_ in range(args.rounds):
+                modes = list(interpreters)
+                if round_ % 2:
+                    modes.reverse()
+                for mode in modes:
+                    command = [
+                        interpreters[mode],
+                        str(Path(__file__).resolve()),
+                        "--case",
+                        name,
+                        "--runs",
+                        str(args.runs),
+                    ]
+                    raw = subprocess.check_output(
+                        command, env=env, cwd=scratch, text=True
+                    )
+                    samples[name][mode].append(json.loads(raw))
+    print(
+        "case     mode        capture p50/p95 ms    save p50/p95 ms   peak RSS MiB   dump bytes"
+    )
+    summary = {name: {} for name in CASES}
+    mismatch = []
+    for name, results in samples.items():
+        for key in ("capture_digest", "save_digest"):
+            if len({r[key] for rounds in results.values() for r in rounds}) != 1:
+                mismatch.append(f"{name}: {key}")
+        for mode, rounds in results.items():
+            row = summary[name][mode] = {}
+            cells = []
+            for metric in ("capture_ms", "save_ms"):
+                times = sorted(value for r in rounds for value in r[metric])
+                p95 = statistics.quantiles(times, n=100, method="inclusive")[94]
+                p50 = statistics.median(times)
+                row[metric] = {"p50": p50, "p95": p95}
+                cells.append(f"{p50:7.2f}/{p95:<7.2f}")
+            peaks = [
+                r["peak_rss_bytes"] for r in rounds if r["peak_rss_bytes"] is not None
+            ]
+            row["peak_rss_bytes"] = max(peaks, default=None)
+            row["median_dump_bytes"] = statistics.median(
+                r["dump_bytes"] for r in rounds
+            )
+            row["median_serialized_bytes"] = statistics.median(
+                r["serialized_bytes"] for r in rounds
+            )
+            rss = f"{max(peaks) / 2**20:.2f}" if peaks else "n/a"
+            print(
+                f"{name:<8} {mode:<10} {cells[0]}   {cells[1]}   {rss:>10} {row['median_dump_bytes']:>12g}"
+            )
+    if args.json:
+        report = {"summary": summary, "rounds": samples, "mismatches": mismatch}
+        Path(args.json).write_text(json.dumps(report, indent=2) + "\n")
+    if mismatch:
+        raise SystemExit("captured contents differ: " + ", ".join(mismatch))
+
+
+def entrypoint():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--suite", action="store_true", help="run the four exception workloads"
+    )
+    parser.add_argument(
+        "--compare-python",
+        help="alternate with this interpreter's installed pydumpling",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=3,
+        help="fresh processes per workload and interpreter",
+    )
+    parser.add_argument(
+        "--runs", type=int, default=20, help="samples per operation in each child"
+    )
+    parser.add_argument(
+        "--json", help="write raw timings, byte counts, RSS and content digests"
+    )
+    parser.add_argument("--case", choices=CASES, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.runs < 2 or args.rounds < 1:
+        parser.error("use at least two samples and one round")
+    if args.case:
+        print(json.dumps(suite_worker(args.case, args.runs)))
+    elif args.suite:
+        run_suite(args)
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    entrypoint()
